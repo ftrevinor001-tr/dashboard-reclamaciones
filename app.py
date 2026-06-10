@@ -213,6 +213,13 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
 
+    # Convertir las columnas de fecha a datetime para poder asignarles
+    # Timestamps después sin provocar un TypeError de pandas. Si la columna
+    # viene vacía, pandas la cargaría como texto/objeto y rechazaría la mezcla.
+    for col in (COL_FECHA_ENVIO, COL_FECHA_RESPUESTA):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
     # Normalizar columnas de texto clave
     for col in (COL_PROVEEDOR, COL_COMPRADOR, COL_ESTATUS, COL_FOLIO):
         if col in df.columns:
@@ -515,10 +522,13 @@ def formulario_edicion(df: pd.DataFrame) -> None:
     df_completo.loc[mascara, COL_CARTA_ENVIADA] = "SÍ" if chk_carta else "NO"
     df_completo.loc[mascara, COL_RESPUESTA] = "SÍ" if chk_respuesta else "NO"
     df_completo.loc[mascara, COL_AVISO_ENVIADO] = "SÍ" if chk_aviso else "NO"
-    if chk_carta and _a_fecha(df_completo.loc[mascara, COL_FECHA_ENVIO].iloc[0]) is None:
-        df_completo.loc[mascara, COL_FECHA_ENVIO] = pd.Timestamp(hoy)
-    if chk_respuesta and _a_fecha(df_completo.loc[mascara, COL_FECHA_RESPUESTA].iloc[0]) is None:
-        df_completo.loc[mascara, COL_FECHA_RESPUESTA] = pd.Timestamp(hoy)
+    idx = df_completo.index[mascara][0]
+    if chk_carta and _a_fecha(df_completo.at[idx, COL_FECHA_ENVIO]) is None:
+        df_completo[COL_FECHA_ENVIO] = pd.to_datetime(df_completo[COL_FECHA_ENVIO], errors="coerce")
+        df_completo.at[idx, COL_FECHA_ENVIO] = pd.Timestamp(hoy)
+    if chk_respuesta and _a_fecha(df_completo.at[idx, COL_FECHA_RESPUESTA]) is None:
+        df_completo[COL_FECHA_RESPUESTA] = pd.to_datetime(df_completo[COL_FECHA_RESPUESTA], errors="coerce")
+        df_completo.at[idx, COL_FECHA_RESPUESTA] = pd.Timestamp(hoy)
 
     # Estatus: automático por fase o manual
     estatus_final = (
