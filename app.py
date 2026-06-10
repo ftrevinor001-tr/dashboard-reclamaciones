@@ -285,27 +285,56 @@ def subir_a_github(mensaje_commit: str) -> tuple[bool, str]:
 
         repo.index.commit(mensaje_commit)
 
-        # Inyectar el token en la URL del remoto de forma temporal y segura.
+        # Construir la URL del remoto con el token en el formato que GitHub
+        # recomienda para tokens: https://x-access-token:TOKEN@github.com/...
         origen = repo.remote(name="origin")
         url_original = origen.url
         url_limpia = url_original
         if url_limpia.startswith("git@github.com:"):
             url_limpia = url_limpia.replace("git@github.com:", "https://github.com/")
+        if not url_limpia.endswith(".git"):
+            url_limpia = url_limpia + ".git"
+        # Quitar credenciales previas si las hubiera
         if "@" in url_limpia and url_limpia.startswith("https://"):
-            # Quitar credenciales previas si las hubiera
             url_limpia = "https://" + url_limpia.split("@", 1)[1]
-        url_con_token = url_limpia.replace("https://", f"https://{token}@")
+        url_con_token = url_limpia.replace(
+            "https://", f"https://x-access-token:{token}@"
+        )
 
+        # Desactivar cualquier solicitud interactiva de contraseña. Sin esto,
+        # si la autenticación falla, git intenta abrir un prompt que en
+        # Streamlit Cloud no existe y produce el error "No such device".
+        entorno = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "echo",
+            "GCM_INTERACTIVE": "never",
+        }
+
+        rama_actual = repo.active_branch.name
         try:
-            origen.set_url(url_con_token)
-            origen.push()
+            with repo.git.custom_environment(**entorno):
+                repo.git.push(url_con_token, f"HEAD:{rama_actual}")
         finally:
-            # Restaurar la URL sin token para no dejarlo expuesto en .git/config
-            origen.set_url(url_original)
+            # Asegurar que la URL guardada nunca contenga el token.
+            origen.set_url(url_limpia)
 
         return True, "Cambios subidos a GitHub correctamente. ✅"
     except Exception as e:
-        return False, f"Error al subir a GitHub: {e}"
+        detalle = str(e)
+        if "403" in detalle or "denied" in detalle.lower():
+            ayuda = (
+                " — El token no tiene permiso de escritura. Verifica que sea "
+                "un token fine-grained con 'Contents: Read and write' sobre el "
+                "repositorio dashboard-reclamaciones."
+            )
+        elif "could not read Password" in detalle or "Authentication" in detalle:
+            ayuda = (
+                " — El token es inválido o expiró. Genera uno nuevo y "
+                "actualízalo en los secretos de Streamlit (GITHUB_TOKEN)."
+            )
+        else:
+            ayuda = ""
+        return False, f"Error al subir a GitHub: {detalle}{ayuda}"
 
 
 # =============================================================================
@@ -426,6 +455,14 @@ def formulario_edicion(df: pd.DataFrame) -> None:
     """Formulario para editar un registro, firmarlo y subirlo a GitHub."""
     st.subheader("✏️ Editar reclamación")
 
+    # Mostrar el resultado del último guardado (tras el rerun).
+    if "mensaje_guardado" in st.session_state:
+        tipo, texto = st.session_state.pop("mensaje_guardado")
+        if tipo == "success":
+            st.success(texto)
+        else:
+            st.warning(texto)
+
     if df.empty:
         st.info("No hay registros con los filtros actuales.")
         return
@@ -474,19 +511,24 @@ def formulario_edicion(df: pd.DataFrame) -> None:
 
         st.markdown("##### Estatus final")
         estatus_sugerido = derivar_estatus_por_fase(chk_carta, chk_respuesta, chk_aviso)
+        if estatus_sugerido:
+            st.caption(f"💡 Según las fases marcadas, el estatus sugerido es: **{estatus_sugerido}**")
         indice_defecto = (
             OPCIONES_ESTATUS.index(fila[COL_ESTATUS])
             if fila[COL_ESTATUS] in OPCIONES_ESTATUS
             else (OPCIONES_ESTATUS.index(estatus_sugerido) if estatus_sugerido in OPCIONES_ESTATUS else 0)
         )
-        usar_automatico = st.toggle(
-            "Asignar estatus automáticamente según las fases marcadas",
-            value=True,
-            help="Carta → Enviada · Respuesta → En revisión · Aviso CxP → En proceso. "
-                 "Desactívalo para elegir un estatus final manualmente.",
-        )
         estatus_manual = st.selectbox(
-            "Estatus (manual)", options=OPCIONES_ESTATUS, index=indice_defecto
+            "Estatus a guardar", options=OPCIONES_ESTATUS, index=indice_defecto,
+            help="Este es el estatus que se guardará. Por defecto se preselecciona "
+                 "el sugerido por las fases, pero puedes elegir cualquiera.",
+        )
+        usar_automatico = st.toggle(
+            "Usar el estatus sugerido automáticamente en lugar del seleccionado arriba",
+            value=False,
+            help="Si lo activas, se guarda el estatus sugerido por las fases marcadas "
+                 "(Carta → Enviada · Respuesta → En revisión · Aviso CxP → En proceso), "
+                 "ignorando el selector de arriba.",
         )
 
         st.markdown("##### Comentarios y firma")
@@ -565,15 +607,23 @@ def formulario_edicion(df: pd.DataFrame) -> None:
     with st.spinner("Subiendo cambios a GitHub…"):
         exito, mensaje = subir_a_github(mensaje_commit)
 
-    # Invalidar caché y refrescar datos en sesión
+    # Invalidar caché y volver a leer el Excel recién escrito, de modo que
+    # el DataFrame en sesión y la tabla del dashboard reflejen los cambios.
+    cargar_datos.clear()
     st.session_state["version_datos"] += 1
-    st.session_state["df"] = df_completo
+    st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
 
+    # Guardar el mensaje para mostrarlo tras el rerun.
     if exito:
-        st.success(f"✅ Registro actualizado. {mensaje}")
-        st.toast("Cambios guardados", icon="💾")
+        st.session_state["mensaje_guardado"] = ("success", f"✅ Registro actualizado. {mensaje}")
     else:
-        st.warning(f"💾 El Excel se guardó localmente, pero: {mensaje}")
+        st.session_state["mensaje_guardado"] = (
+            "warning", f"💾 El Excel se guardó localmente, pero: {mensaje}"
+        )
+
+    # Volver a ejecutar el script para que la tabla y el resumen muestren
+    # los datos actualizados (Streamlit dibuja la tabla antes de llegar aquí).
+    st.rerun()
 
 
 # =============================================================================
