@@ -54,6 +54,7 @@ OPCIONES_ESTATUS = [
 # Nombres canónicos de columnas (los encabezados reales del Excel traen
 # saltos de línea y espacios dobles, por eso se normalizan al cargar).
 COL_MES = "MES DE DEVOLUCION"
+COL_MES_ETIQUETA = "MES (ETIQUETA)"
 COL_ID = "ID"
 COL_PROVEEDOR = "PROVEEDOR"
 COL_FOLIO = "FOLIO REPORTE"
@@ -91,6 +92,21 @@ EN_TIEMPO = "🟢 EN TIEMPO"
 POR_VENCERSE = "🟡 POR VENCERSE"
 VENCIDO = "🔴 VENCIDO"
 SIN_FECHA = "—"
+TERMINADO_FASE = "✅ TERMINADO"
+
+# Mapeo acumulativo: cada estatus marca como "TERMINADO" su columna de fase
+# y todas las anteriores. El número indica hasta qué columna (índice de
+# COLUMNAS_SEMAFORO) se considera terminada.
+#   0 -> LÍMITE NOTIFICAR (+7 días)
+#   1 -> FECHA CON COMPRADOR SEGUIMIENTO (+1 mes)
+#   2 -> AVISO CxP (+2 meses)
+#   3 -> FECHA VENCIMIENTO (+90 días)
+NIVEL_FASE_POR_ESTATUS = {
+    "Enviada": 0,
+    "En proceso": 1,
+    "Pagado": 2,
+    "Terminado": 3,
+}
 
 
 # =============================================================================
@@ -228,21 +244,51 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
     # Clave única de reclamación: el ID de proveedor se repite entre meses,
     # por lo que la combinación ID + FOLIO identifica cada registro.
     df["CLAVE"] = df[COL_ID].astype(str) + " | " + df[COL_FOLIO]
+
+    # Etiqueta legible del mes de devolución (para el filtro), en español.
+    if COL_MES in df.columns:
+        meses_es = {
+            1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo",
+            6: "Junio", 7: "Julio", 8: "Agosto", 9: "Septiembre",
+            10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+        }
+        fechas_mes = pd.to_datetime(df[COL_MES], errors="coerce")
+        df[COL_MES_ETIQUETA] = fechas_mes.apply(
+            lambda d: f"{meses_es[d.month]} {d.year}" if pd.notna(d) else "Sin fecha"
+        )
+    else:
+        df[COL_MES_ETIQUETA] = "Sin fecha"
     return df
 
 
 def agregar_columnas_semaforo(df: pd.DataFrame) -> pd.DataFrame:
-    """Devuelve una copia con las 4 columnas de fecha convertidas a semáforo."""
+    """Devuelve una copia con las 4 columnas de fecha convertidas a semáforo.
+
+    Si el ESTATUS ACTUAL de la fila marca una fase como terminada (según
+    NIVEL_FASE_POR_ESTATUS), esa columna y las anteriores muestran
+    "TERMINADO" en lugar del semáforo de fechas.
+    """
     vista = df.copy()
     for col in COLUMNAS_SEMAFORO:
         if col in vista.columns:
             vista[col] = vista[col].apply(calcular_semaforo)
+
+    # Aplicar "TERMINADO" de forma acumulativa según el estatus de cada fila.
+    if COL_ESTATUS in vista.columns:
+        for idx in vista.index:
+            estatus = str(df.at[idx, COL_ESTATUS]).strip()
+            nivel = NIVEL_FASE_POR_ESTATUS.get(estatus)
+            if nivel is not None:
+                for i in range(nivel + 1):
+                    col = COLUMNAS_SEMAFORO[i]
+                    if col in vista.columns:
+                        vista.at[idx, col] = TERMINADO_FASE
     return vista
 
 
 def guardar_excel(df: pd.DataFrame, ruta: str) -> None:
     """Sobrescribe el archivo Excel con el DataFrame actualizado."""
-    df_guardar = df.drop(columns=["CLAVE"], errors="ignore")
+    df_guardar = df.drop(columns=["CLAVE", COL_MES_ETIQUETA], errors="ignore")
     df_guardar.to_excel(ruta, sheet_name=NOMBRE_HOJA, index=False)
 
 
@@ -357,13 +403,28 @@ def mostrar_kpis(df: pd.DataFrame) -> None:
 
 
 def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
-    """Barra lateral con filtros en cascada: Comprador → Estatus → Semáforo.
+    """Barra lateral con filtros en cascada: Mes → Comprador → Estatus → Semáforo.
 
     Cada filtro reduce las opciones disponibles del siguiente.
     """
     st.sidebar.header("🔎 Filtros")
 
     df_filtrado = df.copy()
+
+    # --- Filtro por MES DE RECLAMACIÓN ---
+    if COL_MES_ETIQUETA in df_filtrado.columns:
+        # Ordenar los meses cronológicamente usando la fecha real subyacente.
+        orden_meses = (
+            df_filtrado[[COL_MES_ETIQUETA, COL_MES]]
+            .drop_duplicates()
+            .sort_values(COL_MES)
+            [COL_MES_ETIQUETA].tolist()
+        )
+        sel_meses = st.sidebar.multiselect(
+            "Mes de reclamación", options=orden_meses, placeholder="Todos los meses"
+        )
+        if sel_meses:
+            df_filtrado = df_filtrado[df_filtrado[COL_MES_ETIQUETA].isin(sel_meses)]
 
     # --- Filtro por COMPRADOR ---
     compradores = sorted(x for x in df_filtrado[COL_COMPRADOR].unique() if x)
@@ -432,25 +493,6 @@ def mostrar_tabla(df: pd.DataFrame) -> None:
     )
 
 
-def derivar_estatus_por_fase(carta: bool, respuesta: bool, aviso: bool) -> str:
-    """Deriva el ESTATUS ACTUAL según la fase más avanzada activa.
-
-    Fases del proceso de reclamación:
-      1. Carta enviada           -> "Enviada"
-      2. Respuesta del proveedor -> "En revisión"
-      3. Aviso a CxP enviado     -> "En proceso"
-    Los estatus finales (Aceptado, Devuelto, Pagado, Rechazado, Terminado)
-    se asignan manualmente con el selector.
-    """
-    if aviso:
-        return "En proceso"
-    if respuesta:
-        return "En revisión"
-    if carta:
-        return "Enviada"
-    return ""
-
-
 def formulario_edicion(df: pd.DataFrame) -> None:
     """Formulario para editar un registro, firmarlo y subirlo a GitHub."""
     st.subheader("✏️ Editar reclamación")
@@ -494,41 +536,17 @@ def formulario_edicion(df: pd.DataFrame) -> None:
 
     # --- Formulario de edición ---
     with st.form("form_edicion", clear_on_submit=False):
-        st.markdown("##### Fases del proceso (marca las completadas)")
-        col_a, col_b, col_c = st.columns(3)
-        chk_carta = col_a.checkbox(
-            "📤 ¿Carta enviada?",
-            value=str(fila.get(COL_CARTA_ENVIADA, "")).strip().upper() in ("SÍ", "SI"),
-        )
-        chk_respuesta = col_b.checkbox(
-            "📨 ¿Respuesta del proveedor?",
-            value=str(fila.get(COL_RESPUESTA, "")).strip().upper() in ("SÍ", "SI"),
-        )
-        chk_aviso = col_c.checkbox(
-            "📣 ¿Aviso a CxP enviado?",
-            value=str(fila.get(COL_AVISO_ENVIADO, "")).strip().upper() in ("SÍ", "SI"),
-        )
-
-        st.markdown("##### Estatus final")
-        estatus_sugerido = derivar_estatus_por_fase(chk_carta, chk_respuesta, chk_aviso)
-        if estatus_sugerido:
-            st.caption(f"💡 Según las fases marcadas, el estatus sugerido es: **{estatus_sugerido}**")
+        st.markdown("##### Estatus")
         indice_defecto = (
             OPCIONES_ESTATUS.index(fila[COL_ESTATUS])
             if fila[COL_ESTATUS] in OPCIONES_ESTATUS
-            else (OPCIONES_ESTATUS.index(estatus_sugerido) if estatus_sugerido in OPCIONES_ESTATUS else 0)
+            else 0
         )
         estatus_manual = st.selectbox(
             "Estatus a guardar", options=OPCIONES_ESTATUS, index=indice_defecto,
-            help="Este es el estatus que se guardará. Por defecto se preselecciona "
-                 "el sugerido por las fases, pero puedes elegir cualquiera.",
-        )
-        usar_automatico = st.toggle(
-            "Usar el estatus sugerido automáticamente en lugar del seleccionado arriba",
-            value=False,
-            help="Si lo activas, se guarda el estatus sugerido por las fases marcadas "
-                 "(Carta → Enviada · Respuesta → En revisión · Aviso CxP → En proceso), "
-                 "ignorando el selector de arriba.",
+            help="Al guardar, las columnas de fecha por etapa se marcarán como "
+                 "TERMINADO según el estatus: Enviada → +7 días · En proceso → "
+                 "+1 mes · Pagado → +2 meses · Terminado → +90 días (acumulativo).",
         )
 
         st.markdown("##### Comentarios y firma")
@@ -557,25 +575,10 @@ def formulario_edicion(df: pd.DataFrame) -> None:
         return
 
     ahora = datetime.now()
-    hoy = date.today()
     valor_anterior = df_completo.loc[mascara, COL_ESTATUS].iloc[0]
 
-    # Fases (SÍ/NO) y fechas asociadas automáticas
-    df_completo.loc[mascara, COL_CARTA_ENVIADA] = "SÍ" if chk_carta else "NO"
-    df_completo.loc[mascara, COL_RESPUESTA] = "SÍ" if chk_respuesta else "NO"
-    df_completo.loc[mascara, COL_AVISO_ENVIADO] = "SÍ" if chk_aviso else "NO"
-    idx = df_completo.index[mascara][0]
-    if chk_carta and _a_fecha(df_completo.at[idx, COL_FECHA_ENVIO]) is None:
-        df_completo[COL_FECHA_ENVIO] = pd.to_datetime(df_completo[COL_FECHA_ENVIO], errors="coerce")
-        df_completo.at[idx, COL_FECHA_ENVIO] = pd.Timestamp(hoy)
-    if chk_respuesta and _a_fecha(df_completo.at[idx, COL_FECHA_RESPUESTA]) is None:
-        df_completo[COL_FECHA_RESPUESTA] = pd.to_datetime(df_completo[COL_FECHA_RESPUESTA], errors="coerce")
-        df_completo.at[idx, COL_FECHA_RESPUESTA] = pd.Timestamp(hoy)
-
-    # Estatus: automático por fase o manual
-    estatus_final = (
-        estatus_sugerido if (usar_automatico and estatus_sugerido) else estatus_manual
-    )
+    # Estatus: el seleccionado en el formulario
+    estatus_final = estatus_manual
     df_completo.loc[mascara, COL_ESTATUS] = estatus_final
 
     # Notas: se anexa el comentario con sello de fecha/hora y firma
@@ -645,7 +648,8 @@ def main() -> None:
     df = st.session_state["df"]
 
     # --- Encabezado ---
-    st.title("📋 Dashboard de Devoluciones y Reclamaciones")
+    st.markdown("### 📋 Dashboard de Devoluciones y Reclamaciones")
+    st.markdown("#### Seguimiento a devoluciones")
     st.caption(
         "Gestiona el registro de reclamaciones, actualiza estatus y sincroniza "
         "automáticamente con GitHub."
