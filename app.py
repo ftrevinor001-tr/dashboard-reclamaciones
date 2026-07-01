@@ -439,8 +439,12 @@ def aplicar_guardado(df: pd.DataFrame, clave: str, cambios: dict,
 
 
 def persistir_y_sincronizar(df: pd.DataFrame, mensaje_commit: str,
-                            mensaje_ok: str) -> None:
-    """Guarda el Excel, sube a GitHub, refresca la sesión y vuelve a renderizar."""
+                            mensaje_ok: str, celebrar: bool = False) -> None:
+    """Guarda el Excel, sube a GitHub, refresca la sesión y vuelve a renderizar.
+
+    Si celebrar=True, se marca para mostrar los globos UNA sola vez tras el
+    rerun (por ejemplo, al cerrar una etapa).
+    """
     try:
         guardar_excel(df, RUTA_EXCEL)
     except Exception as e:
@@ -457,6 +461,8 @@ def persistir_y_sincronizar(df: pd.DataFrame, mensaje_commit: str,
         st.session_state["flash"] = ("success", f"✅ {mensaje_ok} {mensaje}")
     else:
         st.session_state["flash"] = ("warning", f"💾 {mensaje_ok} Guardado local, pero: {mensaje}")
+    if celebrar:
+        st.session_state["celebrar"] = True
     st.rerun()
 
 
@@ -657,7 +663,7 @@ def pestania_etapa1(fila: pd.Series) -> None:
         mensaje_log = "Etapa 1 (Reporte de reclamo) TERMINADA → pasa a Gestión"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.")
+    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=envio_hecho)
 
 
 def pestania_etapa2(fila: pd.Series) -> None:
@@ -756,7 +762,7 @@ def pestania_etapa2(fila: pd.Series) -> None:
             mensaje_log = f"Etapa 2 TERMINADA · {respuesta} → pasa a Cuentas por pagar"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.")
+    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=bool(cerrar))
 
 
 def pestania_etapa3(fila: pd.Series) -> None:
@@ -833,7 +839,7 @@ def pestania_etapa3(fila: pd.Series) -> None:
         mensaje_log = "Etapa 3 (Cuentas por pagar) TERMINADA → pasa a Destino final"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.")
+    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=aplicacion_hecha)
 
 
 def pestania_etapa4(fila: pd.Series) -> None:
@@ -881,7 +887,6 @@ def pestania_etapa4(fila: pd.Series) -> None:
         ultimo_etiqueta = "Recepción de folio de ajuste"
 
     if terminada:
-        st.balloons()
         st.success("🎉 Proceso TERMINADO. Todas las etapas y fechas quedaron registradas.")
         _resumen_pasos(fila, pasos)
         if str(fila.get(COL_E4_OBS, "")).strip():
@@ -915,7 +920,7 @@ def pestania_etapa4(fila: pd.Series) -> None:
         mensaje_log = "Etapa 4 (Destino final) TERMINADA · PROCESO FINALIZADO"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.")
+    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=ultimo_hecho)
 
 
 # =============================================================================
@@ -927,6 +932,9 @@ def vista_editar(df: pd.DataFrame) -> None:
     if "flash" in st.session_state:
         tipo, texto = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(texto)
+    # Globos SOLO al terminar una etapa (bandera de un solo uso).
+    if st.session_state.pop("celebrar", False):
+        st.balloons()
 
     if df.empty:
         st.info("No hay registros con los filtros actuales.")
@@ -1101,7 +1109,120 @@ y la bitácora completa se acumula en *Acciones / Notas* para su posterior anál
 
 
 # =============================================================================
-# 12. FUNCIÓN PRINCIPAL
+# 11b. GESTIÓN DE LA BASE DE DATOS (descargar / cargar)
+# =============================================================================
+
+def _excel_en_memoria(df: pd.DataFrame) -> bytes:
+    """Genera el Excel completo (sin columnas auxiliares) como bytes descargables."""
+    import io
+    buffer = io.BytesIO()
+    df_export = df.drop(columns=["CLAVE", COL_MES_ETIQUETA], errors="ignore")
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_export.to_excel(writer, sheet_name=NOMBRE_HOJA, index=False)
+    return buffer.getvalue()
+
+
+def vista_base_datos(df: pd.DataFrame) -> None:
+    st.subheader("🗄️ Base de datos")
+    if "flash_bd" in st.session_state:
+        tipo, texto = st.session_state.pop("flash_bd")
+        (st.success if tipo == "success" else st.warning)(texto)
+
+    # ----- DESCARGAR -----
+    st.markdown("##### ⬇️ Descargar base de datos completa")
+    st.caption("Descarga el Excel con todos los registros y columnas tal como están "
+               "hoy. Puedes abrirlo, agregar reclamaciones nuevas o completar datos, y "
+               "volver a cargarlo aquí.")
+    hoy = datetime.now().strftime("%Y%m%d_%H%M")
+    st.download_button(
+        "⬇️ Descargar datos.xlsx actualizado",
+        data=_excel_en_memoria(df),
+        file_name=f"datos_{hoy}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    # ----- CARGAR -----
+    st.markdown("##### ⬆️ Cargar base de datos actualizada")
+    st.caption("Sube un Excel (misma estructura de columnas) para reemplazar la base "
+               "de datos. Se guardará y se subirá al repositorio para que la app tome "
+               "la nueva información. **Recomendado:** parte del archivo que descargaste "
+               "arriba para no perder columnas.")
+
+    archivo = st.file_uploader("Selecciona el archivo datos.xlsx", type=["xlsx"])
+    if archivo is None:
+        return
+
+    # Vista previa y validación
+    try:
+        df_nuevo = pd.read_excel(archivo, sheet_name=NOMBRE_HOJA)
+    except Exception as e:
+        st.error(f"No se pudo leer el archivo. ¿Tiene una hoja llamada '{NOMBRE_HOJA}'? "
+                 f"Detalle: {e}")
+        return
+
+    df_nuevo.columns = [_normalizar_encabezado(c) for c in df_nuevo.columns]
+    if COL_FOLIO not in df_nuevo.columns:
+        st.error(f"El archivo no tiene la columna obligatoria '{COL_FOLIO}'. "
+                 "Descarga la base actual y parte de ella.")
+        return
+
+    n_nuevos = len(df_nuevo)
+    folios = df_nuevo[COL_FOLIO].astype(str).str.strip()
+    duplicados = folios[folios.duplicated()].unique()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Registros en el archivo", n_nuevos)
+    c2.metric("Registros actuales", len(df))
+    c3.metric("Diferencia", f"{n_nuevos - len(df):+d}")
+
+    if len(duplicados) > 0:
+        st.error(f"⚠️ Hay folios repetidos en el archivo (deben ser únicos): "
+                 f"{', '.join(map(str, duplicados[:10]))}"
+                 f"{'…' if len(duplicados) > 10 else ''}. Corrige antes de cargar.")
+        return
+
+    st.markdown("**Vista previa (primeras filas):**")
+    st.dataframe(df_nuevo.head(10), use_container_width=True, hide_index=True)
+
+    st.warning("Al confirmar, la base actual se reemplazará por completo con este "
+               "archivo y se subirá al repositorio.")
+    usuario = st.text_input("Tu nombre / usuario (para el registro)", key="user_carga_bd")
+    confirmar = st.checkbox("Entiendo que se reemplazará toda la base de datos",
+                            key="confirmar_carga_bd")
+
+    if st.button("⬆️ Cargar y subir al repositorio", type="primary",
+                 use_container_width=True, disabled=not confirmar):
+        if not usuario.strip():
+            st.error("✍️ Escribe tu nombre antes de cargar.")
+            return
+        try:
+            # Escribir el archivo nuevo tal cual en datos.xlsx
+            df_nuevo.to_excel(RUTA_EXCEL, sheet_name=NOMBRE_HOJA, index=False)
+        except Exception as e:
+            st.error(f"No se pudo escribir el Excel: {e}")
+            return
+
+        mensaje_commit = (f"Carga masiva de base de datos por {usuario.strip()} "
+                          f"({n_nuevos} registros, {datetime.now():%d/%m/%Y %H:%M})")
+        with st.spinner("Subiendo la nueva base a GitHub…"):
+            exito, mensaje = subir_a_github(mensaje_commit)
+
+        cargar_datos.clear()
+        st.session_state["version_datos"] += 1
+        st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
+
+        if exito:
+            st.session_state["flash_bd"] = ("success", f"✅ Base cargada. {mensaje}")
+        else:
+            st.session_state["flash_bd"] = ("warning", f"💾 Guardado local, pero: {mensaje}")
+        st.rerun()
+
+
+# =============================================================================
+# 13. FUNCIÓN PRINCIPAL
 # =============================================================================
 
 def main() -> None:
@@ -1133,8 +1254,9 @@ def main() -> None:
     mostrar_kpis(df_filtrado)
     st.divider()
 
-    tab_editar, tab_tabla, tab_resumen, tab_guia = st.tabs(
-        ["✏️ Editar reclamación", "📊 Tabla", "🔔 Resumen y alarmas", "📖 Guía"]
+    tab_editar, tab_tabla, tab_resumen, tab_bd, tab_guia = st.tabs(
+        ["✏️ Editar reclamación", "📊 Tabla", "🔔 Resumen y alarmas",
+         "🗄️ Base de datos", "📖 Guía"]
     )
     with tab_editar:
         vista_editar(df_filtrado)
@@ -1142,6 +1264,9 @@ def main() -> None:
         mostrar_tabla(df_filtrado)
     with tab_resumen:
         mostrar_notificaciones(df_filtrado)
+    with tab_bd:
+        # La descarga/carga siempre opera sobre la base COMPLETA, no la filtrada.
+        vista_base_datos(df)
     with tab_guia:
         vista_guia()
 
