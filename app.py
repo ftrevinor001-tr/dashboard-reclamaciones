@@ -524,11 +524,16 @@ def _resumen_pasos(fila: pd.Series, pasos: list) -> None:
 
 
 def _boton_reactivar(etapa_cod: str, clave_registro: str) -> None:
-    """Botón protegido por clave para reabrir una etapa terminada."""
+    """Botón protegido por clave para reabrir una etapa terminada.
+
+    Al reactivar una etapa, se limpia su marca de terminada y la de las etapas
+    posteriores, para que el flujo se recorra de nuevo de forma limpia.
+    """
     with st.expander("🔓 Reactivar esta etapa (requiere clave)"):
         st.caption(
             "Solo personal autorizado. Reactivar reabre la etapa para corregir "
-            "información; las etapas posteriores se recalculan al avanzar de nuevo."
+            "información; las etapas posteriores se reinician y deberán completarse "
+            "de nuevo."
         )
         c1, c2 = st.columns([2, 1])
         clave_in = c1.text_input(
@@ -542,8 +547,19 @@ def _boton_reactivar(etapa_cod: str, clave_registro: str) -> None:
                 return
             df = st.session_state["df"]
             cambios = {COL_ETAPA: ETAPA_NOMBRE_POR_COD[etapa_cod]}
-            # Quitar la marca de terminada de esta etapa
-            cambios[COL_TERM_POR_COD[etapa_cod]] = "NO"
+            # Reabrir esta etapa y todas las posteriores (limpiar terminada
+            # y las fechas/usuarios de sus pasos, para recorrerlas de nuevo).
+            orden = ["E1", "E2", "E3", "E4"]
+            pasos_por_cod = {
+                "E1": PASOS_E1, "E2": PASOS_E2, "E3": PASOS_E3,
+                "E4": PASOS_E4_DESTRUCCION + PASOS_E4_RECOLECCION,
+            }
+            desde = orden.index(etapa_cod)
+            for cod in orden[desde:]:
+                cambios[COL_TERM_POR_COD[cod]] = "NO"
+                for _c, _e, cf, cu in pasos_por_cod[cod]:
+                    cambios[cf] = pd.NaT
+                    cambios[cu] = ""
             mensaje = aplicar_guardado(
                 df, clave_registro, cambios, "Reactivación",
                 f"Etapa '{ETAPA_NOMBRE_POR_COD[etapa_cod]}' reactivada",
@@ -719,8 +735,8 @@ def pestania_etapa2(fila: pd.Series) -> None:
                        "Al cerrar se activará **Cuentas por pagar**.")
 
         obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E2_OBS, "") or ""))
-        cerrar = st.checkbox("Marcar 'Respuesta de proveedor' como definitiva y cerrar la etapa",
-                             key=f"cerrar_e2_{clave}")
+        st.caption("Al marcar 'Respuesta de proveedor' se cierra la etapa y se activa la "
+                   "siguiente según la respuesta seleccionada.")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e2_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
 
@@ -740,10 +756,11 @@ def pestania_etapa2(fila: pd.Series) -> None:
     if respuesta == RESP_RECOLECCION and fecha_compromiso:
         cambios[COL_E2_COMPROMISO] = pd.Timestamp(fecha_compromiso)
 
+    # La etapa cierra cuando el último paso (Respuesta de proveedor) queda marcado.
+    cerrar = _paso_quedo_hecho(PASOS_E2[-1][2], cambios, fila)
     mensaje_log = "Avance en Gestión"
     if cerrar:
-        # Cerrar etapa 2 y bifurcar
-        cambios[PASOS_E2[-1][2]] = pd.Timestamp(date.today())  # marca respuesta
+        # Cerrar etapa 2 y bifurcar según la respuesta
         for cu in [p[3] for p in PASOS_E2]:
             if not str(fila.get(cu, "")).strip() and cu not in cambios:
                 cambios[cu] = usuario.strip()
