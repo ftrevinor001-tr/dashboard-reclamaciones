@@ -21,9 +21,33 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, date, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    ZONA_MX = ZoneInfo("America/Mexico_City")
+except Exception:
+    ZONA_MX = None
 
 import pandas as pd
 import streamlit as st
+
+
+def hoy_mx() -> date:
+    """Fecha actual en la zona horaria de México (evita el desfase por UTC).
+
+    Streamlit Cloud corre en UTC; sin esto, en las tardes/noches de México
+    la app graba la fecha del día siguiente.
+    """
+    if ZONA_MX is not None:
+        return datetime.now(ZONA_MX).date()
+    # Respaldo: UTC menos 6 horas (horario del centro de México)
+    return (datetime.utcnow() - timedelta(hours=6)).date()
+
+
+def ahora_mx() -> datetime:
+    """Fecha y hora actual en la zona horaria de México (sin tzinfo, para logs)."""
+    if ZONA_MX is not None:
+        return datetime.now(ZONA_MX).replace(tzinfo=None)
+    return datetime.utcnow() - timedelta(hours=6)
 
 # =============================================================================
 # 1. CONFIGURACIÓN GENERAL Y CONSTANTES
@@ -189,7 +213,7 @@ def semaforo_por_limite(fecha_limite, terminada: bool) -> str:
     f = _a_fecha(fecha_limite)
     if f is None:
         return SIN_DATO
-    hoy = date.today()
+    hoy = hoy_mx()
     if f < hoy:
         return VENCIDO
     if f <= hoy + timedelta(days=15):
@@ -235,10 +259,14 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
     for col in COLUMNAS_REQUERIDAS:
         if col in df.columns and col not in cols_fecha and col not in cols_numericas:
             df[col] = df[col].fillna("").astype(str).replace("nan", "")
-    # Las columnas de fecha a datetime (para poder asignar Timestamps).
+    # Las columnas de fecha a datetime SIN componente de hora (solo fecha).
+    # .dt.normalize() pone la hora en 00:00 para que no se guarde hora alguna.
     for col in cols_fecha:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.normalize()
+    # También normalizar FECHA CORTE (fecha base del proceso).
+    if COL_FECHA_CORTE in df.columns:
+        df[COL_FECHA_CORTE] = pd.to_datetime(df[COL_FECHA_CORTE], errors="coerce").dt.normalize()
 
     # Etapa inicial por defecto
     if COL_ETAPA in df.columns:
@@ -269,11 +297,32 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
     return df
 
 
+def _columnas_fecha() -> set:
+    """Conjunto de todas las columnas que deben tratarse como fecha."""
+    cols = set()
+    for _pasos in (PASOS_E1, PASOS_E2, PASOS_E3, PASOS_E4_DESTRUCCION, PASOS_E4_RECOLECCION):
+        for _c, _e, _cf, _cu in _pasos:
+            cols.add(_cf)
+    cols |= {COL_E1_LIMITE, COL_E2_LIMITE, COL_E3_LIMITE,
+             COL_E2_COMPROMISO, COL_E4_LIMITE_REC, COL_FECHA_CORTE}
+    return cols
+
+
+def _preparar_para_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """Copia sin columnas auxiliares y con fechas como date puro (sin hora)."""
+    salida = df.drop(columns=["CLAVE", COL_MES_ETIQUETA], errors="ignore").copy()
+    for col in _columnas_fecha():
+        if col in salida.columns:
+            salida[col] = pd.to_datetime(salida[col], errors="coerce").dt.date
+    return salida
+
+
 def guardar_excel(df: pd.DataFrame, ruta: str) -> None:
-    """Sobrescribe el Excel quitando columnas auxiliares."""
-    df.drop(columns=["CLAVE", COL_MES_ETIQUETA], errors="ignore").to_excel(
-        ruta, sheet_name=NOMBRE_HOJA, index=False
-    )
+    """Sobrescribe el Excel quitando columnas auxiliares y sin hora en las fechas."""
+    salida = _preparar_para_excel(df)
+    with pd.ExcelWriter(ruta, engine="openpyxl", datetime_format="DD/MM/YYYY",
+                        date_format="DD/MM/YYYY") as writer:
+        salida.to_excel(writer, sheet_name=NOMBRE_HOJA, index=False)
 
 
 # =============================================================================
@@ -367,7 +416,7 @@ def estado_alarma(fecha_limite, terminada: bool) -> tuple[str, str]:
     f = _a_fecha(fecha_limite)
     if f is None:
         return "none", "Sin fecha límite definida."
-    hoy = date.today()
+    hoy = hoy_mx()
     dias = (f - hoy).days
     if dias < 0:
         return "danger", f"VENCIDA hace {abs(dias)} día(s) (límite {f:%d/%m/%Y})."
@@ -423,7 +472,7 @@ def aplicar_guardado(df: pd.DataFrame, clave: str, cambios: dict,
     Devuelve el mensaje de commit.
     """
     mascara = df["CLAVE"] == clave
-    ahora = datetime.now()
+    ahora = ahora_mx()
     for col, valor in cambios.items():
         df.loc[mascara, col] = valor
     # Bitácora acumulada en ACCIONES / NOTAS
@@ -601,7 +650,7 @@ def _registrar_pasos_form(fila, pasos, prefijo, solo_lectura):
     """
     cambios = {}
     cols_usuario_nuevas = []
-    hoy = date.today()
+    hoy = hoy_mx()
     for clave, etiqueta, cf, cu in pasos:
         ya_hecho = _a_fecha(fila.get(cf)) is not None
         col1, col2 = st.columns([3, 2])
@@ -673,7 +722,7 @@ def pestania_etapa1(fila: pd.Series) -> None:
         # Cerrar etapa 1: contar días desde FECHA CORTE y activar etapa 2
         corte = _a_fecha(fila.get(COL_FECHA_CORTE))
         if corte:
-            cambios[COL_E1_DIAS] = (date.today() - corte).days
+            cambios[COL_E1_DIAS] = (hoy_mx() - corte).days
         cambios[COL_E1_TERM] = "SÍ"
         cambios[COL_ETAPA] = ETAPA_2
         mensaje_log = "Etapa 1 (Reporte de reclamo) TERMINADA → pasa a Gestión"
@@ -723,7 +772,7 @@ def pestania_etapa2(fila: pd.Series) -> None:
         fecha_compromiso = None
         if respuesta == RESP_RECOLECCION:
             fecha_compromiso = st.date_input(
-                "Fecha compromiso de recolección", value=date.today(),
+                "Fecha compromiso de recolección", value=hoy_mx(),
                 format="DD/MM/YYYY", key=f"comp_{clave}",
             )
             st.info("Al cerrar, se activará la pestaña **Destino final** (modalidad recolección).")
@@ -766,12 +815,12 @@ def pestania_etapa2(fila: pd.Series) -> None:
                 cambios[cu] = usuario.strip()
         lim_e2 = limites["E2"]
         if lim_e2:
-            cambios[COL_E2_DIAS] = (date.today() - lim_e2).days + DIAS_ETAPA_2
+            cambios[COL_E2_DIAS] = (hoy_mx() - lim_e2).days + DIAS_ETAPA_2
         cambios[COL_E2_TERM] = "SÍ"
         if respuesta == RESP_RECOLECCION:
             cambios[COL_ETAPA] = ETAPA_4
             cambios[COL_E4_MODALIDAD] = RESP_RECOLECCION
-            cambios[COL_E4_LIMITE_REC] = pd.Timestamp(date.today() + timedelta(days=DIAS_RECOLECCION))
+            cambios[COL_E4_LIMITE_REC] = pd.Timestamp(hoy_mx() + timedelta(days=DIAS_RECOLECCION))
             mensaje_log = "Etapa 2 TERMINADA · Recolección → pasa a Destino final"
         else:
             cambios[COL_ETAPA] = ETAPA_3
@@ -849,7 +898,7 @@ def pestania_etapa3(fila: pd.Series) -> None:
     if aplicacion_hecha:
         lim_e3 = limites["E3"]
         if lim_e3:
-            cambios[COL_E3_DIAS] = (date.today() - lim_e3).days + DIAS_ETAPA_3
+            cambios[COL_E3_DIAS] = (hoy_mx() - lim_e3).days + DIAS_ETAPA_3
         cambios[COL_E3_TERM] = "SÍ"
         cambios[COL_ETAPA] = ETAPA_4
         cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
@@ -1130,11 +1179,12 @@ y la bitácora completa se acumula en *Acciones / Notas* para su posterior anál
 # =============================================================================
 
 def _excel_en_memoria(df: pd.DataFrame) -> bytes:
-    """Genera el Excel completo (sin columnas auxiliares) como bytes descargables."""
+    """Genera el Excel completo (sin columnas auxiliares, fechas sin hora)."""
     import io
     buffer = io.BytesIO()
-    df_export = df.drop(columns=["CLAVE", COL_MES_ETIQUETA], errors="ignore")
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    df_export = _preparar_para_excel(df)
+    with pd.ExcelWriter(buffer, engine="openpyxl", datetime_format="DD/MM/YYYY",
+                        date_format="DD/MM/YYYY") as writer:
         df_export.to_excel(writer, sheet_name=NOMBRE_HOJA, index=False)
     return buffer.getvalue()
 
@@ -1150,7 +1200,7 @@ def vista_base_datos(df: pd.DataFrame) -> None:
     st.caption("Descarga el Excel con todos los registros y columnas tal como están "
                "hoy. Puedes abrirlo, agregar reclamaciones nuevas o completar datos, y "
                "volver a cargarlo aquí.")
-    hoy = datetime.now().strftime("%Y%m%d_%H%M")
+    hoy = ahora_mx().strftime("%Y%m%d_%H%M")
     st.download_button(
         "⬇️ Descargar datos.xlsx actualizado",
         data=_excel_en_memoria(df),
@@ -1223,7 +1273,7 @@ def vista_base_datos(df: pd.DataFrame) -> None:
             return
 
         mensaje_commit = (f"Carga masiva de base de datos por {usuario.strip()} "
-                          f"({n_nuevos} registros, {datetime.now():%d/%m/%Y %H:%M})")
+                          f"({n_nuevos} registros, {ahora_mx():%d/%m/%Y %H:%M})")
         with st.spinner("Subiendo la nueva base a GitHub…"):
             exito, mensaje = subir_a_github(mensaje_commit)
 
