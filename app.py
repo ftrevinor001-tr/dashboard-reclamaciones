@@ -622,6 +622,24 @@ COL_TERM_POR_COD = {"E1": COL_E1_TERM, "E2": COL_E2_TERM, "E3": COL_E3_TERM, "E4
 COL_DIAS_POR_COD = {"E1": COL_E1_DIAS, "E2": COL_E2_DIAS, "E3": COL_E3_DIAS}
 
 
+def modalidad_destino_final(fila: pd.Series) -> str:
+    """Determina la modalidad de la etapa 4 (Recolección o Destrucción).
+
+    Prioridad:
+      1. La columna E4 MODALIDAD, si está definida.
+      2. Si no, se deriva de la respuesta del proveedor: solo 'Recolección'
+         lleva a recolección; destrucción o sin respuesta llevan a destrucción.
+
+    Esto evita que un registro con respuesta 'Recolección' aparezca como
+    destrucción cuando la modalidad no quedó grabada.
+    """
+    modalidad = str(fila.get(COL_E4_MODALIDAD, "")).strip()
+    if modalidad in (RESP_RECOLECCION, RESP_DESTRUCCION):
+        return modalidad
+    respuesta = str(fila.get(COL_RESPUESTA_TIPO, "")).strip()
+    return RESP_RECOLECCION if respuesta == RESP_RECOLECCION else RESP_DESTRUCCION
+
+
 def _pasos_de_etapa(cod: str, fila: pd.Series) -> list:
     """Devuelve la lista de pasos de una etapa. Para E4 depende de la modalidad."""
     if cod == "E1":
@@ -630,7 +648,7 @@ def _pasos_de_etapa(cod: str, fila: pd.Series) -> list:
         return PASOS_E2
     if cod == "E3":
         return PASOS_E3
-    modalidad = str(fila.get(COL_E4_MODALIDAD, "")).strip()
+    modalidad = modalidad_destino_final(fila)
     return PASOS_E4_RECOLECCION if modalidad == RESP_RECOLECCION else PASOS_E4_DESTRUCCION
 
 
@@ -769,7 +787,8 @@ def _panel_ajuste_manual(etapa_cod: str, fila: pd.Series) -> None:
                     cambios[COL_E3_DIAS] = (fecha_cierre - limites["E3"]).days + DIAS_ETAPA_3
                     cambios[COL_E3_LIMITE] = pd.Timestamp(limites["E3"])
                 cambios[COL_ETAPA] = ETAPA_4
-                cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
+                # No forzar destrucción: respetar la respuesta del proveedor.
+                cambios[COL_E4_MODALIDAD] = modalidad_destino_final(fila)
             else:  # E4
                 cambios[COL_ETAPA] = ETAPA_FINAL
 
@@ -1075,7 +1094,8 @@ def pestania_etapa3(fila: pd.Series) -> None:
             cambios[COL_E3_DIAS] = (hoy_mx() - lim_e3).days + DIAS_ETAPA_3
         cambios[COL_E3_TERM] = "SÍ"
         cambios[COL_ETAPA] = ETAPA_4
-        cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
+        # Respetar la respuesta del proveedor (no forzar destrucción).
+        cambios[COL_E4_MODALIDAD] = modalidad_destino_final(fila)
         mensaje_log = "Etapa 3 (Cuentas por pagar) TERMINADA → pasa a Destino final"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
@@ -1086,7 +1106,7 @@ def pestania_etapa4(fila: pd.Series) -> None:
     """Etapa 4 — Destino final (recolección 20 días / destrucción)."""
     clave = fila["CLAVE"]
     etapa_actual = str(fila.get(COL_ETAPA, "")).strip()
-    modalidad = str(fila.get(COL_E4_MODALIDAD, "")).strip() or RESP_DESTRUCCION
+    modalidad = modalidad_destino_final(fila)
     disponible = etapa_actual in (ETAPA_4, ETAPA_FINAL)
     terminada = _etapa_bloqueada(fila, "E4")
 
@@ -1100,6 +1120,36 @@ def pestania_etapa4(fila: pd.Series) -> None:
         return
 
     st.info(f"Modalidad: **{modalidad}**")
+
+    # Corrector de modalidad (por si quedó mal grabada en un registro).
+    with st.expander("🔀 Corregir modalidad (requiere clave)"):
+        st.caption("La modalidad debe coincidir con la respuesta del proveedor "
+                   f"registrada en Gestión: **{fila.get(COL_RESPUESTA_TIPO, '') or '—'}**. "
+                   "Usa esto solo si quedó grabada de forma incorrecta.")
+        cm1, cm2, cm3 = st.columns([2, 2, 1])
+        clave_mod = cm1.text_input("Clave", type="password", key=f"clave_mod_{clave}")
+        nueva_mod = cm2.selectbox(
+            "Modalidad correcta", options=[RESP_RECOLECCION, RESP_DESTRUCCION],
+            index=0 if modalidad == RESP_RECOLECCION else 1,
+            key=f"sel_mod_{clave}",
+        )
+        if cm3.button("Aplicar", key=f"btn_mod_{clave}", use_container_width=True):
+            if clave_mod != CLAVE_REACTIVACION:
+                st.error("Clave incorrecta.")
+            elif nueva_mod == modalidad:
+                st.info("La modalidad ya es esa; no hay cambios.")
+            else:
+                df = st.session_state["df"]
+                cambios = {COL_E4_MODALIDAD: nueva_mod}
+                # Si pasa a recolección, fijar el límite de 20 días si no existe.
+                if nueva_mod == RESP_RECOLECCION and _a_fecha(fila.get(COL_E4_LIMITE_REC)) is None:
+                    cambios[COL_E4_LIMITE_REC] = pd.Timestamp(
+                        hoy_mx() + timedelta(days=DIAS_RECOLECCION))
+                mensaje = aplicar_guardado(
+                    df, clave, cambios, "Corrección",
+                    f"Modalidad de Destino final corregida a '{nueva_mod}'",
+                )
+                persistir_y_sincronizar(df, mensaje, "Modalidad corregida.")
 
     # ----- RECOLECCIÓN -----
     if modalidad == RESP_RECOLECCION:
