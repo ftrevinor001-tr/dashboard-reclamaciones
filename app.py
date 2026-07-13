@@ -71,7 +71,7 @@ NOMBRE_HOJA = "datos"
 # ahí, se usa la clave de respaldo de abajo. Para cambiarla sin tocar el código,
 # agrégala en Streamlit Cloud: ⋮ → Settings → Secrets
 #     CLAVE_REACTIVACION = "TuNuevaClave"
-CLAVE_REACTIVACION_RESPALDO = "devolucion"
+CLAVE_REACTIVACION_RESPALDO = "devoluciones2026"
 
 
 def clave_autorizacion() -> str:
@@ -107,6 +107,8 @@ ETAPA_FINAL = "FINALIZADO"
 DIAS_ETAPA_1 = 7    # desde FECHA CORTE
 DIAS_ETAPA_2 = 30   # desde el vencimiento de la etapa 1
 DIAS_ETAPA_3 = 53   # desde el vencimiento de la etapa 2
+DIAS_VENCIMIENTO_TOTAL = 90  # desde FECHA CORTE: vencimiento global del reclamo
+MSG_VENCIDO_90 = "RECLAMO VENCIDO SIN DEFINICIÓN, ENVIAR A DESTRUCCIÓN"
 DIAS_RECOLECCION = 20  # desde que se define la recolección (etapa 4)
 
 # Tipos de respuesta del proveedor (etapa 2)
@@ -417,6 +419,25 @@ def calcular_fechas_limite(fila: pd.Series) -> dict:
     return limites
 
 
+def fecha_vencimiento_90(fila: pd.Series):
+    """Fecha de vencimiento global del reclamo: FECHA CORTE + 90 días."""
+    corte = _a_fecha(fila.get(COL_FECHA_CORTE))
+    return corte + timedelta(days=DIAS_VENCIMIENTO_TOTAL) if corte else None
+
+
+def vencido_90_sin_definicion(fila: pd.Series) -> bool:
+    """True si pasaron los 90 días desde FECHA CORTE y el reclamo NO está resuelto.
+
+    'Sin definición' significa que el proceso aún no ha llegado a su fin
+    (la etapa no es FINALIZADO), por lo que debe enviarse a destrucción.
+    """
+    etapa = str(fila.get(COL_ETAPA, "")).strip()
+    if etapa == ETAPA_FINAL:
+        return False
+    limite = fecha_vencimiento_90(fila)
+    return limite is not None and hoy_mx() > limite
+
+
 def estado_alarma(fecha_limite, terminada: bool) -> tuple[str, str]:
     """Devuelve (nivel, mensaje) de alarma para una etapa activa.
 
@@ -447,6 +468,23 @@ def construir_notificaciones(df: pd.DataFrame) -> list[dict]:
         etapa = str(fila.get(COL_ETAPA, "")).strip()
         if etapa in ("", ETAPA_FINAL):
             continue
+
+        # --- ALARMA CRÍTICA: vencimiento global de 90 días sin definición ---
+        if vencido_90_sin_definicion(fila):
+            lim90 = fecha_vencimiento_90(fila)
+            dias_vencido = (hoy_mx() - lim90).days
+            avisos.append({
+                "folio": fila.get(COL_FOLIO, ""),
+                "proveedor": fila.get(COL_PROVEEDOR, ""),
+                "comprador": fila.get(COL_COMPRADOR, ""),
+                "etapa": etapa,
+                "nivel": "critico",
+                "mensaje": (f"{MSG_VENCIDO_90} · Venció hace {dias_vencido} día(s) "
+                            f"(90 días desde el corte: {lim90:%d/%m/%Y})."),
+                "destinatario": "",
+            })
+            continue  # esta alarma reemplaza a la de etapa (es más grave)
+
         limites = calcular_fechas_limite(fila)
         # Determinar la fecha límite y bandera de terminada de la etapa activa
         if etapa == ETAPA_1:
@@ -471,8 +509,9 @@ def construir_notificaciones(df: pd.DataFrame) -> list[dict]:
                 # Campo reservado para el futuro envío por correo:
                 "destinatario": "",
             })
-    # Vencidas primero
-    avisos.sort(key=lambda a: 0 if a["nivel"] == "danger" else 1)
+    # Orden: críticas (90 días) primero, luego vencidas, luego por vencerse
+    prioridad = {"critico": 0, "danger": 1, "warn": 2}
+    avisos.sort(key=lambda a: prioridad.get(a["nivel"], 3))
     return avisos
 
 
@@ -1253,18 +1292,40 @@ def vista_editar(df: pd.DataFrame) -> None:
                             options=df_sel["ETIQUETA"].tolist())
     fila = df_sel[df_sel["ETIQUETA"] == etiqueta].iloc[0]
 
-    # Ficha del registro
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(f"**Folio:** {fila[COL_FOLIO]}")
-        c1.markdown(f"**Proveedor:** {fila[COL_PROVEEDOR]}")
-        imp = pd.to_numeric(pd.Series([fila.get(COL_IMPORTE)]), errors="coerce").iloc[0]
-        c2.markdown(f"**Importe:** ${imp:,.2f}" if pd.notna(imp) else "**Importe:** —")
-        c2.markdown(f"**Comprador:** {fila[COL_COMPRADOR]}")
-        c3.markdown(f"**Fecha corte:** {_fmt_fecha(fila.get(COL_FECHA_CORTE))}")
-        c3.markdown(f"**Carta firmada:** {fila.get(COL_CARTA_FIRMADA, '—')}")
-        c4.markdown(f"**Etapa actual:** `{fila.get(COL_ETAPA, '—')}`")
-        c4.markdown(f"**Respuesta prov.:** {fila.get(COL_RESPUESTA_TIPO, '') or '—'}")
+    # Ficha compacta del registro (una sola línea, no ocupa espacio)
+    imp = pd.to_numeric(pd.Series([fila.get(COL_IMPORTE)]), errors="coerce").iloc[0]
+    imp_txt = f"${imp:,.2f}" if pd.notna(imp) else "—"
+    lim90 = fecha_vencimiento_90(fila)
+    st.markdown(
+        f"""<div style='display:flex;gap:1.2rem;flex-wrap:wrap;
+                        padding:0.4rem 0.7rem;margin:0.2rem 0 0.5rem 0;
+                        border:1px solid #e6e6e6;border-radius:8px;font-size:0.82rem'>
+          <span><b>Folio:</b> {fila[COL_FOLIO]}</span>
+          <span><b>Proveedor:</b> {fila[COL_PROVEEDOR]}</span>
+          <span><b>Importe:</b> {imp_txt}</span>
+          <span><b>Comprador:</b> {fila[COL_COMPRADOR] or '—'}</span>
+          <span><b>Corte:</b> {_fmt_fecha(fila.get(COL_FECHA_CORTE))}</span>
+          <span><b>Vence 90d:</b> {lim90:%d/%m/%Y}</span>
+          <span><b>Etapa:</b> <code>{fila.get(COL_ETAPA, '—')}</code></span>
+          <span><b>Respuesta:</b> {fila.get(COL_RESPUESTA_TIPO, '') or '—'}</span>
+          <span><b>Carta:</b> {fila.get(COL_CARTA_FIRMADA, '—')}</span>
+        </div>""" if lim90 else
+        f"""<div style='display:flex;gap:1.2rem;flex-wrap:wrap;
+                        padding:0.4rem 0.7rem;margin:0.2rem 0 0.5rem 0;
+                        border:1px solid #e6e6e6;border-radius:8px;font-size:0.82rem'>
+          <span><b>Folio:</b> {fila[COL_FOLIO]}</span>
+          <span><b>Proveedor:</b> {fila[COL_PROVEEDOR]}</span>
+          <span><b>Importe:</b> {imp_txt}</span>
+          <span><b>Etapa:</b> <code>{fila.get(COL_ETAPA, '—')}</code></span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Alarma crítica de 90 días para ESTE registro
+    if vencido_90_sin_definicion(fila):
+        dias_v = (hoy_mx() - lim90).days
+        st.error(f"🚨 **{MSG_VENCIDO_90}** — Venció hace {dias_v} día(s) "
+                 f"(límite: {lim90:%d/%m/%Y}).")
 
     t1, t2, t3, t4 = st.tabs([
         f"1️⃣ {ETAPA_1}", f"2️⃣ {ETAPA_2}", f"3️⃣ {ETAPA_3}", f"4️⃣ {ETAPA_4}",
@@ -1284,47 +1345,77 @@ def vista_editar(df: pd.DataFrame) -> None:
 # =============================================================================
 
 def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.header("🔎 Filtros")
+    """Filtros en cascada en la barra lateral (colapsable, no ocupa el área principal)."""
+    st.sidebar.markdown("### 🔎 Filtros")
     dff = df.copy()
+
+    # Búsqueda directa por folio (lo más usado)
+    buscar = st.sidebar.text_input("Buscar folio", placeholder="Ej. DC-MZ017")
+    if buscar.strip():
+        dff = dff[dff[COL_FOLIO].str.contains(buscar.strip(), case=False, na=False)]
 
     # Mes de reclamación (cascada inicial)
     if COL_MES_ETIQUETA in dff.columns:
         orden = (dff[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
                  .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
-        sel = st.sidebar.multiselect("Mes de reclamación", options=orden,
-                                     placeholder="Todos los meses")
+        sel = st.sidebar.multiselect("Mes", options=orden, placeholder="Todos")
         if sel:
             dff = dff[dff[COL_MES_ETIQUETA].isin(sel)]
 
+    # Proveedor
+    proveedores = sorted(x for x in dff[COL_PROVEEDOR].unique() if x)
+    selp = st.sidebar.multiselect("Proveedor", options=proveedores, placeholder="Todos")
+    if selp:
+        dff = dff[dff[COL_PROVEEDOR].isin(selp)]
+
     # Comprador
     compradores = sorted(x for x in dff[COL_COMPRADOR].unique() if x)
-    selc = st.sidebar.multiselect("Comprador", options=compradores,
-                                  placeholder="Todos los compradores")
+    selc = st.sidebar.multiselect("Comprador", options=compradores, placeholder="Todos")
     if selc:
         dff = dff[dff[COL_COMPRADOR].isin(selc)]
 
     # Etapa
     etapas_pres = [e for e in (ETAPA_1, ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL)
                    if e in set(dff[COL_ETAPA])]
-    sele = st.sidebar.multiselect("Etapa actual", options=etapas_pres,
-                                  placeholder="Todas las etapas")
+    sele = st.sidebar.multiselect("Etapa", options=etapas_pres, placeholder="Todas")
     if sele:
         dff = dff[dff[COL_ETAPA].isin(sele)]
 
-    st.sidebar.caption(f"Mostrando **{len(dff)}** de **{len(df)}** registros.")
+    # Solo vencidos a 90 días (alarma crítica)
+    solo_criticos = st.sidebar.checkbox(
+        f"🚨 Solo vencidos ({DIAS_VENCIMIENTO_TOTAL} días)",
+        help=MSG_VENCIDO_90,
+    )
+    if solo_criticos and not dff.empty:
+        mascara = dff.apply(vencido_90_sin_definicion, axis=1)
+        dff = dff[mascara]
+
+    st.sidebar.caption(f"**{len(dff)}** de **{len(df)}** registros")
     return dff
 
 
 def mostrar_kpis(df: pd.DataFrame) -> None:
+    """KPIs compactos en una sola línea."""
     total = len(df)
     importe = pd.to_numeric(df.get(COL_IMPORTE), errors="coerce").fillna(0).sum()
     finalizados = int((df[COL_ETAPA] == ETAPA_FINAL).sum())
     en_proceso = total - finalizados
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📦 Reclamaciones", f"{total:,}")
-    c2.metric("💰 Importe total (MXN)", f"${importe:,.2f}")
-    c3.metric("⏳ En proceso", en_proceso)
-    c4.metric("✅ Finalizadas", finalizados)
+    vencidos_90 = int(df.apply(vencido_90_sin_definicion, axis=1).sum()) if total else 0
+
+    st.markdown(
+        f"""<div style='display:flex;gap:1.6rem;flex-wrap:wrap;
+                        padding:0.35rem 0.7rem;margin-bottom:0.4rem;
+                        border:1px solid #e6e6e6;border-radius:8px;
+                        font-size:0.85rem;align-items:center'>
+          <span>📦 <b>{total:,}</b> reclamaciones</span>
+          <span>💰 <b>${importe:,.2f}</b></span>
+          <span>⏳ <b>{en_proceso}</b> en proceso</span>
+          <span>✅ <b>{finalizados}</b> finalizadas</span>
+          <span style='color:#c0392b'>🚨 <b>{vencidos_90}</b> vencidas
+            ({DIAS_VENCIMIENTO_TOTAL} días)</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 def mostrar_notificaciones(df: pd.DataFrame) -> None:
@@ -1332,27 +1423,57 @@ def mostrar_notificaciones(df: pd.DataFrame) -> None:
     if not avisos:
         st.success("✅ No hay reclamaciones por vencerse o vencidas con los filtros actuales.")
         return
+
+    criticos = [a for a in avisos if a["nivel"] == "critico"]
     vencidas = [a for a in avisos if a["nivel"] == "danger"]
     por_vencer = [a for a in avisos if a["nivel"] == "warn"]
-    c1, c2 = st.columns(2)
-    c1.metric("🔴 Vencidas", len(vencidas))
-    c2.metric("🟡 Por vencerse", len(por_vencer))
-    for a in avisos:
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"🚨 Vencidas {DIAS_VENCIMIENTO_TOTAL} días", len(criticos))
+    c2.metric("🔴 Etapa vencida", len(vencidas))
+    c3.metric("🟡 Por vencerse", len(por_vencer))
+
+    # --- Sección crítica: reclamos vencidos a 90 días ---
+    if criticos:
+        st.error(f"🚨 **{MSG_VENCIDO_90}**")
+        for a in criticos:
+            st.markdown(
+                f"&nbsp;&nbsp;🚨 **Folio {a['folio']}** · {a['proveedor']} · "
+                f"_{a['etapa']}_ — {a['mensaje']}"
+            )
+        st.divider()
+
+    # --- Etapas vencidas y por vencerse ---
+    for a in vencidas + por_vencer:
         icono = "🔴" if a["nivel"] == "danger" else "🟡"
         st.markdown(f"{icono} **Folio {a['folio']}** · {a['proveedor']} · "
                     f"_{a['etapa']}_ — {a['mensaje']} (Comprador: {a['comprador']})")
 
 
 def mostrar_tabla(df: pd.DataFrame) -> None:
+    vista = df.copy()
+    # Columna de alerta: reclamos vencidos a 90 días sin definición
+    COL_ALERTA = "⚠️ ALERTA"
+    if not vista.empty:
+        vista[COL_ALERTA] = vista.apply(
+            lambda f: MSG_VENCIDO_90 if vencido_90_sin_definicion(f) else "", axis=1
+        )
+        vista["VENCE 90D"] = vista.apply(fecha_vencimiento_90, axis=1)
+    else:
+        vista[COL_ALERTA] = ""
+        vista["VENCE 90D"] = pd.NaT
+
     columnas = [COL_FOLIO, COL_PROVEEDOR, COL_COMPRADOR, COL_IMPORTE, COL_FECHA_CORTE,
+                "VENCE 90D", COL_ALERTA,
                 COL_ETAPA, COL_RESPUESTA_TIPO, COL_E1_TERM, COL_E2_TERM, COL_E3_TERM,
                 COL_E4_TERM, COL_MODIFICADO_POR, COL_FECHA_MODIFICACION]
-    columnas = [c for c in columnas if c in df.columns]
+    columnas = [c for c in columnas if c in vista.columns]
     st.dataframe(
-        df[columnas], use_container_width=True, hide_index=True,
+        vista[columnas], use_container_width=True, hide_index=True,
         column_config={
             COL_IMPORTE: st.column_config.NumberColumn(format="$%.2f"),
             COL_FECHA_CORTE: st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "VENCE 90D": st.column_config.DateColumn(format="DD/MM/YYYY"),
         },
     )
 
@@ -1408,7 +1529,14 @@ permite capturar la fecha real y el responsable de cada paso, y cerrar la etapa
 con esa fecha. Los días transcurridos se calculan con la fecha real capturada,
 no con la de hoy, para que las métricas del proceso sean correctas.
 
-### 🔔 Alarmas
+### 🚨 Alarma de vencimiento total ({DIAS_VENCIMIENTO_TOTAL} días)
+Si pasan **{DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte** y el reclamo
+todavía no está finalizado, se dispara la alarma:
+**{MSG_VENCIDO_90}**. Aparece en el encabezado, en la ficha del registro, en la
+tabla y en la pestaña *Resumen y alarmas*. En la barra lateral hay un filtro para
+ver solo estos reclamos.
+
+### 🔔 Alarmas por etapa
 En la pestaña **Resumen** se listan las reclamaciones *por vencerse* (≤ 15 días) y
 *vencidas*. La estructura de avisos está preparada para enviarse por correo en el
 futuro.
@@ -1548,24 +1676,40 @@ def main() -> None:
         st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
     df = st.session_state["df"]
 
-    st.markdown("### 📋 Dashboard de Devoluciones y Reclamaciones")
-    st.markdown("#### Seguimiento a devoluciones")
+    # --- Encabezado compacto (una sola línea) ---
+    st.markdown(
+        "<div style='margin-bottom:0.2rem'>"
+        "<span style='font-size:1.15rem;font-weight:700'>📋 Seguimiento a devoluciones</span>"
+        "<span style='color:#888;font-size:0.85rem'> · Devoluciones y reclamaciones</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    st.sidebar.title("⚙️ Panel de control")
-    if st.sidebar.button("🔄 Recargar datos", use_container_width=True):
+    # --- Barra lateral: control + filtros (colapsable, no ocupa el área principal) ---
+    st.sidebar.markdown("### ⚙️ Panel")
+    cb1, cb2 = st.sidebar.columns(2)
+    if cb1.button("🔄 Recargar", use_container_width=True):
         cargar_datos.clear()
         st.session_state["version_datos"] += 1
         st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
         st.rerun()
-    if st.sidebar.button("🚪 Cerrar sesión", use_container_width=True):
+    if cb2.button("🚪 Salir", use_container_width=True):
         st.session_state.clear()
         st.rerun()
-    st.sidebar.divider()
 
     df_filtrado = construir_filtros(df)
 
+    # --- KPIs compactos en una línea ---
     mostrar_kpis(df_filtrado)
-    st.divider()
+
+    # --- Aviso destacado de reclamos vencidos a 90 días ---
+    criticos = [f for _, f in df_filtrado.iterrows() if vencido_90_sin_definicion(f)]
+    if criticos:
+        st.error(
+            f"🚨 **{MSG_VENCIDO_90}** — {len(criticos)} reclamo(s) rebasaron los "
+            f"{DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte. "
+            "Revísalos en la pestaña *Resumen y alarmas*."
+        )
 
     tab_editar, tab_tabla, tab_resumen, tab_bd, tab_guia = st.tabs(
         ["✏️ Editar reclamación", "📊 Tabla", "🔔 Resumen y alarmas",
