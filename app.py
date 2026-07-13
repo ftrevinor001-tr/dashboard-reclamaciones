@@ -619,6 +619,168 @@ def _boton_reactivar(etapa_cod: str, clave_registro: str) -> None:
 # Mapas auxiliares para reactivación
 ETAPA_NOMBRE_POR_COD = {"E1": ETAPA_1, "E2": ETAPA_2, "E3": ETAPA_3, "E4": ETAPA_4}
 COL_TERM_POR_COD = {"E1": COL_E1_TERM, "E2": COL_E2_TERM, "E3": COL_E3_TERM, "E4": COL_E4_TERM}
+COL_DIAS_POR_COD = {"E1": COL_E1_DIAS, "E2": COL_E2_DIAS, "E3": COL_E3_DIAS}
+
+
+def _pasos_de_etapa(cod: str, fila: pd.Series) -> list:
+    """Devuelve la lista de pasos de una etapa. Para E4 depende de la modalidad."""
+    if cod == "E1":
+        return PASOS_E1
+    if cod == "E2":
+        return PASOS_E2
+    if cod == "E3":
+        return PASOS_E3
+    modalidad = str(fila.get(COL_E4_MODALIDAD, "")).strip()
+    return PASOS_E4_RECOLECCION if modalidad == RESP_RECOLECCION else PASOS_E4_DESTRUCCION
+
+
+def _panel_ajuste_manual(etapa_cod: str, fila: pd.Series) -> None:
+    """Panel protegido con clave para capturar/corregir fechas de pasos ya realizados.
+
+    Sirve para registros que se completaron antes de usar la app: permite poner
+    la fecha real de cada paso (retroactiva), quién lo hizo, y cerrar la etapa
+    con esa fecha para que los días transcurridos se calculen correctamente.
+    """
+    clave = fila["CLAVE"]
+    pasos = _pasos_de_etapa(etapa_cod, fila)
+    nombre_etapa = ETAPA_NOMBRE_POR_COD[etapa_cod]
+
+    with st.expander("🗓️ Ajuste manual de fechas (requiere clave)"):
+        st.caption(
+            "Usa esta opción cuando la etapa se realizó **antes** de usar la app y "
+            "necesitas capturar las fechas reales. Puedes dejar en blanco los pasos "
+            "que no apliquen."
+        )
+        clave_in = st.text_input(
+            "Clave de autorización", type="password",
+            key=f"aj_clave_{etapa_cod}_{clave}",
+        )
+
+        with st.form(f"form_ajuste_{etapa_cod}_{clave}"):
+            st.markdown("##### Fecha y responsable de cada paso")
+            valores = {}
+            for pkey, etiqueta, cf, cu in pasos:
+                c1, c2, c3 = st.columns([2, 2, 2])
+                fecha_actual = _a_fecha(fila.get(cf))
+                usar = c1.checkbox(
+                    etiqueta, value=fecha_actual is not None,
+                    key=f"aj_use_{etapa_cod}_{pkey}_{clave}",
+                )
+                fecha_in = c2.date_input(
+                    "Fecha", value=fecha_actual or hoy_mx(), format="DD/MM/YYYY",
+                    key=f"aj_fecha_{etapa_cod}_{pkey}_{clave}",
+                    label_visibility="collapsed",
+                )
+                usuario_in = c3.text_input(
+                    "Responsable",
+                    value=str(fila.get(cu, "") or ""),
+                    placeholder="Responsable",
+                    key=f"aj_user_{etapa_cod}_{pkey}_{clave}",
+                    label_visibility="collapsed",
+                )
+                valores[pkey] = (usar, fecha_in, usuario_in, cf, cu)
+
+            st.divider()
+            cerrar_etapa = st.checkbox(
+                f"Marcar la etapa '{nombre_etapa}' como TERMINADA con estas fechas",
+                value=es_verdadero(fila.get(COL_TERM_POR_COD[etapa_cod])),
+                key=f"aj_cerrar_{etapa_cod}_{clave}",
+                help="Al cerrarla se activa la siguiente etapa y se calculan los días "
+                     "transcurridos con la fecha del último paso.",
+            )
+
+            # En la etapa 2, la respuesta del proveedor define hacia dónde avanza.
+            respuesta_aj = None
+            if etapa_cod == "E2":
+                actual = str(fila.get(COL_RESPUESTA_TIPO, "")).strip()
+                opciones = [RESP_RECOLECCION, RESP_DESTRUCCION, RESP_SIN]
+                idx = opciones.index(actual) if actual in opciones else 0
+                respuesta_aj = st.radio(
+                    "Respuesta del proveedor (define la siguiente etapa)",
+                    options=opciones, index=idx, horizontal=True,
+                    key=f"aj_resp_{clave}",
+                )
+
+            firma = st.text_input(
+                "Tu nombre / usuario (quien hace el ajuste)",
+                key=f"aj_firma_{etapa_cod}_{clave}",
+            )
+            aplicar = st.form_submit_button(
+                "💾 Aplicar ajuste manual", use_container_width=True
+            )
+
+        if not aplicar:
+            return
+        if clave_in != CLAVE_REACTIVACION:
+            st.error("🔒 Clave de autorización incorrecta.")
+            return
+        if not firma.strip():
+            st.error("✍️ Firma con tu nombre antes de aplicar el ajuste.")
+            return
+
+        df = st.session_state["df"]
+        cambios = {}
+        fechas_marcadas = []
+        for pkey, (usar, fecha_in, usuario_in, cf, cu) in valores.items():
+            if usar:
+                cambios[cf] = pd.Timestamp(fecha_in)
+                cambios[cu] = usuario_in.strip() or firma.strip()
+                fechas_marcadas.append(fecha_in)
+            else:
+                cambios[cf] = pd.NaT
+                cambios[cu] = ""
+
+        if etapa_cod == "E2" and respuesta_aj:
+            cambios[COL_RESPUESTA_TIPO] = respuesta_aj
+
+        mensaje_log = f"Ajuste manual de fechas en '{nombre_etapa}'"
+
+        if cerrar_etapa:
+            if not fechas_marcadas:
+                st.error("Marca al menos un paso con su fecha antes de cerrar la etapa.")
+                return
+            cambios[COL_TERM_POR_COD[etapa_cod]] = "SÍ"
+            fecha_cierre = max(fechas_marcadas)  # la fecha del último paso realizado
+
+            # Días transcurridos, calculados con la fecha real de cierre.
+            limites = calcular_fechas_limite(fila)
+            if etapa_cod == "E1":
+                corte = _a_fecha(fila.get(COL_FECHA_CORTE))
+                if corte:
+                    cambios[COL_E1_DIAS] = (fecha_cierre - corte).days
+                cambios[COL_ETAPA] = ETAPA_2
+                cambios[COL_E1_LIMITE] = (pd.Timestamp(limites["E1"])
+                                          if limites["E1"] else pd.NaT)
+            elif etapa_cod == "E2":
+                if limites["E2"]:
+                    cambios[COL_E2_DIAS] = (fecha_cierre - limites["E2"]).days + DIAS_ETAPA_2
+                    cambios[COL_E2_LIMITE] = pd.Timestamp(limites["E2"])
+                if respuesta_aj == RESP_RECOLECCION:
+                    cambios[COL_ETAPA] = ETAPA_4
+                    cambios[COL_E4_MODALIDAD] = RESP_RECOLECCION
+                    cambios[COL_E4_LIMITE_REC] = pd.Timestamp(
+                        fecha_cierre + timedelta(days=DIAS_RECOLECCION)
+                    )
+                else:
+                    cambios[COL_ETAPA] = ETAPA_3
+                    cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
+            elif etapa_cod == "E3":
+                if limites["E3"]:
+                    cambios[COL_E3_DIAS] = (fecha_cierre - limites["E3"]).days + DIAS_ETAPA_3
+                    cambios[COL_E3_LIMITE] = pd.Timestamp(limites["E3"])
+                cambios[COL_ETAPA] = ETAPA_4
+                cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
+            else:  # E4
+                cambios[COL_ETAPA] = ETAPA_FINAL
+
+            mensaje_log += f" · etapa TERMINADA con fecha {fecha_cierre:%d/%m/%Y}"
+        else:
+            # Si se desmarca el cierre, la etapa vuelve a quedar abierta.
+            cambios[COL_TERM_POR_COD[etapa_cod]] = "NO"
+            cambios[COL_ETAPA] = nombre_etapa
+
+        mensaje = aplicar_guardado(df, clave, cambios, firma.strip(), mensaje_log)
+        persistir_y_sincronizar(df, mensaje, "Ajuste manual aplicado.")
 
 
 def _etapa_bloqueada(fila: pd.Series, etapa_cod: str) -> bool:
@@ -693,6 +855,7 @@ def pestania_etapa1(fila: pd.Series) -> None:
         if str(fila.get(COL_E1_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E1_OBS)}")
         _boton_reactivar("E1", clave)
+        _panel_ajuste_manual("E1", fila)
         return
 
     with st.form(f"form_e1_{clave}"):
@@ -701,6 +864,9 @@ def pestania_etapa1(fila: pd.Series) -> None:
                            placeholder="Notas sobre la recepción/revisión/envío…")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e1_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
+
+    # Ajuste manual disponible también con la etapa abierta
+    _panel_ajuste_manual("E1", fila)
 
     if not guardar:
         return
@@ -758,6 +924,7 @@ def pestania_etapa2(fila: pd.Series) -> None:
         if str(fila.get(COL_E2_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E2_OBS)}")
         _boton_reactivar("E2", clave)
+        _panel_ajuste_manual("E2", fila)
         return
 
     with st.form(f"form_e2_{clave}"):
@@ -788,6 +955,9 @@ def pestania_etapa2(fila: pd.Series) -> None:
                    "siguiente según la respuesta seleccionada.")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e2_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
+
+    # Ajuste manual disponible también con la etapa abierta
+    _panel_ajuste_manual("E2", fila)
 
     if not guardar:
         return
@@ -869,6 +1039,7 @@ def pestania_etapa3(fila: pd.Series) -> None:
         if str(fila.get(COL_E3_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E3_OBS)}")
         _boton_reactivar("E3", clave)
+        _panel_ajuste_manual("E3", fila)
         return
 
     with st.form(f"form_e3_{clave}"):
@@ -878,6 +1049,9 @@ def pestania_etapa3(fila: pd.Series) -> None:
                    "activa **Destino final**.")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e3_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
+
+    # Ajuste manual disponible también con la etapa abierta
+    _panel_ajuste_manual("E3", fila)
 
     if not guardar:
         return
@@ -958,6 +1132,7 @@ def pestania_etapa4(fila: pd.Series) -> None:
         if str(fila.get(COL_E4_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E4_OBS)}")
         _boton_reactivar("E4", clave)
+        _panel_ajuste_manual("E4", fila)
         return
 
     with st.form(f"form_e4_{clave}"):
@@ -966,6 +1141,9 @@ def pestania_etapa4(fila: pd.Series) -> None:
         st.caption(f"Al registrar '{ultimo_etiqueta}' se da por terminado TODO el proceso.")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e4_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
+
+    # Ajuste manual disponible también con la etapa abierta
+    _panel_ajuste_manual("E4", fila)
 
     if not guardar:
         return
@@ -1161,6 +1339,13 @@ Al registrar el último paso, **todo el proceso se da por terminado**.
 ### 🔓 Reactivar etapas
 Cada etapa cerrada tiene un botón **Reactivar** protegido con clave. Solo el
 personal autorizado puede reabrir una etapa para corregir información.
+
+### 🗓️ Ajuste manual de fechas (retroactivo)
+En cada etapa hay un panel **Ajuste manual de fechas**, también protegido con la
+misma clave. Sirve para los registros que se **completaron antes de usar la app**:
+permite capturar la fecha real y el responsable de cada paso, y cerrar la etapa
+con esa fecha. Los días transcurridos se calculan con la fecha real capturada,
+no con la de hoy, para que las métricas del proceso sean correctas.
 
 ### 🔔 Alarmas
 En la pestaña **Resumen** se listan las reclamaciones *por vencerse* (≤ 15 días) y
