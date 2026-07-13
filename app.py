@@ -64,8 +64,19 @@ RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
 RUTA_EXCEL = os.path.join(RUTA_BASE, "datos.xlsx")
 NOMBRE_HOJA = "datos"
 
-# Clave para reactivar (desbloquear) etapas ya cerradas.
-CLAVE_REACTIVACION = "devoluciones2026"
+# Clave para las acciones protegidas (reactivar etapas, ajuste manual de fechas
+# y corrección de modalidad).
+#
+# Se lee de los secretos de Streamlit: CLAVE_REACTIVACION. Si no está definida
+# ahí, se usa la clave de respaldo de abajo. Para cambiarla sin tocar el código,
+# agrégala en Streamlit Cloud: ⋮ → Settings → Secrets
+#     CLAVE_REACTIVACION = "TuNuevaClave"
+CLAVE_REACTIVACION_RESPALDO = "devoluciones2026"
+
+
+def clave_autorizacion() -> str:
+    """Devuelve la clave para desbloquear acciones protegidas."""
+    return st.secrets.get("CLAVE_REACTIVACION", CLAVE_REACTIVACION_RESPALDO)
 
 # --- Columnas base (encabezados normalizados a MAYÚSCULAS sin saltos) ---
 COL_MES = "MES DE DEVOLUCION"
@@ -591,7 +602,7 @@ def _boton_reactivar(etapa_cod: str, clave_registro: str) -> None:
         )
         if c2.button("Reactivar", key=f"btn_react_{etapa_cod}_{clave_registro}",
                      use_container_width=True):
-            if clave_in != CLAVE_REACTIVACION:
+            if clave_in != clave_autorizacion():
                 st.error("Clave incorrecta.")
                 return
             df = st.session_state["df"]
@@ -729,7 +740,7 @@ def _panel_ajuste_manual(etapa_cod: str, fila: pd.Series) -> None:
 
         if not aplicar:
             return
-        if clave_in != CLAVE_REACTIVACION:
+        if clave_in != clave_autorizacion():
             st.error("🔒 Clave de autorización incorrecta.")
             return
         if not firma.strip():
@@ -1134,7 +1145,7 @@ def pestania_etapa4(fila: pd.Series) -> None:
             key=f"sel_mod_{clave}",
         )
         if cm3.button("Aplicar", key=f"btn_mod_{clave}", use_container_width=True):
-            if clave_mod != CLAVE_REACTIVACION:
+            if clave_mod != clave_autorizacion():
                 st.error("Clave incorrecta.")
             elif nueva_mod == modalidad:
                 st.info("La modalidad ya es esa; no hay cambios.")
