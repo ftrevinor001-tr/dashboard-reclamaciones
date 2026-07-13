@@ -71,7 +71,7 @@ NOMBRE_HOJA = "datos"
 # ahí, se usa la clave de respaldo de abajo. Para cambiarla sin tocar el código,
 # agrégala en Streamlit Cloud: ⋮ → Settings → Secrets
 #     CLAVE_REACTIVACION = "TuNuevaClave"
-CLAVE_REACTIVACION_RESPALDO = "devoluciones2026"
+CLAVE_REACTIVACION_RESPALDO = "devolucion"
 
 
 def clave_autorizacion() -> str:
