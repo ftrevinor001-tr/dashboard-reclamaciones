@@ -1732,8 +1732,8 @@ def _grafica_barras(tabla: pd.DataFrame, etiqueta_valor: str, es_dinero: bool,
 
     if not ALTAIR_OK:
         # Respaldo: gráfica nativa (sin formato personalizado).
-        st.bar_chart(tabla, height=altura, stack=True,
-                     y_label=etiqueta_valor, x_label="Comprador")
+        st.bar_chart(tabla, height=altura, stack=True, horizontal=True,
+                     x_label=etiqueta_valor, y_label="Comprador")
         return
 
     # Formatos estilo D3: '$,.2f' → $1,234.56 · ',d' → 1,234
@@ -1748,16 +1748,17 @@ def _grafica_barras(tabla: pd.DataFrame, etiqueta_valor: str, es_dinero: bool,
     largo = largo[largo["Valor"] != 0]
 
     orden = orden_series or list(tabla.columns)
+    # Barras HORIZONTALES: el valor va en el eje X y el comprador en el Y.
     grafica = (
         alt.Chart(largo)
         .mark_bar()
         .encode(
-            x=alt.X("Comprador:N", title="Comprador",
-                    sort=list(tabla.index), axis=alt.Axis(labelAngle=-90)),
-            y=alt.Y("Valor:Q", title=etiqueta_valor,
+            y=alt.Y("Comprador:N", title=None,
+                    sort=list(tabla.index)),
+            x=alt.X("Valor:Q", title=etiqueta_valor,
                     axis=alt.Axis(format=fmt)),
             color=alt.Color("Serie:N", title="", sort=orden,
-                            legend=alt.Legend(orient="bottom")),
+                            legend=alt.Legend(orient="bottom", columns=3)),
             order=alt.Order("Serie:N"),
             tooltip=[
                 alt.Tooltip("Comprador:N", title="Comprador"),
@@ -1776,18 +1777,18 @@ def _grafica_porcentaje(resumen: pd.DataFrame, altura: int = 320) -> None:
         st.info("Sin datos para graficar.")
         return
     if not ALTAIR_OK:
-        st.bar_chart(resumen[["% finalizado"]], height=altura,
-                     y_label="% finalizado", x_label="Comprador")
+        st.bar_chart(resumen[["% finalizado"]], height=altura, horizontal=True,
+                     x_label="% finalizado", y_label="Comprador")
         return
 
     datos = resumen.reset_index().rename(columns={"_comprador": "Comprador"})
+    # Barras HORIZONTALES
     grafica = (
         alt.Chart(datos)
         .mark_bar()
         .encode(
-            x=alt.X("Comprador:N", title="Comprador",
-                    sort=list(resumen.index), axis=alt.Axis(labelAngle=-90)),
-            y=alt.Y("% finalizado:Q", title="% finalizado",
+            y=alt.Y("Comprador:N", title=None, sort=list(resumen.index)),
+            x=alt.X("% finalizado:Q", title="% finalizado",
                     scale=alt.Scale(domain=[0, 100]),
                     axis=alt.Axis(format=".0f")),
             tooltip=[
@@ -1798,6 +1799,116 @@ def _grafica_porcentaje(resumen: pd.DataFrame, altura: int = 320) -> None:
         .properties(height=altura)
     )
     st.altair_chart(grafica, use_container_width=True)
+
+
+def _dias_por_etapa(fila: pd.Series) -> dict:
+    """Días que tardó cada etapa en una reclamación.
+
+    E1, E2 y E3 tienen su columna de días registrada. Disposición final (E4) no
+    la tiene, así que se calcula desde el cierre de Gestión hasta la fecha del
+    último paso realizado en esa etapa.
+    Devuelve solo las etapas terminadas con un valor válido.
+    """
+    dias = {}
+
+    def _num(valor):
+        try:
+            v = float(valor)
+            return v if v == v else None  # descarta NaN
+        except (TypeError, ValueError):
+            return None
+
+    if es_verdadero(fila.get(COL_E1_TERM)):
+        v = _num(fila.get(COL_E1_DIAS))
+        if v is not None:
+            dias[ETAPA_1] = v
+    if es_verdadero(fila.get(COL_E2_TERM)):
+        v = _num(fila.get(COL_E2_DIAS))
+        if v is not None:
+            dias[ETAPA_2] = v
+    if es_verdadero(fila.get(COL_E3_TERM)):
+        v = _num(fila.get(COL_E3_DIAS))
+        if v is not None:
+            dias[ETAPA_3] = v
+
+    # Disposición final: desde la respuesta del proveedor (cierre de Gestión)
+    # hasta el último paso registrado en la etapa.
+    if es_verdadero(fila.get(COL_E4_TERM)):
+        inicio = _a_fecha(fila.get("E2 FECHA RESPUESTA"))
+        pasos_e4 = (PASOS_E4_RECOLECCION
+                    if modalidad_destino_final(fila) == RESP_RECOLECCION
+                    else PASOS_E4_DESTRUCCION)
+        fechas = [_a_fecha(fila.get(cf)) for _c, _e, cf, _cu in pasos_e4]
+        fechas = [f for f in fechas if f]
+        if inicio and fechas:
+            d = (max(fechas) - inicio).days
+            if d >= 0:
+                dias[ETAPA_4] = float(d)
+    return dias
+
+
+def _grafica_dias_promedio(df: pd.DataFrame, altura: int = 360) -> None:
+    """Días promedio por etapa y mes (barras horizontales agrupadas)."""
+    filas = []
+    for _, fila in df.iterrows():
+        mes = fila.get(COL_MES_ETIQUETA, "Sin fecha")
+        orden_mes = _a_fecha(fila.get(COL_MES))
+        for etapa, dias in _dias_por_etapa(fila).items():
+            filas.append({"Mes": mes, "_orden": orden_mes or date.min,
+                          "Etapa": etapa, "Días": dias})
+
+    if not filas:
+        st.info("Todavía no hay etapas terminadas con días registrados. "
+                "Este dato aparece conforme se vayan cerrando etapas.")
+        return
+
+    detalle = pd.DataFrame(filas)
+    resumen = (detalle.groupby(["Mes", "_orden", "Etapa"], as_index=False)
+               .agg(Promedio=("Días", "mean"), Casos=("Días", "size")))
+    resumen["Promedio"] = resumen["Promedio"].round(1)
+    resumen = resumen.sort_values("_orden")
+    orden_meses = resumen.drop_duplicates("Mes")["Mes"].tolist()
+    orden_etapas = [e for e in (ETAPA_1, ETAPA_2, ETAPA_4, ETAPA_3)
+                    if e in set(resumen["Etapa"])]
+
+    if not ALTAIR_OK:
+        st.dataframe(
+            resumen.pivot(index="Mes", columns="Etapa", values="Promedio"),
+            use_container_width=True,
+        )
+        return
+
+    grafica = (
+        alt.Chart(resumen)
+        .mark_bar()
+        .encode(
+            y=alt.Y("Etapa:N", title=None, sort=orden_etapas),
+            x=alt.X("Promedio:Q", title="Días promedio",
+                    axis=alt.Axis(format=".1f")),
+            color=alt.Color("Etapa:N", title="", sort=orden_etapas,
+                            legend=alt.Legend(orient="bottom", columns=2)),
+            row=alt.Row("Mes:N", title=None, sort=orden_meses,
+                        header=alt.Header(labelAngle=0, labelAlign="left")),
+            tooltip=[
+                alt.Tooltip("Mes:N", title="Mes"),
+                alt.Tooltip("Etapa:N", title="Etapa"),
+                alt.Tooltip("Promedio:Q", title="Días promedio", format=".1f"),
+                alt.Tooltip("Casos:Q", title="Reclamaciones", format=",d"),
+            ],
+        )
+        .properties(height=max(60, altura // max(1, len(orden_meses))))
+    )
+    st.altair_chart(grafica, use_container_width=True)
+
+    with st.expander("📋 Ver detalle de días promedio"):
+        tabla = resumen.pivot(index="Mes", columns="Etapa", values="Promedio")
+        tabla = tabla.reindex(orden_meses)
+        cols = [c for c in orden_etapas if c in tabla.columns]
+        st.dataframe(
+            tabla[cols], use_container_width=True,
+            column_config={c: st.column_config.NumberColumn(format="%.1f")
+                           for c in cols},
+        )
 
 
 def vista_graficas(df: pd.DataFrame) -> None:
@@ -1935,6 +2046,14 @@ def vista_graficas(df: pd.DataFrame) -> None:
             detalle, use_container_width=True,
             column_config={c: fmt_columna for c in detalle.columns},
         )
+
+    # =====================================================================
+    # 4) Días promedio por etapa y mes
+    # =====================================================================
+    st.markdown("##### 4. Días promedio por etapa")
+    st.caption("Cuánto tardó en promedio cada etapa, agrupado por mes de "
+               "reclamación. Solo considera etapas ya terminadas.")
+    _grafica_dias_promedio(dfg, altura=360)
 
 
 # =============================================================================
