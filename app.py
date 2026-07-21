@@ -6,8 +6,8 @@
 #
 #     1) Reporte de reclamo   (7 días)
 #     2) Gestión              (30 días)
-#     3) Cuentas por pagar    (53 días)
-#     4) Destino final        (recolección 20 días / destrucción)
+#     3) Disposición final    (recolección con contador de 20 días / destrucción)
+#     4) Cuentas por pagar    (53 días) — cierra el proceso
 #
 #  Cada etapa registra fecha y usuario de cada estatus, observaciones, y al
 #  cerrarse bloquea su pestaña y activa la siguiente. Las etapas se pueden
@@ -100,7 +100,7 @@ COL_FECHA_MODIFICACION = "FECHA MODIFICACIÓN"
 ETAPA_1 = "Reporte de reclamo"
 ETAPA_2 = "Gestión"
 ETAPA_3 = "Cuentas por pagar"
-ETAPA_4 = "Destino final"
+ETAPA_4 = "Disposición final"
 ETAPA_FINAL = "FINALIZADO"
 
 # Duraciones (días) de cada etapa.
@@ -129,14 +129,11 @@ PASOS_E2 = [
     ("respuesta", "Respuesta de proveedor", "E2 FECHA RESPUESTA", "E2 USUARIO RESPUESTA"),
 ]
 PASOS_E3 = [
-    ("negociacion", "Negociación con proveedor", "E3 FECHA NEGOCIACION", "E3 USUARIO NEGOCIACION"),
     ("seguimiento", "Seguimiento", "E3 FECHA SEGUIMIENTO", "E3 USUARIO SEGUIMIENTO"),
     ("recepcion_nc", "Recepción de nota de crédito", "E3 FECHA RECEPCION NC", "E3 USUARIO RECEPCION NC"),
     ("aplicacion", "Aplicación de pago", "E3 FECHA APLICACION PAGO", "E3 USUARIO APLICACION"),
 ]
 PASOS_E4_DESTRUCCION = [
-    ("informe", "Informe a proveedor", "E4 FECHA INFORME PROVEEDOR", "E4 USUARIO INFORME"),
-    ("definicion", "Definición de destino final", "E4 FECHA DEFINICION DESTINO", "E4 USUARIO DEFINICION"),
     ("reporte_almacen", "Reporte al almacén de devoluciones", "E4 FECHA REPORTE ALMACEN", "E4 USUARIO REPORTE ALMACEN"),
     ("folio_ajuste", "Recepción de folio de ajuste", "E4 FECHA RECEPCION FOLIO AJUSTE", "E4 USUARIO FOLIO AJUSTE"),
 ]
@@ -405,17 +402,23 @@ def subir_a_github(mensaje_commit: str) -> tuple[bool, str]:
 def calcular_fechas_limite(fila: pd.Series) -> dict:
     """Calcula las fechas límite de cada etapa a partir de FECHA CORTE.
 
-    E1: FECHA CORTE + 7
-    E2: límite E1 + 30
-    E3: límite E2 + 53
+    Flujo: Reporte (7d) → Gestión (30d) → Disposición final → Cuentas por pagar.
+    Los plazos suman 90 días en total desde la fecha de corte:
+      E1: FECHA CORTE + 7
+      E2: límite E1 + 30   (día 37)
+      E4: comparte el tramo final con E3 (día 90), pues va después de Gestión
+      E3: límite E2 + 53   (día 90, cierre del proceso)
     Devuelve un dict con date o None por etapa.
     """
     corte = _a_fecha(fila.get(COL_FECHA_CORTE))
-    limites = {"E1": None, "E2": None, "E3": None}
+    limites = {"E1": None, "E2": None, "E3": None, "E4": None}
     if corte:
         limites["E1"] = corte + timedelta(days=DIAS_ETAPA_1)
         limites["E2"] = limites["E1"] + timedelta(days=DIAS_ETAPA_2)
         limites["E3"] = limites["E2"] + timedelta(days=DIAS_ETAPA_3)
+        # Disposición final ocurre entre Gestión y Cuentas por pagar: su fecha
+        # tope es la misma del cierre global (90 días desde el corte).
+        limites["E4"] = limites["E3"]
     return limites
 
 
@@ -494,7 +497,9 @@ def construir_notificaciones(df: pd.DataFrame) -> list[dict]:
         elif etapa == ETAPA_3:
             lim, term = limites["E3"], es_verdadero(fila.get(COL_E3_TERM))
         elif etapa == ETAPA_4:
-            lim, term = _a_fecha(fila.get(COL_E4_LIMITE_REC)), es_verdadero(fila.get(COL_E4_TERM))
+            # El plazo de la etapa es el global; el de recolección (20 días) es
+            # un contador aparte que se muestra dentro de la propia etapa.
+            lim, term = limites["E4"], es_verdadero(fila.get(COL_E4_TERM))
         else:
             continue
         nivel, mensaje = estado_alarma(lim, term)
@@ -648,7 +653,7 @@ def _boton_reactivar(etapa_cod: str, clave_registro: str) -> None:
             cambios = {COL_ETAPA: ETAPA_NOMBRE_POR_COD[etapa_cod]}
             # Reabrir esta etapa y todas las posteriores (limpiar terminada
             # y las fechas/usuarios de sus pasos, para recorrerlas de nuevo).
-            orden = ["E1", "E2", "E3", "E4"]
+            orden = ["E1", "E2", "E4", "E3"]  # orden real del flujo
             pasos_por_cod = {
                 "E1": PASOS_E1, "E2": PASOS_E2, "E3": PASOS_E3,
                 "E4": PASOS_E4_DESTRUCCION + PASOS_E4_RECOLECCION,
@@ -823,23 +828,22 @@ def _panel_ajuste_manual(etapa_cod: str, fila: pd.Series) -> None:
                 if limites["E2"]:
                     cambios[COL_E2_DIAS] = (fecha_cierre - limites["E2"]).days + DIAS_ETAPA_2
                     cambios[COL_E2_LIMITE] = pd.Timestamp(limites["E2"])
+                # Gestión SIEMPRE pasa a Disposición final.
+                cambios[COL_ETAPA] = ETAPA_4
                 if respuesta_aj == RESP_RECOLECCION:
-                    cambios[COL_ETAPA] = ETAPA_4
                     cambios[COL_E4_MODALIDAD] = RESP_RECOLECCION
                     cambios[COL_E4_LIMITE_REC] = pd.Timestamp(
                         fecha_cierre + timedelta(days=DIAS_RECOLECCION)
                     )
                 else:
-                    cambios[COL_ETAPA] = ETAPA_3
                     cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
-            elif etapa_cod == "E3":
+            elif etapa_cod == "E4":
+                # Disposición final SIEMPRE pasa a Cuentas por pagar.
+                cambios[COL_ETAPA] = ETAPA_3
+            else:  # E3 — última etapa: cierra el proceso
                 if limites["E3"]:
                     cambios[COL_E3_DIAS] = (fecha_cierre - limites["E3"]).days + DIAS_ETAPA_3
                     cambios[COL_E3_LIMITE] = pd.Timestamp(limites["E3"])
-                cambios[COL_ETAPA] = ETAPA_4
-                # No forzar destrucción: respetar la respuesta del proveedor.
-                cambios[COL_E4_MODALIDAD] = modalidad_destino_final(fila)
-            else:  # E4
                 cambios[COL_ETAPA] = ETAPA_FINAL
 
             mensaje_log += f" · etapa TERMINADA con fecha {fecha_cierre:%d/%m/%Y}"
@@ -1011,7 +1015,8 @@ def pestania_etapa2(fila: pd.Series) -> None:
                 "Fecha compromiso de recolección", value=hoy_mx(),
                 format="DD/MM/YYYY", key=f"comp_{clave}",
             )
-            st.info("Al cerrar, se activará la pestaña **Destino final** (modalidad recolección).")
+            st.info(f"Al cerrar, se activará **{ETAPA_4}** en modalidad recolección, "
+                    f"con un contador de {DIAS_RECOLECCION} días para recoger.")
         elif respuesta == RESP_DESTRUCCION:
             st.warning("Destrucción: se reportará a Devoluciones y se informará a CxP de la "
                        "nota de crédito. Al cerrar se activará **Cuentas por pagar**.")
@@ -1048,7 +1053,9 @@ def pestania_etapa2(fila: pd.Series) -> None:
     cerrar = _paso_quedo_hecho(PASOS_E2[-1][2], cambios, fila)
     mensaje_log = "Avance en Gestión"
     if cerrar:
-        # Cerrar etapa 2 y bifurcar según la respuesta
+        # Cerrar etapa 2: SIEMPRE pasa a Disposición final (flujo lineal).
+        # La respuesta del proveedor ya no decide la etapa siguiente, solo
+        # define los pasos que se mostrarán en Disposición final.
         for cu in [p[3] for p in PASOS_E2]:
             if not str(fila.get(cu, "")).strip() and cu not in cambios:
                 cambios[cu] = usuario.strip()
@@ -1056,41 +1063,35 @@ def pestania_etapa2(fila: pd.Series) -> None:
         if lim_e2:
             cambios[COL_E2_DIAS] = (hoy_mx() - lim_e2).days + DIAS_ETAPA_2
         cambios[COL_E2_TERM] = "SÍ"
+        cambios[COL_ETAPA] = ETAPA_4
         if respuesta == RESP_RECOLECCION:
-            cambios[COL_ETAPA] = ETAPA_4
             cambios[COL_E4_MODALIDAD] = RESP_RECOLECCION
+            # Contador independiente: 20 días para recoger desde que se define.
             cambios[COL_E4_LIMITE_REC] = pd.Timestamp(hoy_mx() + timedelta(days=DIAS_RECOLECCION))
-            mensaje_log = "Etapa 2 TERMINADA · Recolección → pasa a Destino final"
         else:
-            cambios[COL_ETAPA] = ETAPA_3
-            cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION  # destino final será destrucción
-            mensaje_log = f"Etapa 2 TERMINADA · {respuesta} → pasa a Cuentas por pagar"
+            cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
+        mensaje_log = (f"Etapa 2 TERMINADA · {respuesta} → pasa a {ETAPA_4}")
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
     persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=bool(cerrar))
 
 
 def pestania_etapa3(fila: pd.Series) -> None:
-    """Etapa 3 — Cuentas por pagar (53 días desde el vencimiento de la etapa 2)."""
+    """Cuentas por pagar — última etapa del flujo, tras Disposición final."""
     clave = fila["CLAVE"]
     etapa_actual = str(fila.get(COL_ETAPA, "")).strip()
-    # Solo aplica si el flujo fue destrucción o sin respuesta (no recolección)
-    es_recoleccion = str(fila.get(COL_RESPUESTA_TIPO, "")).strip() == RESP_RECOLECCION
-    disponible = etapa_actual in (ETAPA_3, ETAPA_4, ETAPA_FINAL) and not es_recoleccion
+    # Se activa al cerrar Disposición final (todas las reclamaciones pasan por aquí).
+    disponible = etapa_actual in (ETAPA_3, ETAPA_FINAL) or _etapa_bloqueada(fila, "E4")
     terminada = _etapa_bloqueada(fila, "E3")
     limites = calcular_fechas_limite(fila)
 
-    st.markdown(f"#### 3️⃣ {ETAPA_3}")
-    st.caption("Pasos: Negociación → Seguimiento → Recepción de nota de crédito → "
-               "Aplicación de pago. Plazo de 53 días desde el vencimiento de Gestión.")
+    st.markdown(f"#### 4️⃣ {ETAPA_3}")
+    st.caption("Pasos: Seguimiento → Recepción de nota de crédito → Aplicación de pago. "
+               "Es la última etapa: al cerrarla se da por terminado todo el proceso "
+               f"(plazo total de {DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte).")
 
-    if es_recoleccion:
-        st.info("Esta reclamación fue de **recolección**, por lo que no pasa por "
-                "Cuentas por pagar. Continúa en **Destino final**.")
-        return
     if not disponible:
-        st.warning("🔒 Esta etapa se activa cuando cierres **Gestión** con respuesta "
-                   "de destrucción o sin respuesta.")
+        st.warning(f"🔒 Esta etapa se activa cuando cierres **{ETAPA_4}**.")
         return
 
     _mostrar_alarma(limites["E3"], terminada)
@@ -1103,7 +1104,7 @@ def pestania_etapa3(fila: pd.Series) -> None:
                  "Notificar a Devoluciones para proceder con la destrucción.")
 
     if terminada:
-        st.success("Etapa terminada. Continúa en **Destino final**.")
+        st.success("🎉 Proceso TERMINADO. Todas las etapas y fechas quedaron registradas.")
         _resumen_pasos(fila, PASOS_E3)
         if str(fila.get(COL_E3_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E3_OBS)}")
@@ -1114,8 +1115,8 @@ def pestania_etapa3(fila: pd.Series) -> None:
     with st.form(f"form_e3_{clave}"):
         cambios, cols_usuario = _registrar_pasos_form(fila, PASOS_E3, "e3", solo_lectura=False)
         obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E3_OBS, "") or ""))
-        st.caption("Al registrar 'Aplicación de pago' se da por terminada la etapa y se "
-                   "activa **Destino final**.")
+        st.caption("Al registrar 'Aplicación de pago' se da por terminado TODO el "
+                   "proceso de la reclamación.")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e3_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
 
@@ -1143,30 +1144,30 @@ def pestania_etapa3(fila: pd.Series) -> None:
         if lim_e3:
             cambios[COL_E3_DIAS] = (hoy_mx() - lim_e3).days + DIAS_ETAPA_3
         cambios[COL_E3_TERM] = "SÍ"
-        cambios[COL_ETAPA] = ETAPA_4
-        # Respetar la respuesta del proveedor (no forzar destrucción).
-        cambios[COL_E4_MODALIDAD] = modalidad_destino_final(fila)
-        mensaje_log = "Etapa 3 (Cuentas por pagar) TERMINADA → pasa a Destino final"
+        # Cuentas por pagar es la ÚLTIMA etapa del flujo: cierra el proceso.
+        cambios[COL_ETAPA] = ETAPA_FINAL
+        mensaje_log = "Etapa Cuentas por pagar TERMINADA · PROCESO FINALIZADO"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
     persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=aplicacion_hecha)
 
 
 def pestania_etapa4(fila: pd.Series) -> None:
-    """Etapa 4 — Destino final (recolección 20 días / destrucción)."""
+    """Disposición final — va después de Gestión y antes de Cuentas por pagar."""
     clave = fila["CLAVE"]
     etapa_actual = str(fila.get(COL_ETAPA, "")).strip()
     modalidad = modalidad_destino_final(fila)
-    disponible = etapa_actual in (ETAPA_4, ETAPA_FINAL)
+    # Se activa al cerrar Gestión; sigue visible en las etapas posteriores.
+    disponible = (etapa_actual in (ETAPA_4, ETAPA_3, ETAPA_FINAL)
+                  or _etapa_bloqueada(fila, "E2"))
     terminada = _etapa_bloqueada(fila, "E4")
 
-    st.markdown(f"#### 4️⃣ {ETAPA_4}")
-    st.caption("Cierre del proceso. La ruta depende de la respuesta del proveedor: "
-               "recolección o destrucción.")
+    st.markdown(f"#### 3️⃣ {ETAPA_4}")
+    st.caption("Define el destino del producto. Los pasos dependen de la respuesta "
+               f"del proveedor. Al cerrarla se activa **{ETAPA_3}**.")
 
     if not disponible:
-        st.warning("🔒 Esta etapa se activa al cerrar la etapa previa "
-                   "(Gestión con recolección, o Cuentas por pagar).")
+        st.warning(f"🔒 Esta etapa se activa al cerrar **{ETAPA_2}**.")
         return
 
     st.info(f"Modalidad: **{modalidad}**")
@@ -1197,37 +1198,54 @@ def pestania_etapa4(fila: pd.Series) -> None:
                         hoy_mx() + timedelta(days=DIAS_RECOLECCION))
                 mensaje = aplicar_guardado(
                     df, clave, cambios, "Corrección",
-                    f"Modalidad de Destino final corregida a '{nueva_mod}'",
+                    f"Modalidad de {ETAPA_4} corregida a '{nueva_mod}'",
                 )
                 persistir_y_sincronizar(df, mensaje, "Modalidad corregida.")
 
+    # Alarma del plazo de la etapa (parte de los 90 días globales)
+    limites = calcular_fechas_limite(fila)
+    _mostrar_alarma(limites["E4"], terminada)
+
     # ----- RECOLECCIÓN -----
     if modalidad == RESP_RECOLECCION:
+        # Contador INDEPENDIENTE: 20 días para que recojan el producto, contados
+        # desde que se definió la recolección al cerrar Gestión.
         lim_rec = _a_fecha(fila.get(COL_E4_LIMITE_REC))
-        _mostrar_alarma(lim_rec, terminada)
-        nivel, _ = estado_alarma(lim_rec, terminada)
-        if nivel == "danger" and not terminada:
-            st.error("⚠️ Vencieron los 20 días de recolección: proceder a enviarlo a "
-                     "**destrucción**. Usa el botón de abajo para cambiar a destrucción.")
-            if st.button("➡️ Cambiar a destrucción por vencimiento", key=f"to_destr_{clave}"):
-                df = st.session_state["df"]
-                cambios = {COL_E4_MODALIDAD: RESP_DESTRUCCION,
-                           COL_E4_ESTATUS: "Definición de destino final"}
-                mensaje = aplicar_guardado(df, clave, cambios, "Sistema",
-                                           "Recolección vencida → cambia a destrucción")
-                persistir_y_sincronizar(df, mensaje, "Cambiado a destrucción.")
+        if lim_rec:
+            dias_rest = (lim_rec - hoy_mx()).days
+            if terminada:
+                st.info(f"📦 Recolección · fecha límite: {lim_rec:%d/%m/%Y}")
+            elif dias_rest < 0:
+                st.error(f"📦 **Recolección vencida** hace {abs(dias_rest)} día(s) "
+                         f"(límite {lim_rec:%d/%m/%Y}). Procede a enviarlo a destrucción.")
+                if st.button("➡️ Cambiar a destrucción por vencimiento",
+                             key=f"to_destr_{clave}"):
+                    df = st.session_state["df"]
+                    cambios = {COL_E4_MODALIDAD: RESP_DESTRUCCION}
+                    mensaje = aplicar_guardado(
+                        df, clave, cambios, "Sistema",
+                        f"Recolección vencida ({DIAS_RECOLECCION} días) → cambia a destrucción")
+                    persistir_y_sincronizar(df, mensaje, "Cambiado a destrucción.")
+            elif dias_rest <= 5:
+                st.warning(f"📦 Recolección: quedan {dias_rest} día(s) "
+                           f"(límite {lim_rec:%d/%m/%Y}).")
+            else:
+                st.info(f"📦 Recolección: quedan {dias_rest} día(s) de los "
+                        f"{DIAS_RECOLECCION} (límite {lim_rec:%d/%m/%Y}).")
 
+        st.caption("Recolección: Programación → Recolección → Recepción de folio "
+                   "de devolución.")
         pasos = PASOS_E4_RECOLECCION
         ultimo_etiqueta = "Recepción de folio de devolución"
     # ----- DESTRUCCIÓN -----
     else:
-        st.caption("Destrucción por vencimiento: Informe a proveedor → Definición de "
-                   "destino final → Reporte al almacén → Recepción de folio de ajuste.")
+        st.caption("Destrucción: Reporte al almacén de devoluciones → Recepción de "
+                   "folio de ajuste.")
         pasos = PASOS_E4_DESTRUCCION
         ultimo_etiqueta = "Recepción de folio de ajuste"
 
     if terminada:
-        st.success("🎉 Proceso TERMINADO. Todas las etapas y fechas quedaron registradas.")
+        st.success(f"Etapa terminada. Continúa en **{ETAPA_3}**.")
         _resumen_pasos(fila, pasos)
         if str(fila.get(COL_E4_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E4_OBS)}")
@@ -1238,7 +1256,8 @@ def pestania_etapa4(fila: pd.Series) -> None:
     with st.form(f"form_e4_{clave}"):
         cambios, cols_usuario = _registrar_pasos_form(fila, pasos, "e4", solo_lectura=False)
         obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E4_OBS, "") or ""))
-        st.caption(f"Al registrar '{ultimo_etiqueta}' se da por terminado TODO el proceso.")
+        st.caption(f"Al registrar '{ultimo_etiqueta}' se cierra esta etapa y se "
+                   f"activa **{ETAPA_3}**.")
         usuario = st.text_input("Tu nombre / usuario", key=f"u_e4_{clave}")
         guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
 
@@ -1257,11 +1276,12 @@ def pestania_etapa4(fila: pd.Series) -> None:
     cambios[COL_E4_OBS] = obs.strip()
 
     ultimo_hecho = _paso_quedo_hecho(pasos[-1][2], cambios, fila)
-    mensaje_log = "Avance en Destino final"
+    mensaje_log = f"Avance en {ETAPA_4}"
     if ultimo_hecho:
         cambios[COL_E4_TERM] = "SÍ"
-        cambios[COL_ETAPA] = ETAPA_FINAL
-        mensaje_log = "Etapa 4 (Destino final) TERMINADA · PROCESO FINALIZADO"
+        # Disposición final SIEMPRE pasa a Cuentas por pagar (flujo lineal).
+        cambios[COL_ETAPA] = ETAPA_3
+        mensaje_log = f"Etapa {ETAPA_4} TERMINADA → pasa a {ETAPA_3}"
 
     mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
     persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=ultimo_hecho)
@@ -1327,17 +1347,18 @@ def vista_editar(df: pd.DataFrame) -> None:
         st.error(f"🚨 **{MSG_VENCIDO_90}** — Venció hace {dias_v} día(s) "
                  f"(límite: {lim90:%d/%m/%Y}).")
 
+    # Orden del flujo: Reporte → Gestión → Disposición final → Cuentas por pagar
     t1, t2, t3, t4 = st.tabs([
-        f"1️⃣ {ETAPA_1}", f"2️⃣ {ETAPA_2}", f"3️⃣ {ETAPA_3}", f"4️⃣ {ETAPA_4}",
+        f"1️⃣ {ETAPA_1}", f"2️⃣ {ETAPA_2}", f"3️⃣ {ETAPA_4}", f"4️⃣ {ETAPA_3}",
     ])
     with t1:
         pestania_etapa1(fila)
     with t2:
         pestania_etapa2(fila)
     with t3:
-        pestania_etapa3(fila)
-    with t4:
         pestania_etapa4(fila)
+    with t4:
+        pestania_etapa3(fila)
 
 
 # =============================================================================
@@ -1571,25 +1592,28 @@ se cierra la etapa, se cuentan los días que tardó y se activa **Gestión**.
 
 ### 2️⃣ {ETAPA_2} · plazo {DIAS_ETAPA_2} días
 Pasos: **Enviado a proveedor → Seguimiento → Respuesta de proveedor**.
-Aquí se captura la **respuesta del proveedor**:
-- **Recolección** → se pide *fecha compromiso* y se activa **Destino final**.
-- **Destrucción** → se reporta a Devoluciones, se informa a CxP de la nota de
-  crédito y se activa **Cuentas por pagar**.
-- **Sin respuesta** (al vencer) → se notifica a CxP para negociación y se activa
-  **Cuentas por pagar**.
+Aquí se captura la **respuesta del proveedor** (recolección, destrucción o sin
+respuesta). Al cerrar la etapa **siempre** se pasa a **{ETAPA_4}**; la respuesta
+solo define qué pasos se mostrarán ahí.
 
-### 3️⃣ {ETAPA_3} · plazo {DIAS_ETAPA_3} días
-Pasos: **Negociación → Seguimiento → Recepción de nota de crédito → Aplicación de pago**.
-Si vence sin respuesta del proveedor, se lanza la alarma de **destrucción por
-vencimiento** (estatus *Aplicación a factura*) y se notifica a Devoluciones.
-Al registrar *Aplicación de pago* se activa **Destino final**.
+### 3️⃣ {ETAPA_4}
+Define el destino del producto, según la respuesta capturada en Gestión:
+- **Recolección**: **Programación → Recolección → Recepción de folio de devolución**.
+  Lleva un contador **independiente de {DIAS_RECOLECCION} días** para que el
+  proveedor recoja, contados desde que se definió la recolección al cerrar
+  Gestión. Si vence, se puede cambiar a destrucción con un botón.
+- **Destrucción**: **Reporte al almacén de devoluciones → Recepción de folio de ajuste**.
 
-### 4️⃣ {ETAPA_4}
-- **Recolección**: **Programación → Recolección → Recepción de folio de devolución**,
-  con un contador de **{DIAS_RECOLECCION} días**. Si vence, se manda a destrucción.
-- **Destrucción**: **Informe a proveedor → Definición de destino final → Reporte al
-  almacén → Recepción de folio de ajuste**.
-Al registrar el último paso, **todo el proceso se da por terminado**.
+Al registrar el último paso se cierra la etapa y **siempre** se activa **{ETAPA_3}**.
+
+### 4️⃣ {ETAPA_3} · plazo {DIAS_ETAPA_3} días
+Pasos: **Seguimiento → Recepción de nota de crédito → Aplicación de pago**.
+Es la **última etapa**: al registrar *Aplicación de pago* se da por terminado
+todo el proceso. Si vence sin respuesta del proveedor, se lanza la alarma de
+destrucción por vencimiento y se notifica a Devoluciones.
+
+> **Plazos:** 7 + 30 + 53 = **{DIAS_VENCIMIENTO_TOTAL} días** en total desde la
+> fecha de corte. El contador de recolección corre por separado.
 
 ### 🔓 Reactivar etapas
 Cada etapa cerrada tiene un botón **Reactivar** protegido con clave. Solo el
@@ -1633,7 +1657,8 @@ y la bitácora completa se acumula en *Acciones / Notas* para su posterior anál
 # 11a. GRÁFICAS DE AVANCE POR COMPRADOR
 # =============================================================================
 
-ORDEN_ETAPAS = [ETAPA_1, ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL]
+# Orden real del flujo: Reporte → Gestión → Disposición final → Cuentas por pagar
+ORDEN_ETAPAS = [ETAPA_1, ETAPA_2, ETAPA_4, ETAPA_3, ETAPA_FINAL]
 
 
 def _clasificar_urgencia(fila: pd.Series) -> str:
