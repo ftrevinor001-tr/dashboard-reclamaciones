@@ -1425,10 +1425,14 @@ def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
                         help=MSG_VENCIDO_90, key="f_criticos")
 
     # --- Limpiar ---
+    # Se ELIMINAN las claves en lugar de reasignarlas: Streamlit no permite
+    # escribir en el session_state de un widget ya instanciado en este ciclo
+    # (lanzaría StreamlitAPIException). Al borrarlas, los widgets se recrean
+    # en el siguiente rerun con sus valores por defecto.
     if st.sidebar.button("🧹 Limpiar filtros", use_container_width=True):
-        for k, v in (("f_folio", ""), ("f_mes", []), ("f_proveedor", []),
-                     ("f_comprador", []), ("f_etapa", []), ("f_criticos", False)):
-            st.session_state[k] = v
+        for k in ("f_folio", "f_mes", "f_proveedor", "f_comprador",
+                  "f_etapa", "f_criticos"):
+            st.session_state.pop(k, None)
         st.rerun()
 
     # --- Resultado con TODAS las selecciones aplicadas ---
