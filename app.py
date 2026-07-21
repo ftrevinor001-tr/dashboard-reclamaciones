@@ -1371,23 +1371,33 @@ def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
     """Filtros en cascada bidireccional con selección múltiple.
 
     Cada filtro muestra únicamente las opciones que siguen siendo posibles según
-    lo elegido en TODOS los demás filtros, en cualquier orden. Las selecciones se
-    guardan en session_state para que sobrevivan a los re-renders.
+    lo elegido en TODOS los demás filtros, en cualquier orden.
+
+    Las claves de los widgets llevan un sufijo de versión (`_v{n}`). Para limpiar
+    los filtros se incrementa esa versión: Streamlit ve widgets nuevos y los crea
+    vacíos. Esto es necesario porque borrar la clave del session_state no basta
+    —el widget se vuelve a dibujar con su valor anterior— y reasignarla lanzaría
+    StreamlitAPIException.
     """
     st.sidebar.markdown("### 🔎 Filtros")
 
+    v = st.session_state.get("filtros_version", 0)
+    k_folio, k_mes = f"f_folio_v{v}", f"f_mes_v{v}"
+    k_prov, k_comp = f"f_proveedor_v{v}", f"f_comprador_v{v}"
+    k_etapa, k_crit = f"f_etapa_v{v}", f"f_criticos_v{v}"
+
     # Estado previo de las selecciones (lo que el usuario ya eligió)
     sel = {
-        "folio": st.session_state.get("f_folio", "").strip(),
-        "mes": st.session_state.get("f_mes", []),
-        "proveedor": st.session_state.get("f_proveedor", []),
-        "comprador": st.session_state.get("f_comprador", []),
-        "etapa": st.session_state.get("f_etapa", []),
-        "criticos": st.session_state.get("f_criticos", False),
+        "folio": st.session_state.get(k_folio, "").strip(),
+        "mes": st.session_state.get(k_mes, []),
+        "proveedor": st.session_state.get(k_prov, []),
+        "comprador": st.session_state.get(k_comp, []),
+        "etapa": st.session_state.get(k_etapa, []),
+        "criticos": st.session_state.get(k_crit, False),
     }
 
     # --- Búsqueda por folio ---
-    st.sidebar.text_input("Buscar folio", placeholder="Ej. DC-MZ017", key="f_folio")
+    st.sidebar.text_input("Buscar folio", placeholder="Ej. DC-MZ017", key=k_folio)
 
     # --- Mes: opciones según los demás filtros ---
     base_mes = _aplicar_filtros(df, sel, excluir="mes")
@@ -1395,21 +1405,21 @@ def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
                     .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
     # Conservar valores ya elegidos aunque el resto los excluya (evita perder la selección)
     opciones_mes += [m for m in sel["mes"] if m not in opciones_mes]
-    st.sidebar.multiselect("Mes", options=opciones_mes, placeholder="Todos", key="f_mes")
+    st.sidebar.multiselect("Mes", options=opciones_mes, placeholder="Todos", key=k_mes)
 
     # --- Proveedor ---
     base_prov = _aplicar_filtros(df, sel, excluir="proveedor")
     opciones_prov = sorted(x for x in base_prov[COL_PROVEEDOR].unique() if x)
     opciones_prov += [p for p in sel["proveedor"] if p not in opciones_prov]
     st.sidebar.multiselect("Proveedor", options=opciones_prov, placeholder="Todos",
-                           key="f_proveedor")
+                           key=k_prov)
 
     # --- Comprador ---
     base_comp = _aplicar_filtros(df, sel, excluir="comprador")
     opciones_comp = sorted(x for x in base_comp[COL_COMPRADOR].unique() if x)
     opciones_comp += [c for c in sel["comprador"] if c not in opciones_comp]
     st.sidebar.multiselect("Comprador", options=opciones_comp, placeholder="Todos",
-                           key="f_comprador")
+                           key=k_comp)
 
     # --- Etapa ---
     base_etapa = _aplicar_filtros(df, sel, excluir="etapa")
@@ -1418,31 +1428,20 @@ def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
                       if e in presentes]
     opciones_etapa += [e for e in sel["etapa"] if e not in opciones_etapa]
     st.sidebar.multiselect("Etapa", options=opciones_etapa, placeholder="Todas",
-                           key="f_etapa")
+                           key=k_etapa)
 
     # --- Solo vencidos a 90 días ---
     st.sidebar.checkbox(f"🚨 Solo vencidos ({DIAS_VENCIMIENTO_TOTAL} días)",
-                        help=MSG_VENCIDO_90, key="f_criticos")
-
-    # --- Limpiar ---
-    # Se ELIMINAN las claves en lugar de reasignarlas: Streamlit no permite
-    # escribir en el session_state de un widget ya instanciado en este ciclo
-    # (lanzaría StreamlitAPIException). Al borrarlas, los widgets se recrean
-    # en el siguiente rerun con sus valores por defecto.
-    if st.sidebar.button("🧹 Limpiar filtros", use_container_width=True):
-        for k in ("f_folio", "f_mes", "f_proveedor", "f_comprador",
-                  "f_etapa", "f_criticos"):
-            st.session_state.pop(k, None)
-        st.rerun()
+                        help=MSG_VENCIDO_90, key=k_crit)
 
     # --- Resultado con TODAS las selecciones aplicadas ---
     seleccion_actual = {
-        "folio": st.session_state.get("f_folio", "").strip(),
-        "mes": st.session_state.get("f_mes", []),
-        "proveedor": st.session_state.get("f_proveedor", []),
-        "comprador": st.session_state.get("f_comprador", []),
-        "etapa": st.session_state.get("f_etapa", []),
-        "criticos": st.session_state.get("f_criticos", False),
+        "folio": st.session_state.get(k_folio, "").strip(),
+        "mes": st.session_state.get(k_mes, []),
+        "proveedor": st.session_state.get(k_prov, []),
+        "comprador": st.session_state.get(k_comp, []),
+        "etapa": st.session_state.get(k_etapa, []),
+        "criticos": st.session_state.get(k_crit, False),
     }
     dff = _aplicar_filtros(df, seleccion_actual)
 
@@ -1451,6 +1450,16 @@ def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
         bool(seleccion_actual["proveedor"]), bool(seleccion_actual["comprador"]),
         bool(seleccion_actual["etapa"]), bool(seleccion_actual["criticos"]),
     ])
+
+    # --- Limpiar (solo se ofrece si hay algo que limpiar) ---
+    if st.sidebar.button("🧹 Limpiar filtros", use_container_width=True,
+                         disabled=activos == 0):
+        # Borrar los valores actuales y estrenar versión de claves.
+        for k in (k_folio, k_mes, k_prov, k_comp, k_etapa, k_crit):
+            st.session_state.pop(k, None)
+        st.session_state["filtros_version"] = v + 1
+        st.rerun()
+
     resumen = f"**{len(dff)}** de **{len(df)}** registros"
     if activos:
         resumen += f" · {activos} filtro(s) activo(s)"
