@@ -101,6 +101,15 @@ ETAPA_1 = "Reporte de reclamo"
 ETAPA_2 = "Gestión"
 ETAPA_3 = "Cuentas por pagar"
 ETAPA_4 = "Disposición final"
+
+# Nombres antiguos que puedan existir en la base de datos, para migrarlos
+# automáticamente al cargar (evita que aparezcan etiquetas obsoletas en
+# tablas, filtros y gráficas).
+NOMBRES_ETAPA_ANTIGUOS = {
+    "Destino final": ETAPA_4,
+    "DESTINO FINAL": ETAPA_4,
+    "Destino Final": ETAPA_4,
+}
 ETAPA_FINAL = "FINALIZADO"
 
 # Duraciones (días) de cada etapa.
@@ -281,6 +290,12 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
     # Etapa inicial por defecto
     if COL_ETAPA in df.columns:
         df[COL_ETAPA] = df[COL_ETAPA].replace("", pd.NA).fillna(ETAPA_1)
+        # Migración de nombres antiguos: los registros guardados antes del
+        # cambio de nombre conservan "Destino final" en la base. Se renombran
+        # a la etiqueta vigente para que tablas, filtros y gráficas coincidan.
+        df[COL_ETAPA] = df[COL_ETAPA].astype(str).str.strip().replace(
+            NOMBRES_ETAPA_ANTIGUOS
+        )
 
     # Texto clave normalizado
     for col in (COL_PROVEEDOR, COL_COMPRADOR, COL_FOLIO):
@@ -924,7 +939,8 @@ def pestania_etapa1(fila: pd.Series) -> None:
         _resumen_pasos(fila, PASOS_E1)
         dias = fila.get(COL_E1_DIAS)
         if str(dias).strip():
-            st.metric("Días que tardó la etapa", dias)
+            st.metric("Días que tardó la etapa", f"{float(dias):.0f}"
+                      if str(dias).replace('.', '').replace('-', '').isdigit() else dias)
         if str(fila.get(COL_E1_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E1_OBS)}")
         _boton_reactivar("E1", clave)
@@ -1560,14 +1576,19 @@ def mostrar_tabla(df: pd.DataFrame) -> None:
     columnas = [COL_FOLIO, COL_PROVEEDOR, COL_COMPRADOR, COL_IMPORTE, COL_FECHA_CORTE,
                 "VENCE 90D", COL_ALERTA,
                 COL_ETAPA, COL_RESPUESTA_TIPO, COL_E1_TERM, COL_E2_TERM, COL_E3_TERM,
-                COL_E4_TERM, COL_MODIFICADO_POR, COL_FECHA_MODIFICACION]
+                COL_E4_TERM, COL_E1_DIAS, COL_E2_DIAS, COL_E3_DIAS,
+                COL_MODIFICADO_POR, COL_FECHA_MODIFICACION]
     columnas = [c for c in columnas if c in vista.columns]
     st.dataframe(
         vista[columnas], use_container_width=True, hide_index=True,
         column_config={
-            COL_IMPORTE: st.column_config.NumberColumn(format="$%.2f"),
+            # Importes en formato moneda; días como número entero.
+            COL_IMPORTE: st.column_config.NumberColumn("Importe (MXN)", format="$%.2f"),
             COL_FECHA_CORTE: st.column_config.DateColumn(format="DD/MM/YYYY"),
             "VENCE 90D": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            COL_E1_DIAS: st.column_config.NumberColumn("Días E1", format="%d"),
+            COL_E2_DIAS: st.column_config.NumberColumn("Días E2", format="%d"),
+            COL_E3_DIAS: st.column_config.NumberColumn("Días E3", format="%d"),
         },
     )
 
@@ -1715,17 +1736,24 @@ def vista_graficas(df: pd.DataFrame) -> None:
         st.info("No hay registros para los meses seleccionados.")
         return
 
-    # Columna de valor según la medida elegida
+    # Columna de valor y formato según la medida elegida.
+    # Cantidad → número entero con separador de miles (sin decimales).
+    # Importe  → moneda en pesos con dos decimales.
     if medida == "Cantidad":
         dfg = dfg.assign(_valor=1.0)
+        es_dinero = False
         formato = "{:,.0f}"
         etiqueta_valor = "Reclamaciones"
+        # Formato para las columnas numéricas de las tablas
+        fmt_columna = st.column_config.NumberColumn(format="%d")
     else:
         dfg = dfg.assign(
             _valor=pd.to_numeric(dfg[COL_IMPORTE], errors="coerce").fillna(0.0)
         )
+        es_dinero = True
         formato = "${:,.2f}"
         etiqueta_valor = "Importe (MXN)"
+        fmt_columna = st.column_config.NumberColumn(format="$%.2f")
 
     dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
 
@@ -1742,8 +1770,12 @@ def vista_graficas(df: pd.DataFrame) -> None:
     columnas_orden += [c for c in tabla_etapas.columns if c not in columnas_orden]
     tabla_etapas = tabla_etapas[columnas_orden]
     tabla_etapas = tabla_etapas.loc[tabla_etapas.sum(axis=1).sort_values(ascending=False).index]
+    # Las cantidades son conteos: se muestran como enteros.
+    if not es_dinero:
+        tabla_etapas = tabla_etapas.round(0).astype(int)
 
-    st.bar_chart(tabla_etapas, height=340, stack=True)
+    st.bar_chart(tabla_etapas, height=340, stack=True,
+                 y_label=etiqueta_valor, x_label="Comprador")
 
     # =====================================================================
     # 2) Porcentaje finalizado por comprador
@@ -1760,14 +1792,23 @@ def vista_graficas(df: pd.DataFrame) -> None:
 
     cg1, cg2 = st.columns([3, 2])
     with cg1:
-        st.bar_chart(resumen[["% finalizado"]], height=320)
+        st.bar_chart(resumen[["% finalizado"]], height=320,
+                     y_label="% finalizado", x_label="Comprador")
     with cg2:
         tabla_pct = resumen.copy()
-        tabla_pct["total"] = tabla_pct["total"].map(formato.format)
-        tabla_pct["finalizado"] = tabla_pct["finalizado"].map(formato.format)
+        if not es_dinero:
+            tabla_pct["total"] = tabla_pct["total"].round(0).astype(int)
+            tabla_pct["finalizado"] = tabla_pct["finalizado"].round(0).astype(int)
         tabla_pct = tabla_pct.rename(columns={
             "total": etiqueta_valor, "finalizado": "Finalizado"})
-        st.dataframe(tabla_pct, use_container_width=True, height=320)
+        st.dataframe(
+            tabla_pct, use_container_width=True, height=320,
+            column_config={
+                etiqueta_valor: fmt_columna,
+                "Finalizado": fmt_columna,
+                "% finalizado": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
 
     # =====================================================================
     # 3) Estado de vencimiento por comprador
@@ -1789,16 +1830,22 @@ def vista_graficas(df: pd.DataFrame) -> None:
     if criticas:
         tabla_urg = tabla_urg.loc[
             tabla_urg[criticas].sum(axis=1).sort_values(ascending=False).index]
+    if not es_dinero:
+        tabla_urg = tabla_urg.round(0).astype(int)
 
-    st.bar_chart(tabla_urg, height=340, stack=True)
+    st.bar_chart(tabla_urg, height=340, stack=True,
+                 y_label=etiqueta_valor, x_label="Comprador")
 
     # --- Resumen numérico general ---
     with st.expander("📋 Ver detalle numérico por comprador"):
         detalle = tabla_etapas.copy()
         detalle["TOTAL"] = detalle.sum(axis=1)
-        if medida == "Importe (MXN)":
+        if es_dinero:
             detalle = detalle.round(2)
-        st.dataframe(detalle, use_container_width=True)
+        st.dataframe(
+            detalle, use_container_width=True,
+            column_config={c: fmt_columna for c in detalle.columns},
+        )
 
 
 # =============================================================================
