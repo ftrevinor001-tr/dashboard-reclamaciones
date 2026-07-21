@@ -1344,53 +1344,113 @@ def vista_editar(df: pd.DataFrame) -> None:
 # 10. TABLA, FILTROS, KPIs Y NOTIFICACIONES
 # =============================================================================
 
+def _aplicar_filtros(df: pd.DataFrame, seleccion: dict, excluir: str = None) -> pd.DataFrame:
+    """Aplica todos los filtros de `seleccion`, opcionalmente omitiendo uno.
+
+    Omitir un filtro permite calcular sus opciones disponibles según el resto
+    de selecciones (cascada bidireccional): así cada lista muestra solo valores
+    que existen en combinación con lo ya elegido en los demás filtros.
+    """
+    d = df
+    if excluir != "folio" and seleccion.get("folio"):
+        d = d[d[COL_FOLIO].str.contains(seleccion["folio"], case=False, na=False)]
+    if excluir != "mes" and seleccion.get("mes"):
+        d = d[d[COL_MES_ETIQUETA].isin(seleccion["mes"])]
+    if excluir != "proveedor" and seleccion.get("proveedor"):
+        d = d[d[COL_PROVEEDOR].isin(seleccion["proveedor"])]
+    if excluir != "comprador" and seleccion.get("comprador"):
+        d = d[d[COL_COMPRADOR].isin(seleccion["comprador"])]
+    if excluir != "etapa" and seleccion.get("etapa"):
+        d = d[d[COL_ETAPA].isin(seleccion["etapa"])]
+    if excluir != "criticos" and seleccion.get("criticos") and not d.empty:
+        d = d[d.apply(vencido_90_sin_definicion, axis=1)]
+    return d
+
+
 def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
-    """Filtros en cascada en la barra lateral (colapsable, no ocupa el área principal)."""
+    """Filtros en cascada bidireccional con selección múltiple.
+
+    Cada filtro muestra únicamente las opciones que siguen siendo posibles según
+    lo elegido en TODOS los demás filtros, en cualquier orden. Las selecciones se
+    guardan en session_state para que sobrevivan a los re-renders.
+    """
     st.sidebar.markdown("### 🔎 Filtros")
-    dff = df.copy()
 
-    # Búsqueda directa por folio (lo más usado)
-    buscar = st.sidebar.text_input("Buscar folio", placeholder="Ej. DC-MZ017")
-    if buscar.strip():
-        dff = dff[dff[COL_FOLIO].str.contains(buscar.strip(), case=False, na=False)]
+    # Estado previo de las selecciones (lo que el usuario ya eligió)
+    sel = {
+        "folio": st.session_state.get("f_folio", "").strip(),
+        "mes": st.session_state.get("f_mes", []),
+        "proveedor": st.session_state.get("f_proveedor", []),
+        "comprador": st.session_state.get("f_comprador", []),
+        "etapa": st.session_state.get("f_etapa", []),
+        "criticos": st.session_state.get("f_criticos", False),
+    }
 
-    # Mes de reclamación (cascada inicial)
-    if COL_MES_ETIQUETA in dff.columns:
-        orden = (dff[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
-                 .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
-        sel = st.sidebar.multiselect("Mes", options=orden, placeholder="Todos")
-        if sel:
-            dff = dff[dff[COL_MES_ETIQUETA].isin(sel)]
+    # --- Búsqueda por folio ---
+    st.sidebar.text_input("Buscar folio", placeholder="Ej. DC-MZ017", key="f_folio")
 
-    # Proveedor
-    proveedores = sorted(x for x in dff[COL_PROVEEDOR].unique() if x)
-    selp = st.sidebar.multiselect("Proveedor", options=proveedores, placeholder="Todos")
-    if selp:
-        dff = dff[dff[COL_PROVEEDOR].isin(selp)]
+    # --- Mes: opciones según los demás filtros ---
+    base_mes = _aplicar_filtros(df, sel, excluir="mes")
+    opciones_mes = (base_mes[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
+                    .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
+    # Conservar valores ya elegidos aunque el resto los excluya (evita perder la selección)
+    opciones_mes += [m for m in sel["mes"] if m not in opciones_mes]
+    st.sidebar.multiselect("Mes", options=opciones_mes, placeholder="Todos", key="f_mes")
 
-    # Comprador
-    compradores = sorted(x for x in dff[COL_COMPRADOR].unique() if x)
-    selc = st.sidebar.multiselect("Comprador", options=compradores, placeholder="Todos")
-    if selc:
-        dff = dff[dff[COL_COMPRADOR].isin(selc)]
+    # --- Proveedor ---
+    base_prov = _aplicar_filtros(df, sel, excluir="proveedor")
+    opciones_prov = sorted(x for x in base_prov[COL_PROVEEDOR].unique() if x)
+    opciones_prov += [p for p in sel["proveedor"] if p not in opciones_prov]
+    st.sidebar.multiselect("Proveedor", options=opciones_prov, placeholder="Todos",
+                           key="f_proveedor")
 
-    # Etapa
-    etapas_pres = [e for e in (ETAPA_1, ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL)
-                   if e in set(dff[COL_ETAPA])]
-    sele = st.sidebar.multiselect("Etapa", options=etapas_pres, placeholder="Todas")
-    if sele:
-        dff = dff[dff[COL_ETAPA].isin(sele)]
+    # --- Comprador ---
+    base_comp = _aplicar_filtros(df, sel, excluir="comprador")
+    opciones_comp = sorted(x for x in base_comp[COL_COMPRADOR].unique() if x)
+    opciones_comp += [c for c in sel["comprador"] if c not in opciones_comp]
+    st.sidebar.multiselect("Comprador", options=opciones_comp, placeholder="Todos",
+                           key="f_comprador")
 
-    # Solo vencidos a 90 días (alarma crítica)
-    solo_criticos = st.sidebar.checkbox(
-        f"🚨 Solo vencidos ({DIAS_VENCIMIENTO_TOTAL} días)",
-        help=MSG_VENCIDO_90,
-    )
-    if solo_criticos and not dff.empty:
-        mascara = dff.apply(vencido_90_sin_definicion, axis=1)
-        dff = dff[mascara]
+    # --- Etapa ---
+    base_etapa = _aplicar_filtros(df, sel, excluir="etapa")
+    presentes = set(base_etapa[COL_ETAPA])
+    opciones_etapa = [e for e in (ETAPA_1, ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL)
+                      if e in presentes]
+    opciones_etapa += [e for e in sel["etapa"] if e not in opciones_etapa]
+    st.sidebar.multiselect("Etapa", options=opciones_etapa, placeholder="Todas",
+                           key="f_etapa")
 
-    st.sidebar.caption(f"**{len(dff)}** de **{len(df)}** registros")
+    # --- Solo vencidos a 90 días ---
+    st.sidebar.checkbox(f"🚨 Solo vencidos ({DIAS_VENCIMIENTO_TOTAL} días)",
+                        help=MSG_VENCIDO_90, key="f_criticos")
+
+    # --- Limpiar ---
+    if st.sidebar.button("🧹 Limpiar filtros", use_container_width=True):
+        for k, v in (("f_folio", ""), ("f_mes", []), ("f_proveedor", []),
+                     ("f_comprador", []), ("f_etapa", []), ("f_criticos", False)):
+            st.session_state[k] = v
+        st.rerun()
+
+    # --- Resultado con TODAS las selecciones aplicadas ---
+    seleccion_actual = {
+        "folio": st.session_state.get("f_folio", "").strip(),
+        "mes": st.session_state.get("f_mes", []),
+        "proveedor": st.session_state.get("f_proveedor", []),
+        "comprador": st.session_state.get("f_comprador", []),
+        "etapa": st.session_state.get("f_etapa", []),
+        "criticos": st.session_state.get("f_criticos", False),
+    }
+    dff = _aplicar_filtros(df, seleccion_actual)
+
+    activos = sum([
+        bool(seleccion_actual["folio"]), bool(seleccion_actual["mes"]),
+        bool(seleccion_actual["proveedor"]), bool(seleccion_actual["comprador"]),
+        bool(seleccion_actual["etapa"]), bool(seleccion_actual["criticos"]),
+    ])
+    resumen = f"**{len(dff)}** de **{len(df)}** registros"
+    if activos:
+        resumen += f" · {activos} filtro(s) activo(s)"
+    st.sidebar.caption(resumen)
     return dff
 
 
@@ -1529,6 +1589,14 @@ permite capturar la fecha real y el responsable de cada paso, y cerrar la etapa
 con esa fecha. Los días transcurridos se calculan con la fecha real capturada,
 no con la de hoy, para que las métricas del proceso sean correctas.
 
+### 📈 Avance por comprador
+La primera pestaña muestra tres gráficas: **distribución por etapa** (en qué fase
+está el trabajo de cada comprador), **porcentaje finalizado** (qué proporción ya
+cerró todo el proceso) y **estado de vencimiento** (vencidas, por vencerse o en
+tiempo). Tiene su propio selector de mes y un interruptor para medir por
+**cantidad de reclamaciones** o por **importe en pesos**. Respeta además los
+filtros generales de la barra lateral.
+
 ### 🚨 Alarma de vencimiento total ({DIAS_VENCIMIENTO_TOTAL} días)
 Si pasan **{DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte** y el reclamo
 todavía no está finalizado, se dispara la alarma:
@@ -1546,6 +1614,153 @@ Cada paso guarda **fecha y usuario**; las observaciones quedan en la base de dat
 y la bitácora completa se acumula en *Acciones / Notas* para su posterior análisis.
         """
     )
+
+
+# =============================================================================
+# 11a. GRÁFICAS DE AVANCE POR COMPRADOR
+# =============================================================================
+
+ORDEN_ETAPAS = [ETAPA_1, ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL]
+
+
+def _clasificar_urgencia(fila: pd.Series) -> str:
+    """Clasifica una reclamación para la gráfica de vencimientos."""
+    etapa = str(fila.get(COL_ETAPA, "")).strip()
+    if etapa == ETAPA_FINAL:
+        return "Finalizada"
+    if vencido_90_sin_definicion(fila):
+        return f"Vencida {DIAS_VENCIMIENTO_TOTAL} días"
+
+    limites = calcular_fechas_limite(fila)
+    if etapa == ETAPA_1:
+        lim, term = limites["E1"], es_verdadero(fila.get(COL_E1_TERM))
+    elif etapa == ETAPA_2:
+        lim, term = limites["E2"], es_verdadero(fila.get(COL_E2_TERM))
+    elif etapa == ETAPA_3:
+        lim, term = limites["E3"], es_verdadero(fila.get(COL_E3_TERM))
+    elif etapa == ETAPA_4:
+        lim, term = _a_fecha(fila.get(COL_E4_LIMITE_REC)), es_verdadero(fila.get(COL_E4_TERM))
+    else:
+        return "En tiempo"
+
+    nivel, _ = estado_alarma(lim, term)
+    if nivel == "danger":
+        return "Etapa vencida"
+    if nivel == "warn":
+        return "Por vencerse"
+    return "En tiempo"
+
+
+def vista_graficas(df: pd.DataFrame) -> None:
+    """Gráficas de avance por comprador, con filtro de mes y medida propios."""
+    st.subheader("📈 Avance por comprador")
+
+    if df.empty:
+        st.info("No hay registros con los filtros actuales.")
+        return
+
+    # --- Controles propios de esta vista ---
+    c1, c2 = st.columns([2, 2])
+    meses_disp = (df[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
+                  .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
+    sel_meses = c1.multiselect(
+        "Mes de reclamación", options=meses_disp,
+        placeholder="Todos los meses", key="graf_meses",
+    )
+    medida = c2.radio(
+        "Medir por", options=["Cantidad", "Importe (MXN)"],
+        horizontal=True, key="graf_medida",
+    )
+
+    dfg = df[df[COL_MES_ETIQUETA].isin(sel_meses)] if sel_meses else df.copy()
+    if dfg.empty:
+        st.info("No hay registros para los meses seleccionados.")
+        return
+
+    # Columna de valor según la medida elegida
+    if medida == "Cantidad":
+        dfg = dfg.assign(_valor=1.0)
+        formato = "{:,.0f}"
+        etiqueta_valor = "Reclamaciones"
+    else:
+        dfg = dfg.assign(
+            _valor=pd.to_numeric(dfg[COL_IMPORTE], errors="coerce").fillna(0.0)
+        )
+        formato = "${:,.2f}"
+        etiqueta_valor = "Importe (MXN)"
+
+    dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
+
+    # =====================================================================
+    # 1) Reclamaciones por etapa (barras apiladas)
+    # =====================================================================
+    st.markdown(f"##### 1. Distribución por etapa · {etiqueta_valor}")
+    st.caption("Muestra en qué fase del proceso está el trabajo de cada comprador.")
+
+    tabla_etapas = (dfg.pivot_table(index="_comprador", columns=COL_ETAPA,
+                                    values="_valor", aggfunc="sum", fill_value=0))
+    # Ordenar columnas por el flujo del proceso
+    columnas_orden = [e for e in ORDEN_ETAPAS if e in tabla_etapas.columns]
+    columnas_orden += [c for c in tabla_etapas.columns if c not in columnas_orden]
+    tabla_etapas = tabla_etapas[columnas_orden]
+    tabla_etapas = tabla_etapas.loc[tabla_etapas.sum(axis=1).sort_values(ascending=False).index]
+
+    st.bar_chart(tabla_etapas, height=340, stack=True)
+
+    # =====================================================================
+    # 2) Porcentaje finalizado por comprador
+    # =====================================================================
+    st.markdown("##### 2. Porcentaje finalizado")
+    st.caption("Qué proporción del trabajo de cada comprador ya cerró todo el proceso.")
+
+    resumen = dfg.groupby("_comprador").agg(
+        total=("_valor", "sum"),
+        finalizado=("_valor", lambda s: s[dfg.loc[s.index, COL_ETAPA] == ETAPA_FINAL].sum()),
+    )
+    resumen["% finalizado"] = (resumen["finalizado"] / resumen["total"] * 100).round(1)
+    resumen = resumen.sort_values("% finalizado", ascending=False)
+
+    cg1, cg2 = st.columns([3, 2])
+    with cg1:
+        st.bar_chart(resumen[["% finalizado"]], height=320)
+    with cg2:
+        tabla_pct = resumen.copy()
+        tabla_pct["total"] = tabla_pct["total"].map(formato.format)
+        tabla_pct["finalizado"] = tabla_pct["finalizado"].map(formato.format)
+        tabla_pct = tabla_pct.rename(columns={
+            "total": etiqueta_valor, "finalizado": "Finalizado"})
+        st.dataframe(tabla_pct, use_container_width=True, height=320)
+
+    # =====================================================================
+    # 3) Estado de vencimiento por comprador
+    # =====================================================================
+    st.markdown("##### 3. Estado de vencimiento")
+    st.caption("Reclamaciones vencidas, por vencerse o en tiempo, según su etapa activa. "
+               f"La categoría crítica es la de {DIAS_VENCIMIENTO_TOTAL} días sin definición.")
+
+    dfg["_urgencia"] = dfg.apply(_clasificar_urgencia, axis=1)
+    orden_urgencia = [f"Vencida {DIAS_VENCIMIENTO_TOTAL} días", "Etapa vencida",
+                      "Por vencerse", "En tiempo", "Finalizada"]
+    tabla_urg = (dfg.pivot_table(index="_comprador", columns="_urgencia",
+                                 values="_valor", aggfunc="sum", fill_value=0))
+    cols_urg = [c for c in orden_urgencia if c in tabla_urg.columns]
+    cols_urg += [c for c in tabla_urg.columns if c not in cols_urg]
+    tabla_urg = tabla_urg[cols_urg]
+    # Ordenar por lo más urgente primero
+    criticas = [c for c in cols_urg if "Vencida" in c or "vencida" in c]
+    if criticas:
+        tabla_urg = tabla_urg.loc[
+            tabla_urg[criticas].sum(axis=1).sort_values(ascending=False).index]
+
+    st.bar_chart(tabla_urg, height=340, stack=True)
+
+    # --- Resumen numérico general ---
+    with st.expander("📋 Ver detalle numérico por comprador"):
+        detalle = tabla_etapas.copy()
+        detalle["TOTAL"] = detalle.sum(axis=1)
+        if medida == "Importe (MXN)":
+            detalle = detalle.round(2)
+        st.dataframe(detalle, use_container_width=True)
 
 
 # =============================================================================
@@ -1711,10 +1926,12 @@ def main() -> None:
             "Revísalos en la pestaña *Resumen y alarmas*."
         )
 
-    tab_editar, tab_tabla, tab_resumen, tab_bd, tab_guia = st.tabs(
-        ["✏️ Editar reclamación", "📊 Tabla", "🔔 Resumen y alarmas",
+    tab_graf, tab_editar, tab_tabla, tab_resumen, tab_bd, tab_guia = st.tabs(
+        ["📈 Avance", "✏️ Editar reclamación", "📊 Tabla", "🔔 Resumen y alarmas",
          "🗄️ Base de datos", "📖 Guía"]
     )
+    with tab_graf:
+        vista_graficas(df_filtrado)
     with tab_editar:
         vista_editar(df_filtrado)
     with tab_tabla:
