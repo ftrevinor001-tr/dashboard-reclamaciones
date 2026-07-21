@@ -30,6 +30,14 @@ except Exception:
 import pandas as pd
 import streamlit as st
 
+# Altair viene incluido con Streamlit; se usa para dar formato a los ejes y a
+# las etiquetas emergentes de las gráficas (separador de miles y moneda).
+try:
+    import altair as alt
+    ALTAIR_OK = True
+except Exception:
+    ALTAIR_OK = False
+
 
 def hoy_mx() -> date:
     """Fecha actual en la zona horaria de México (evita el desfase por UTC).
@@ -1710,6 +1718,88 @@ def _clasificar_urgencia(fila: pd.Series) -> str:
     return "En tiempo"
 
 
+def _grafica_barras(tabla: pd.DataFrame, etiqueta_valor: str, es_dinero: bool,
+                    orden_series: list = None, altura: int = 340) -> None:
+    """Dibuja barras apiladas con formato numérico legible.
+
+    Los números llevan separador de miles y, si son importes, símbolo de pesos
+    con dos decimales. El formato se aplica tanto al eje como a la etiqueta
+    emergente que aparece al pasar el cursor.
+    """
+    if tabla.empty:
+        st.info("Sin datos para graficar.")
+        return
+
+    if not ALTAIR_OK:
+        # Respaldo: gráfica nativa (sin formato personalizado).
+        st.bar_chart(tabla, height=altura, stack=True,
+                     y_label=etiqueta_valor, x_label="Comprador")
+        return
+
+    # Formatos estilo D3: '$,.2f' → $1,234.56 · ',d' → 1,234
+    fmt = "$,.2f" if es_dinero else ",d"
+    nombre_valor = "Importe" if es_dinero else "Cantidad"
+
+    largo = (tabla.reset_index()
+             .melt(id_vars=tabla.index.name or "index",
+                   var_name="Serie", value_name="Valor"))
+    col_x = tabla.index.name or "index"
+    largo = largo.rename(columns={col_x: "Comprador"})
+    largo = largo[largo["Valor"] != 0]
+
+    orden = orden_series or list(tabla.columns)
+    grafica = (
+        alt.Chart(largo)
+        .mark_bar()
+        .encode(
+            x=alt.X("Comprador:N", title="Comprador",
+                    sort=list(tabla.index), axis=alt.Axis(labelAngle=-90)),
+            y=alt.Y("Valor:Q", title=etiqueta_valor,
+                    axis=alt.Axis(format=fmt)),
+            color=alt.Color("Serie:N", title="", sort=orden,
+                            legend=alt.Legend(orient="bottom")),
+            order=alt.Order("Serie:N"),
+            tooltip=[
+                alt.Tooltip("Comprador:N", title="Comprador"),
+                alt.Tooltip("Serie:N", title="Etapa"),
+                alt.Tooltip("Valor:Q", title=nombre_valor, format=fmt),
+            ],
+        )
+        .properties(height=altura)
+    )
+    st.altair_chart(grafica, use_container_width=True)
+
+
+def _grafica_porcentaje(resumen: pd.DataFrame, altura: int = 320) -> None:
+    """Barras del porcentaje finalizado por comprador, con formato '00.0 %'."""
+    if resumen.empty:
+        st.info("Sin datos para graficar.")
+        return
+    if not ALTAIR_OK:
+        st.bar_chart(resumen[["% finalizado"]], height=altura,
+                     y_label="% finalizado", x_label="Comprador")
+        return
+
+    datos = resumen.reset_index().rename(columns={"_comprador": "Comprador"})
+    grafica = (
+        alt.Chart(datos)
+        .mark_bar()
+        .encode(
+            x=alt.X("Comprador:N", title="Comprador",
+                    sort=list(resumen.index), axis=alt.Axis(labelAngle=-90)),
+            y=alt.Y("% finalizado:Q", title="% finalizado",
+                    scale=alt.Scale(domain=[0, 100]),
+                    axis=alt.Axis(format=".0f")),
+            tooltip=[
+                alt.Tooltip("Comprador:N", title="Comprador"),
+                alt.Tooltip("% finalizado:Q", title="Finalizado", format=".1f"),
+            ],
+        )
+        .properties(height=altura)
+    )
+    st.altair_chart(grafica, use_container_width=True)
+
+
 def vista_graficas(df: pd.DataFrame) -> None:
     """Gráficas de avance por comprador, con filtro de mes y medida propios."""
     st.subheader("📈 Avance por comprador")
@@ -1774,8 +1864,8 @@ def vista_graficas(df: pd.DataFrame) -> None:
     if not es_dinero:
         tabla_etapas = tabla_etapas.round(0).astype(int)
 
-    st.bar_chart(tabla_etapas, height=340, stack=True,
-                 y_label=etiqueta_valor, x_label="Comprador")
+    _grafica_barras(tabla_etapas, etiqueta_valor, es_dinero,
+                    orden_series=columnas_orden, altura=340)
 
     # =====================================================================
     # 2) Porcentaje finalizado por comprador
@@ -1792,8 +1882,7 @@ def vista_graficas(df: pd.DataFrame) -> None:
 
     cg1, cg2 = st.columns([3, 2])
     with cg1:
-        st.bar_chart(resumen[["% finalizado"]], height=320,
-                     y_label="% finalizado", x_label="Comprador")
+        _grafica_porcentaje(resumen, altura=320)
     with cg2:
         tabla_pct = resumen.copy()
         if not es_dinero:
@@ -1833,8 +1922,8 @@ def vista_graficas(df: pd.DataFrame) -> None:
     if not es_dinero:
         tabla_urg = tabla_urg.round(0).astype(int)
 
-    st.bar_chart(tabla_urg, height=340, stack=True,
-                 y_label=etiqueta_valor, x_label="Comprador")
+    _grafica_barras(tabla_urg, etiqueta_valor, es_dinero,
+                    orden_series=cols_urg, altura=340)
 
     # --- Resumen numérico general ---
     with st.expander("📋 Ver detalle numérico por comprador"):
