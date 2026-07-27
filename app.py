@@ -109,6 +109,7 @@ ETAPA_1 = "Reporte de reclamo"
 ETAPA_2 = "Gestión"
 ETAPA_3 = "Cuentas por pagar"
 ETAPA_4 = "Disposición final"
+ETAPA_CUARENTENA = "Cuarentena"
 
 # Nombres antiguos que puedan existir en la base de datos, para migrarlos
 # automáticamente al cargar (evita que aparezcan etiquetas obsoletas en
@@ -119,6 +120,13 @@ NOMBRES_ETAPA_ANTIGUOS = {
     "Destino Final": ETAPA_4,
 }
 ETAPA_FINAL = "FINALIZADO"
+
+# --- Cuarentena: reclamaciones de importe bajo que se acumulan por proveedor ---
+# Las reclamaciones con importe menor o igual a este monto entran a Cuarentena
+# de forma automática, para juntarlas con otras del mismo proveedor y superar el
+# umbral antes de reclamar formalmente.
+UMBRAL_CUARENTENA = 300.0
+DIAS_CUARENTENA_DEFECTO = 30  # duración sugerida si el admin no especifica otra
 
 # Duraciones (días) de cada etapa.
 DIAS_ETAPA_1 = 7    # desde FECHA CORTE
@@ -171,6 +179,14 @@ COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM = "E3 FECHA LIMITE", "E3 DIAS TARDO", "E
 COL_E4_MODALIDAD, COL_E4_ESTATUS, COL_E4_OBS = "E4 MODALIDAD", "E4 ESTATUS", "E4 OBSERVACIONES"
 COL_E4_LIMITE_REC, COL_E4_TERM = "E4 FECHA LIMITE RECOLECCION", "E4 TERMINADA"
 
+# Columnas de cuarentena
+COL_CUAR_EN = "EN CUARENTENA"              # SÍ / NO
+COL_CUAR_FECHA_INICIO = "CUARENTENA FECHA INICIO"
+COL_CUAR_DIAS = "CUARENTENA DIAS"          # duración asignada por el admin
+COL_CUAR_FECHA_FIN = "CUARENTENA FECHA FIN"  # fecha calculada de salida
+COL_CUAR_OBS = "CUARENTENA OBSERVACIONES"
+COL_ETAPA_PREVIA = "ETAPA PREVIA CUARENTENA"  # a dónde regresa al liberarse
+
 # Semáforo
 EN_TIEMPO = "🟢 EN TIEMPO"
 POR_VENCERSE = "🟡 POR VENCERSE"
@@ -185,6 +201,8 @@ COLUMNAS_REQUERIDAS = [
     COL_E2_ESTATUS, COL_E2_OBS, COL_E2_COMPROMISO, COL_E2_LIMITE, COL_E2_DIAS, COL_E2_TERM,
     COL_E3_ESTATUS, COL_E3_OBS, COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM,
     COL_E4_MODALIDAD, COL_E4_ESTATUS, COL_E4_OBS, COL_E4_LIMITE_REC, COL_E4_TERM,
+    COL_CUAR_EN, COL_CUAR_FECHA_INICIO, COL_CUAR_DIAS, COL_CUAR_FECHA_FIN,
+    COL_CUAR_OBS, COL_ETAPA_PREVIA,
     COL_MODIFICADO_POR, COL_FECHA_MODIFICACION,
 ]
 for _pasos in (PASOS_E1, PASOS_E2, PASOS_E3, PASOS_E4_DESTRUCCION, PASOS_E4_RECOLECCION):
@@ -281,8 +299,9 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
         for _c, _e, _cf, _cu in _pasos:
             cols_fecha.add(_cf)
     cols_fecha |= {COL_E1_LIMITE, COL_E2_LIMITE, COL_E3_LIMITE,
-                   COL_E2_COMPROMISO, COL_E4_LIMITE_REC}
-    cols_numericas = {COL_E1_DIAS, COL_E2_DIAS, COL_E3_DIAS}
+                   COL_E2_COMPROMISO, COL_E4_LIMITE_REC,
+                   COL_CUAR_FECHA_INICIO, COL_CUAR_FECHA_FIN}
+    cols_numericas = {COL_E1_DIAS, COL_E2_DIAS, COL_E3_DIAS, COL_CUAR_DIAS}
     for col in COLUMNAS_REQUERIDAS:
         if col in df.columns and col not in cols_fecha and col not in cols_numericas:
             df[col] = df[col].fillna("").astype(str).replace("nan", "")
@@ -312,6 +331,32 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
 
     # FOLIO REPORTE es el identificador principal y único.
     df["CLAVE"] = df[COL_FOLIO].astype(str)
+
+    # --- Cuarentena automática por importe bajo ---
+    # Las reclamaciones con importe <= UMBRAL que aún no están finalizadas ni
+    # marcadas en cuarentena entran automáticamente a Cuarentena. Se guarda la
+    # etapa en la que estaban para poder devolverlas al liberarlas.
+    if COL_CUAR_DIAS in df.columns:
+        df[COL_CUAR_DIAS] = pd.to_numeric(df[COL_CUAR_DIAS], errors="coerce")
+    if COL_IMPORTE in df.columns:
+        importe_num = pd.to_numeric(df[COL_IMPORTE], errors="coerce").fillna(0.0)
+        # "SÍ" = está en cuarentena · "LIBERADA" = ya fue liberada por el admin
+        # (no debe volver a entrar aunque su importe siga siendo bajo).
+        estado_cuar = df[COL_CUAR_EN].astype(str).str.strip().str.upper()
+        ya_gestionada = estado_cuar.isin(["SÍ", "SI", "LIBERADA"])
+        no_final = df[COL_ETAPA] != ETAPA_FINAL
+        entran = (importe_num <= UMBRAL_CUARENTENA) & (~ya_gestionada) & no_final
+        if entran.any():
+            df.loc[entran, COL_ETAPA_PREVIA] = df.loc[entran, COL_ETAPA]
+            df.loc[entran, COL_CUAR_EN] = "SÍ"
+            df.loc[entran, COL_ETAPA] = ETAPA_CUARENTENA
+            df.loc[entran, COL_CUAR_FECHA_INICIO] = pd.Timestamp(hoy_mx())
+            # Duración por defecto solo donde no haya un valor previo.
+            dias_actuales = pd.to_numeric(df.loc[entran, COL_CUAR_DIAS], errors="coerce")
+            usa_defecto = dias_actuales.isna() | (dias_actuales <= 0)
+            df.loc[dias_actuales[usa_defecto].index, COL_CUAR_DIAS] = DIAS_CUARENTENA_DEFECTO
+            df.loc[entran, COL_CUAR_FECHA_FIN] = pd.Timestamp(
+                hoy_mx() + timedelta(days=DIAS_CUARENTENA_DEFECTO))
 
     # Etiqueta legible del mes (para el filtro)
     if COL_MES in df.columns:
@@ -1605,6 +1650,166 @@ def mostrar_tabla(df: pd.DataFrame) -> None:
 # 11. PESTAÑA DE GUÍA DEL PROCESO
 # =============================================================================
 
+def _dias_restantes_cuarentena(fila: pd.Series):
+    """Días que faltan para que salga de cuarentena. None si no aplica."""
+    fin = _a_fecha(fila.get(COL_CUAR_FECHA_FIN))
+    if fin is None:
+        return None
+    return (fin - hoy_mx()).days
+
+
+def vista_cuarentena(df: pd.DataFrame) -> None:
+    """Gestión de reclamaciones en cuarentena, agrupadas por proveedor."""
+    st.subheader("🧊 Cuarentena")
+    st.caption(f"Reclamaciones con importe menor o igual a "
+               f"${UMBRAL_CUARENTENA:,.2f} en espera de acumular monto por "
+               "proveedor antes de reclamar formalmente.")
+
+    if "flash_cuar" in st.session_state:
+        tipo, texto = st.session_state.pop("flash_cuar")
+        (st.success if tipo == "success" else st.warning)(texto)
+
+    en_cuar = df[df[COL_ETAPA] == ETAPA_CUARENTENA].copy()
+    if en_cuar.empty:
+        st.info("No hay reclamaciones en cuarentena con los filtros actuales.")
+        return
+
+    importe = pd.to_numeric(en_cuar[COL_IMPORTE], errors="coerce").fillna(0.0)
+    en_cuar["_importe"] = importe
+
+    # Resumen por proveedor: cuánto se ha acumulado y si ya supera el umbral
+    resumen = (en_cuar.groupby(COL_PROVEEDOR)
+               .agg(Reclamaciones=("_importe", "size"),
+                    Acumulado=("_importe", "sum"))
+               .sort_values("Acumulado", ascending=False))
+    listos = resumen[resumen["Acumulado"] > UMBRAL_CUARENTENA]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("En cuarentena", len(en_cuar))
+    c2.metric("Monto acumulado", f"${importe.sum():,.2f}")
+    c3.metric("Proveedores listos", len(listos),
+              help=f"Proveedores cuyo acumulado ya supera ${UMBRAL_CUARENTENA:,.2f}")
+
+    if len(listos) > 0:
+        st.success(f"✅ {len(listos)} proveedor(es) ya superan el umbral y pueden "
+                   "liberarse para reclamar en conjunto: "
+                   + ", ".join(listos.index.tolist()))
+
+    st.markdown("##### Acumulado por proveedor")
+    tabla_prov = resumen.copy()
+    tabla_prov["¿Supera umbral?"] = tabla_prov["Acumulado"].apply(
+        lambda v: "✅ Sí" if v > UMBRAL_CUARENTENA else "—")
+    st.dataframe(
+        tabla_prov, use_container_width=True,
+        column_config={
+            "Reclamaciones": st.column_config.NumberColumn(format="%d"),
+            "Acumulado": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+    st.divider()
+    st.markdown("##### Administrar cuarentena")
+    st.caption("Selecciona un proveedor para ajustar la duración de sus "
+               "reclamaciones en cuarentena o liberarlas al flujo normal. "
+               "Requiere clave de autorización.")
+
+    prov_sel = st.selectbox("Proveedor", options=resumen.index.tolist())
+    grupo = en_cuar[en_cuar[COL_PROVEEDOR] == prov_sel]
+
+    # Detalle del proveedor seleccionado
+    detalle = grupo[[COL_FOLIO, COL_IMPORTE, COL_CUAR_FECHA_INICIO,
+                     COL_CUAR_DIAS, COL_CUAR_FECHA_FIN]].copy()
+    detalle["Días restantes"] = grupo.apply(_dias_restantes_cuarentena, axis=1)
+    st.dataframe(
+        detalle, use_container_width=True, hide_index=True,
+        column_config={
+            COL_IMPORTE: st.column_config.NumberColumn("Importe", format="$%.2f"),
+            COL_CUAR_FECHA_INICIO: st.column_config.DateColumn("Inicio", format="DD/MM/YYYY"),
+            COL_CUAR_DIAS: st.column_config.NumberColumn("Días asignados", format="%d"),
+            COL_CUAR_FECHA_FIN: st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
+            "Días restantes": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    clave_in = st.text_input("Clave de autorización", type="password",
+                             key=f"cuar_clave_{prov_sel}")
+
+    ca, cb = st.columns(2)
+
+    # --- Ajustar duración ---
+    with ca:
+        st.markdown("**Ajustar duración**")
+        with st.form(f"form_cuar_dias_{prov_sel}"):
+            nuevos_dias = st.number_input(
+                "Días de cuarentena", min_value=1, max_value=365,
+                value=int(DIAS_CUARENTENA_DEFECTO), step=1)
+            obs_dias = st.text_input("Observación (opcional)")
+            aplicar_dias = st.form_submit_button("Actualizar duración",
+                                                 use_container_width=True)
+        if aplicar_dias:
+            if clave_in != clave_autorizacion():
+                st.error("🔒 Clave incorrecta.")
+            else:
+                dfc = st.session_state["df"]
+                m = (dfc[COL_ETAPA] == ETAPA_CUARENTENA) & (dfc[COL_PROVEEDOR] == prov_sel)
+                for idx in dfc[m].index:
+                    inicio = _a_fecha(dfc.at[idx, COL_CUAR_FECHA_INICIO]) or hoy_mx()
+                    dfc.at[idx, COL_CUAR_DIAS] = int(nuevos_dias)
+                    dfc.at[idx, COL_CUAR_FECHA_FIN] = pd.Timestamp(
+                        inicio + timedelta(days=int(nuevos_dias)))
+                    if obs_dias.strip():
+                        dfc.at[idx, COL_CUAR_OBS] = obs_dias.strip()
+                folio_ej = dfc.loc[m, COL_FOLIO].iloc[0]
+                mensaje = aplicar_guardado(
+                    dfc, folio_ej, {}, "Admin cuarentena",
+                    f"Duración de cuarentena de {prov_sel} ajustada a {int(nuevos_dias)} días")
+                cargar_datos.clear()
+                st.session_state["version_datos"] += 1
+                st.session_state["df"] = cargar_datos(
+                    RUTA_EXCEL, st.session_state["version_datos"])
+                with st.spinner("Guardando…"):
+                    exito, msg = subir_a_github(mensaje)
+                st.session_state["flash_cuar"] = (
+                    "success" if exito else "warning",
+                    f"Duración actualizada. {msg}")
+                st.rerun()
+
+    # --- Liberar / finalizar ---
+    with cb:
+        st.markdown("**Liberar del cuarentena**")
+        st.caption("Devuelve las reclamaciones del proveedor al inicio del flujo "
+                   "(Reporte de reclamo) para reclamar en conjunto.")
+        obs_lib = st.text_input("Observación de liberación (opcional)",
+                                key=f"obs_lib_{prov_sel}")
+        if st.button("🚀 Liberar todas al flujo normal", use_container_width=True,
+                     type="primary", key=f"btn_lib_{prov_sel}"):
+            if clave_in != clave_autorizacion():
+                st.error("🔒 Clave incorrecta.")
+            else:
+                dfc = st.session_state["df"]
+                m = (dfc[COL_ETAPA] == ETAPA_CUARENTENA) & (dfc[COL_PROVEEDOR] == prov_sel)
+                n = int(m.sum())
+                dfc.loc[m, COL_ETAPA] = ETAPA_1  # vuelve al inicio del flujo
+                dfc.loc[m, COL_CUAR_EN] = "LIBERADA"
+                if obs_lib.strip():
+                    dfc.loc[m, COL_CUAR_OBS] = obs_lib.strip()
+                folio_ej = dfc.loc[m, COL_FOLIO].iloc[0]
+                mensaje = aplicar_guardado(
+                    dfc, folio_ej, {}, "Admin cuarentena",
+                    f"{n} reclamación(es) de {prov_sel} liberadas de cuarentena → "
+                    f"{ETAPA_1}")
+                cargar_datos.clear()
+                st.session_state["version_datos"] += 1
+                st.session_state["df"] = cargar_datos(
+                    RUTA_EXCEL, st.session_state["version_datos"])
+                with st.spinner("Guardando…"):
+                    exito, msg = subir_a_github(mensaje)
+                st.session_state["flash_cuar"] = (
+                    "success" if exito else "warning",
+                    f"{n} reclamación(es) liberadas. {msg}")
+                st.rerun()
+
+
 def vista_guia() -> None:
     st.subheader("📖 Guía del proceso")
     st.markdown(
@@ -1643,6 +1848,17 @@ destrucción por vencimiento y se notifica a Devoluciones.
 
 > **Plazos:** 7 + 30 + 53 = **{DIAS_VENCIMIENTO_TOTAL} días** en total desde la
 > fecha de corte. El contador de recolección corre por separado.
+
+### 🧊 Cuarentena (importes bajos)
+Las reclamaciones con importe **menor o igual a ${UMBRAL_CUARENTENA:,.0f}** entran
+automáticamente a **Cuarentena** al cargar la base. La idea es acumularlas por
+proveedor hasta superar ese monto y reclamar en conjunto. En la pestaña
+**Cuarentena** se ve el monto acumulado por proveedor y se marca cuáles ya
+superan el umbral. El administrador (con la clave de autorización) puede ajustar
+los **días de duración** de la cuarentena o **liberar** todas las reclamaciones
+de un proveedor, que regresan al inicio del flujo (**{ETAPA_1}**) para reclamarse
+formalmente. Una vez liberada, una reclamación no vuelve a entrar a cuarentena
+aunque su importe siga siendo bajo.
 
 ### 🔓 Reactivar etapas
 Cada etapa cerrada tiene un botón **Reactivar** protegido con clave. Solo el
@@ -2219,9 +2435,9 @@ def main() -> None:
             "Revísalos en la pestaña *Resumen y alarmas*."
         )
 
-    tab_graf, tab_editar, tab_tabla, tab_resumen, tab_bd, tab_guia = st.tabs(
-        ["📈 Avance", "✏️ Editar reclamación", "📊 Tabla", "🔔 Resumen y alarmas",
-         "🗄️ Base de datos", "📖 Guía"]
+    tab_graf, tab_editar, tab_tabla, tab_cuar, tab_resumen, tab_bd, tab_guia = st.tabs(
+        ["📈 Avance", "✏️ Editar reclamación", "📊 Tabla", "🧊 Cuarentena",
+         "🔔 Resumen y alarmas", "🗄️ Base de datos", "📖 Guía"]
     )
     with tab_graf:
         vista_graficas(df_filtrado)
@@ -2229,6 +2445,8 @@ def main() -> None:
         vista_editar(df_filtrado)
     with tab_tabla:
         mostrar_tabla(df_filtrado)
+    with tab_cuar:
+        vista_cuarentena(df_filtrado)
     with tab_resumen:
         mostrar_notificaciones(df_filtrado)
     with tab_bd:
