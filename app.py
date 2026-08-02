@@ -1613,21 +1613,42 @@ def mostrar_notificaciones(df: pd.DataFrame) -> None:
     c2.metric("🔴 Etapa vencida", len(vencidas))
     c3.metric("🟡 Por vencerse", len(por_vencer))
 
-    # --- Sección crítica: reclamos vencidos a 90 días ---
     if criticos:
-        st.error(f"🚨 **{MSG_VENCIDO_90}**")
-        for a in criticos:
-            st.markdown(
-                f"&nbsp;&nbsp;🚨 **Folio {a['folio']}** · {a['proveedor']} · "
-                f"_{a['etapa']}_ — {a['mensaje']}"
-            )
-        st.divider()
+        st.error(f"🚨 **{MSG_VENCIDO_90}** — {len(criticos)} reclamo(s).")
 
-    # --- Etapas vencidas y por vencerse ---
-    for a in vencidas + por_vencer:
-        icono = "🔴" if a["nivel"] == "danger" else "🟡"
-        st.markdown(f"{icono} **Folio {a['folio']}** · {a['proveedor']} · "
-                    f"_{a['etapa']}_ — {a['mensaje']} (Comprador: {a['comprador']})")
+    # Etiqueta legible por nivel de alarma
+    etiqueta_nivel = {
+        "critico": f"🚨 Vencida {DIAS_VENCIMIENTO_TOTAL} días",
+        "danger": "🔴 Etapa vencida",
+        "warn": "🟡 Por vencerse",
+    }
+    filas = [{
+        "Nivel": etiqueta_nivel.get(a["nivel"], a["nivel"]),
+        "Folio": a["folio"],
+        "Proveedor": a["proveedor"],
+        "Comprador": a["comprador"],
+        "Etapa": a["etapa"],
+        "Detalle": a["mensaje"],
+    } for a in avisos]
+    tabla = pd.DataFrame(filas)
+
+    st.caption("Haz clic en el encabezado de cualquier columna para ordenar. "
+               "Usa el botón para descargar la información.")
+    st.dataframe(
+        tabla, use_container_width=True, hide_index=True,
+        column_config={
+            "Nivel": st.column_config.TextColumn("Nivel", width="medium"),
+            "Folio": st.column_config.TextColumn("Folio", width="small"),
+            "Detalle": st.column_config.TextColumn("Detalle", width="large"),
+        },
+    )
+    st.download_button(
+        "⬇️ Descargar alarmas (Excel)",
+        data=_tabla_a_excel(tabla.set_index("Folio")),
+        file_name="alarmas.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 
 def mostrar_tabla(df: pd.DataFrame) -> None:
