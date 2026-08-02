@@ -1951,57 +1951,127 @@ def _clasificar_urgencia(fila: pd.Series) -> str:
     return "En tiempo"
 
 
+def _fmt_valor(v, es_dinero: bool) -> str:
+    """Formatea un número: moneda con pesos o entero, ambos con miles."""
+    if es_dinero:
+        return f"${v:,.2f}"
+    return f"{int(round(v)):,}"
+
+
 def _grafica_barras(tabla: pd.DataFrame, etiqueta_valor: str, es_dinero: bool,
                     orden_series: list = None, altura: int = 340) -> None:
-    """Dibuja barras apiladas con formato numérico legible.
+    """Dibuja barras horizontales apiladas con formato numérico legible.
 
-    Los números llevan separador de miles y, si son importes, símbolo de pesos
-    con dos decimales. El formato se aplica tanto al eje como a la etiqueta
-    emergente que aparece al pasar el cursor.
+    Los números llevan separador de miles y, si son importes, símbolo de pesos.
+    Cada segmento muestra su valor y al final de la barra aparece el total.
     """
     if tabla.empty:
         st.info("Sin datos para graficar.")
         return
 
     if not ALTAIR_OK:
-        # Respaldo: gráfica nativa (sin formato personalizado).
         st.bar_chart(tabla, height=altura, stack=True, horizontal=True,
-                     x_label=etiqueta_valor, y_label="Comprador")
+                     x_label=etiqueta_valor, y_label=None)
         return
 
     # Formatos estilo D3: '$,.2f' → $1,234.56 · ',d' → 1,234
     fmt = "$,.2f" if es_dinero else ",d"
     nombre_valor = "Importe" if es_dinero else "Cantidad"
+    col_cat = tabla.index.name or "index"
 
     largo = (tabla.reset_index()
-             .melt(id_vars=tabla.index.name or "index",
-                   var_name="Serie", value_name="Valor"))
-    col_x = tabla.index.name or "index"
-    largo = largo.rename(columns={col_x: "Comprador"})
+             .melt(id_vars=col_cat, var_name="Serie", value_name="Valor"))
+    largo = largo.rename(columns={col_cat: "Categoria"})
     largo = largo[largo["Valor"] != 0]
 
     orden = orden_series or list(tabla.columns)
-    # Barras HORIZONTALES: el valor va en el eje X y el comprador en el Y.
-    grafica = (
-        alt.Chart(largo)
-        .mark_bar()
+    base = alt.Chart(largo)
+    barras = (
+        base.mark_bar()
         .encode(
-            y=alt.Y("Comprador:N", title=None,
-                    sort=list(tabla.index)),
-            x=alt.X("Valor:Q", title=etiqueta_valor,
+            y=alt.Y("Categoria:N", title=None, sort=list(tabla.index)),
+            x=alt.X("Valor:Q", title=etiqueta_valor, stack=True,
                     axis=alt.Axis(format=fmt)),
             color=alt.Color("Serie:N", title="", sort=orden,
                             legend=alt.Legend(orient="bottom", columns=3)),
             order=alt.Order("Serie:N"),
             tooltip=[
-                alt.Tooltip("Comprador:N", title="Comprador"),
+                alt.Tooltip("Categoria:N", title=col_cat.replace("_", " ").title()),
                 alt.Tooltip("Serie:N", title="Etapa"),
                 alt.Tooltip("Valor:Q", title=nombre_valor, format=fmt),
             ],
         )
-        .properties(height=altura)
     )
+    # Número dentro de cada segmento
+    etiquetas = (
+        base.mark_text(color="white", fontSize=11, fontWeight="bold")
+        .encode(
+            y=alt.Y("Categoria:N", sort=list(tabla.index)),
+            x=alt.X("Valor:Q", stack="center"),
+            detail="Serie:N",
+            text=alt.Text("Valor:Q", format=fmt),
+        )
+        .transform_filter("datum.Valor > 0")
+    )
+    # Total al final de la barra
+    totales = tabla.sum(axis=1).reset_index()
+    totales.columns = ["Categoria", "Total"]
+    capa_total = (
+        alt.Chart(totales)
+        .mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
+                   color="#333")
+        .encode(
+            y=alt.Y("Categoria:N", sort=list(tabla.index)),
+            x=alt.X("Total:Q"),
+            text=alt.Text("Total:Q", format=fmt),
+        )
+    )
+    grafica = (barras + etiquetas + capa_total).properties(height=altura)
     st.altair_chart(grafica, use_container_width=True)
+
+
+def _grafica_barra_simple(serie: pd.Series, etiqueta_valor: str, es_dinero: bool,
+                          altura: int = 340, color: str = "#4C78A8") -> None:
+    """Barras horizontales de una sola serie, con el número al final de cada barra."""
+    if serie.empty or serie.sum() == 0:
+        st.info("Sin datos para graficar.")
+        return
+
+    col_cat = serie.index.name or "Categoria"
+    datos = serie.reset_index()
+    datos.columns = ["Categoria", "Valor"]
+    datos = datos[datos["Valor"] != 0]
+
+    if not ALTAIR_OK:
+        st.bar_chart(datos.set_index("Categoria"), height=altura,
+                     horizontal=True, x_label=etiqueta_valor, y_label=None)
+        return
+
+    fmt = "$,.2f" if es_dinero else ",d"
+    nombre_valor = "Importe" if es_dinero else "Reclamaciones"
+    base = alt.Chart(datos)
+    barras = (
+        base.mark_bar(color=color)
+        .encode(
+            y=alt.Y("Categoria:N", title=None, sort="-x"),
+            x=alt.X("Valor:Q", title=etiqueta_valor, axis=alt.Axis(format=fmt)),
+            tooltip=[
+                alt.Tooltip("Categoria:N", title=col_cat.replace("_", " ").title()),
+                alt.Tooltip("Valor:Q", title=nombre_valor, format=fmt),
+            ],
+        )
+    )
+    etiquetas = (
+        base.mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
+                       color="#333")
+        .encode(
+            y=alt.Y("Categoria:N", sort="-x"),
+            x=alt.X("Valor:Q"),
+            text=alt.Text("Valor:Q", format=fmt),
+        )
+    )
+    st.altair_chart((barras + etiquetas).properties(height=altura),
+                    use_container_width=True)
 
 
 def _grafica_porcentaje(resumen: pd.DataFrame, altura: int = 320) -> None:
@@ -2111,17 +2181,15 @@ def _grafica_dias_promedio(df: pd.DataFrame, altura: int = 360) -> None:
         )
         return
 
-    grafica = (
-        alt.Chart(resumen)
-        .mark_bar()
+    base = alt.Chart(resumen)
+    barras = (
+        base.mark_bar()
         .encode(
             y=alt.Y("Etapa:N", title=None, sort=orden_etapas),
             x=alt.X("Promedio:Q", title="Días promedio",
                     axis=alt.Axis(format=".1f")),
             color=alt.Color("Etapa:N", title="", sort=orden_etapas,
                             legend=alt.Legend(orient="bottom", columns=2)),
-            row=alt.Row("Mes:N", title=None, sort=orden_meses,
-                        header=alt.Header(labelAngle=0, labelAlign="left")),
             tooltip=[
                 alt.Tooltip("Mes:N", title="Mes"),
                 alt.Tooltip("Etapa:N", title="Etapa"),
@@ -2129,6 +2197,20 @@ def _grafica_dias_promedio(df: pd.DataFrame, altura: int = 360) -> None:
                 alt.Tooltip("Casos:Q", title="Reclamaciones", format=",d"),
             ],
         )
+    )
+    etiquetas = (
+        base.mark_text(align="left", dx=4, fontSize=10, fontWeight="bold",
+                       color="#333")
+        .encode(
+            y=alt.Y("Etapa:N", sort=orden_etapas),
+            x=alt.X("Promedio:Q"),
+            text=alt.Text("Promedio:Q", format=".1f"),
+        )
+    )
+    grafica = (
+        (barras + etiquetas)
+        .encode(row=alt.Row("Mes:N", title=None, sort=orden_meses,
+                            header=alt.Header(labelAngle=0, labelAlign="left")))
         .properties(height=max(60, altura // max(1, len(orden_meses))))
     )
     st.altair_chart(grafica, use_container_width=True)
@@ -2154,9 +2236,9 @@ def _grafica_dias_comprador(prom: pd.DataFrame, altura: int = 320) -> None:
                      x_label="Días promedio", y_label="Comprador")
         return
     datos = prom.reset_index()
-    grafica = (
-        alt.Chart(datos)
-        .mark_bar()
+    base = alt.Chart(datos)
+    barras = (
+        base.mark_bar(color="#72B7B2")
         .encode(
             y=alt.Y("_comprador:N", title=None, sort=list(prom.index)),
             x=alt.X("Promedio:Q", title="Días promedio en Gestión",
@@ -2167,9 +2249,30 @@ def _grafica_dias_comprador(prom: pd.DataFrame, altura: int = 320) -> None:
                 alt.Tooltip("Casos:Q", title="Reclamaciones", format=",d"),
             ],
         )
-        .properties(height=altura)
     )
-    st.altair_chart(grafica, use_container_width=True)
+    # Etiqueta: días promedio y, entre paréntesis, cuántas reclamaciones lo componen
+    datos["_txt"] = (datos["Promedio"].map(lambda v: f"{v:.1f}")
+                     + " (" + datos["Casos"].map(lambda n: f"{int(n)}") + ")")
+    etiquetas = (
+        base.mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
+                       color="#333")
+        .encode(
+            y=alt.Y("_comprador:N", sort=list(prom.index)),
+            x=alt.X("Promedio:Q"),
+            text=alt.Text("_txt:N"),
+        )
+    )
+    st.altair_chart((barras + etiquetas).properties(height=altura),
+                    use_container_width=True)
+
+
+def _tabla_a_excel(tabla: pd.DataFrame) -> bytes:
+    """Convierte una tabla (con índice) a un archivo Excel en memoria."""
+    import io
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        tabla.to_excel(writer, sheet_name="Avance", index=True)
+    return buffer.getvalue()
 
 
 def vista_graficas(df: pd.DataFrame) -> None:
@@ -2218,6 +2321,7 @@ def vista_graficas(df: pd.DataFrame) -> None:
         fmt_columna = st.column_config.NumberColumn(format="$%.2f")
 
     dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
+    dfg["_proveedor"] = dfg[COL_PROVEEDOR].replace("", "SIN PROVEEDOR")
 
     # =====================================================================
     #  SECCIÓN A — JEFATURA DE INCIDENCIAS
@@ -2230,73 +2334,64 @@ def vista_graficas(df: pd.DataFrame) -> None:
     etapas_jef = [e for e in ETAPAS_JEFATURA if e in set(dfg[COL_ETAPA])]
     dfg_jef = dfg[dfg[COL_ETAPA].isin(ETAPAS_JEFATURA)]
 
-    # A1) Total de la Jefatura por etapa
-    st.markdown(f"##### 1. Carga total de la Jefatura por etapa · {etiqueta_valor}")
     if dfg_jef.empty:
         st.info("No hay reclamaciones en etapas de la Jefatura con los filtros actuales.")
     else:
-        serie_jef = (dfg_jef.groupby(COL_ETAPA)["_valor"].sum()
-                     .reindex(etapas_jef).fillna(0))
-        tabla_jef_total = pd.DataFrame({"Jefatura de incidencias": serie_jef}).T
-        tabla_jef_total = tabla_jef_total[etapas_jef]
-        if not es_dinero:
-            tabla_jef_total = tabla_jef_total.round(0).astype(int)
-        _grafica_barras(tabla_jef_total, etiqueta_valor, es_dinero,
-                        orden_series=etapas_jef, altura=180)
+        # A1) Total de reclamos por proveedor (solo el total, sin desglose)
+        st.markdown(f"##### 1. Reclamos por proveedor · {etiqueta_valor}")
+        st.caption("Total de reclamaciones de la Jefatura agrupadas por proveedor.")
+        serie_prov = (dfg_jef.groupby("_proveedor")["_valor"].sum()
+                      .sort_values(ascending=False))
+        serie_prov.index.name = "Proveedor"
+        _grafica_barra_simple(serie_prov, etiqueta_valor, es_dinero,
+                              altura=max(320, 22 * len(serie_prov)))
 
-        # A2) Desglose por comprador de origen
-        st.markdown(f"##### 2. Desglose por comprador de origen · {etiqueta_valor}")
-        st.caption("Las mismas etapas de Jefatura, separadas según el comprador "
-                   "que originó cada reclamación.")
-        tabla_jef = (dfg_jef.pivot_table(index="_comprador", columns=COL_ETAPA,
-                                         values="_valor", aggfunc="sum", fill_value=0))
-        cols_jef = [e for e in etapas_jef if e in tabla_jef.columns]
-        tabla_jef = tabla_jef[cols_jef]
-        tabla_jef = tabla_jef.loc[tabla_jef.sum(axis=1).sort_values(ascending=False).index]
+        # A2) Por proveedor y por etapa (solo etapas de Jefatura)
+        st.markdown(f"##### 2. Reclamos por proveedor y etapa · {etiqueta_valor}")
+        st.caption("Las reclamaciones de la Jefatura por proveedor, divididas en "
+                   "sus tres etapas (sin incluir Gestión).")
+        tabla_pe = (dfg_jef.pivot_table(index="_proveedor", columns=COL_ETAPA,
+                                        values="_valor", aggfunc="sum", fill_value=0))
+        cols_pe = [e for e in etapas_jef if e in tabla_pe.columns]
+        tabla_pe = tabla_pe[cols_pe]
+        tabla_pe = tabla_pe.loc[tabla_pe.sum(axis=1).sort_values(ascending=False).index]
+        tabla_pe.index.name = "Proveedor"
         if not es_dinero:
-            tabla_jef = tabla_jef.round(0).astype(int)
-        _grafica_barras(tabla_jef, etiqueta_valor, es_dinero,
-                        orden_series=cols_jef, altura=340)
+            tabla_pe = tabla_pe.round(0).astype(int)
+        _grafica_barras(tabla_pe, etiqueta_valor, es_dinero,
+                        orden_series=cols_pe, altura=max(340, 26 * len(tabla_pe)))
 
     st.divider()
 
     # =====================================================================
     #  SECCIÓN B — COMPRADORES (Gestión)
+    #  Solo lo que está actualmente en Gestión.
     # =====================================================================
     st.markdown("### 🧑‍💼 Compradores · Gestión")
-    st.caption("Etapa de Gestión, a cargo de cada comprador.")
+    st.caption("Reclamaciones que están actualmente en la etapa de Gestión, "
+               "a cargo de cada comprador.")
 
     dfg_gest = dfg[dfg[COL_ETAPA] == ETAPA_COMPRADORES]
 
-    # B1) Cuántas de cada comprador ya pasaron a la siguiente etapa
-    st.markdown("##### 3. Gestión: en curso vs. ya avanzadas")
-    st.caption("Por comprador: cuántas reclamaciones siguen en Gestión y cuántas "
-               "ya cerró (pasaron a Disposición final o más adelante).")
-
-    # "En Gestión" = etapa actual es Gestión · "Avanzó" = terminó Gestión (E2)
-    dfg["_gestion_estado"] = dfg.apply(
-        lambda f: "En Gestión" if str(f.get(COL_ETAPA, "")).strip() == ETAPA_COMPRADORES
-        else ("Avanzó de Gestión" if es_verdadero(f.get(COL_E2_TERM)) else None),
-        axis=1,
-    )
-    dfg_g = dfg[dfg["_gestion_estado"].notna()]
-    if dfg_g.empty:
-        st.info("No hay reclamaciones en Gestión ni avanzadas con los filtros actuales.")
+    # B1) Cuántas reclamaciones tiene cada comprador EN Gestión (+ total)
+    st.markdown(f"##### 3. Reclamaciones en Gestión por comprador · {etiqueta_valor}")
+    if dfg_gest.empty:
+        st.info("No hay reclamaciones actualmente en Gestión con los filtros actuales.")
     else:
-        tabla_g = (dfg_g.pivot_table(index="_comprador", columns="_gestion_estado",
-                                     values="_valor", aggfunc="sum", fill_value=0))
-        orden_g = [c for c in ["En Gestión", "Avanzó de Gestión"] if c in tabla_g.columns]
-        tabla_g = tabla_g[orden_g]
-        tabla_g = tabla_g.loc[tabla_g.sum(axis=1).sort_values(ascending=False).index]
-        if not es_dinero:
-            tabla_g = tabla_g.round(0).astype(int)
-        _grafica_barras(tabla_g, etiqueta_valor, es_dinero,
-                        orden_series=orden_g, altura=320)
+        serie_gest = (dfg_gest.groupby("_comprador")["_valor"].sum()
+                      .sort_values(ascending=False))
+        serie_gest.index.name = "Comprador"
+        total_gest = serie_gest.sum()
+        st.caption(f"Total en Gestión: **{_fmt_valor(total_gest, es_dinero)}** "
+                   f"en {len(serie_gest)} comprador(es).")
+        _grafica_barra_simple(serie_gest, etiqueta_valor, es_dinero,
+                              altura=max(280, 26 * len(serie_gest)), color="#F58518")
 
     # B2) Tiempo promedio que tardan en Gestión
     st.markdown("##### 4. Tiempo promedio en Gestión por comprador")
     st.caption("Días promedio que cada comprador tardó en cerrar la etapa de "
-               "Gestión (solo reclamaciones con Gestión terminada).")
+               "Gestión (solo reclamaciones con Gestión terminada). Entre "
+               "paréntesis, el número de reclamaciones promediadas.")
 
     filas_dias = []
     for _, fila in dfg.iterrows():
@@ -2315,7 +2410,51 @@ def vista_graficas(df: pd.DataFrame) -> None:
                 .agg(Promedio=("Días", "mean"), Casos=("Días", "size")))
         prom["Promedio"] = prom["Promedio"].round(1)
         prom = prom.sort_values("Promedio", ascending=False)
-        _grafica_dias_comprador(prom, altura=320)
+        _grafica_dias_comprador(prom, altura=max(280, 26 * len(prom)))
+
+    st.divider()
+
+    # =====================================================================
+    #  Tabla de reclamaciones por comprador y su avance (descargable)
+    # =====================================================================
+    st.markdown("### 📋 Detalle por comprador")
+    st.caption("Reclamaciones de cada comprador y su avance. Cambia entre "
+               "cantidad e importe con el selector de arriba. Se puede descargar.")
+
+    tabla_det = (dfg.pivot_table(index="_comprador", columns=COL_ETAPA,
+                                 values="_valor", aggfunc="sum", fill_value=0))
+    orden_cols = [e for e in ORDEN_ETAPAS if e in tabla_det.columns]
+    orden_cols += [c for c in tabla_det.columns if c not in orden_cols]
+    tabla_det = tabla_det[orden_cols]
+    tabla_det["TOTAL"] = tabla_det.sum(axis=1)
+    finalizadas = (dfg[dfg[COL_ETAPA] == ETAPA_FINAL].groupby("_comprador")["_valor"]
+                   .sum().reindex(tabla_det.index).fillna(0))
+    tabla_det["% avance"] = (finalizadas / tabla_det["TOTAL"].replace(0, pd.NA)
+                             * 100).round(1).fillna(0)
+    tabla_det = tabla_det.sort_values("TOTAL", ascending=False)
+    if not es_dinero:
+        for c in orden_cols + ["TOTAL"]:
+            tabla_det[c] = tabla_det[c].round(0).astype(int)
+
+    tabla_det.index.name = "Comprador"
+    st.dataframe(
+        tabla_det, use_container_width=True,
+        column_config={
+            **{c: fmt_columna for c in orden_cols},
+            "TOTAL": fmt_columna,
+            "% avance": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+    # Descarga en Excel
+    unidad = "importe" if es_dinero else "cantidad"
+    st.download_button(
+        f"⬇️ Descargar tabla ({unidad})",
+        data=_tabla_a_excel(tabla_det),
+        file_name=f"avance_por_comprador_{unidad}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
     st.divider()
 
