@@ -2052,8 +2052,13 @@ def _grafica_barras(tabla: pd.DataFrame, etiqueta_valor: str, es_dinero: bool,
 
 
 def _grafica_barra_simple(serie: pd.Series, etiqueta_valor: str, es_dinero: bool,
-                          altura: int = 340, color: str = "#4C78A8") -> None:
-    """Barras horizontales de una sola serie, con el número al final de cada barra."""
+                          altura: int = 340, color: str = "#4C78A8",
+                          conteo: pd.Series = None) -> None:
+    """Barras horizontales de una sola serie con el valor al final de cada barra.
+
+    Si se pasa `conteo` (reclamaciones por categoría), la etiqueta muestra el
+    importe y, entre paréntesis, el número de reclamaciones. Ej.: $12,345.00 (7).
+    """
     if serie.empty or serie.sum() == 0:
         st.info("Sin datos para graficar.")
         return
@@ -2061,15 +2066,27 @@ def _grafica_barra_simple(serie: pd.Series, etiqueta_valor: str, es_dinero: bool
     col_cat = serie.index.name or "Categoria"
     datos = serie.reset_index()
     datos.columns = ["Categoria", "Valor"]
+    if conteo is not None:
+        datos["Conteo"] = datos["Categoria"].map(conteo).fillna(0).astype(int)
+    else:
+        datos["Conteo"] = 0
     datos = datos[datos["Valor"] != 0]
 
     if not ALTAIR_OK:
-        st.bar_chart(datos.set_index("Categoria"), height=altura,
+        st.bar_chart(datos.set_index("Categoria")[["Valor"]], height=altura,
                      horizontal=True, x_label=etiqueta_valor, y_label=None)
         return
 
     fmt = "$,.2f" if es_dinero else ",d"
-    nombre_valor = "Importe" if es_dinero else "Reclamaciones"
+    # Texto de la etiqueta: importe y, si hay conteo, "(n)" al lado
+    if conteo is not None:
+        datos["_txt"] = datos.apply(
+            lambda r: (f"${r['Valor']:,.2f}" if es_dinero else f"{int(r['Valor']):,}")
+            + f"  ({int(r['Conteo'])})", axis=1)
+    else:
+        datos["_txt"] = datos["Valor"].map(
+            lambda v: f"${v:,.2f}" if es_dinero else f"{int(v):,}")
+
     base = alt.Chart(datos)
     barras = (
         base.mark_bar(color=color)
@@ -2078,7 +2095,8 @@ def _grafica_barra_simple(serie: pd.Series, etiqueta_valor: str, es_dinero: bool
             x=alt.X("Valor:Q", title=etiqueta_valor, axis=alt.Axis(format=fmt)),
             tooltip=[
                 alt.Tooltip("Categoria:N", title=col_cat.replace("_", " ").title()),
-                alt.Tooltip("Valor:Q", title=nombre_valor, format=fmt),
+                alt.Tooltip("Valor:Q", title="Importe", format=fmt),
+                alt.Tooltip("Conteo:Q", title="Reclamaciones", format=",d"),
             ],
         )
     )
@@ -2088,7 +2106,7 @@ def _grafica_barra_simple(serie: pd.Series, etiqueta_valor: str, es_dinero: bool
         .encode(
             y=alt.Y("Categoria:N", sort="-x"),
             x=alt.X("Valor:Q"),
-            text=alt.Text("Valor:Q", format=fmt),
+            text=alt.Text("_txt:N"),
         )
     )
     st.altair_chart((barras + etiquetas).properties(height=altura),
@@ -2306,17 +2324,12 @@ def vista_graficas(df: pd.DataFrame) -> None:
         st.info("No hay registros con los filtros actuales.")
         return
 
-    # --- Controles propios de esta vista ---
-    c1, c2 = st.columns([2, 2])
+    # --- Control propio: solo filtro de mes (las gráficas van siempre en importe) ---
     meses_disp = (df[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
                   .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
-    sel_meses = c1.multiselect(
+    sel_meses = st.multiselect(
         "Mes de reclamación", options=meses_disp,
         placeholder="Todos los meses", key="graf_meses",
-    )
-    medida = c2.radio(
-        "Medir por", options=["Cantidad", "Importe (MXN)"],
-        horizontal=True, key="graf_medida",
     )
 
     dfg = df[df[COL_MES_ETIQUETA].isin(sel_meses)] if sel_meses else df.copy()
@@ -2324,24 +2337,17 @@ def vista_graficas(df: pd.DataFrame) -> None:
         st.info("No hay registros para los meses seleccionados.")
         return
 
-    # Columna de valor y formato según la medida elegida.
-    # Cantidad → número entero con separador de miles (sin decimales).
-    # Importe  → moneda en pesos con dos decimales.
-    if medida == "Cantidad":
-        dfg = dfg.assign(_valor=1.0)
-        es_dinero = False
-        formato = "{:,.0f}"
-        etiqueta_valor = "Reclamaciones"
-        # Formato para las columnas numéricas de las tablas
-        fmt_columna = st.column_config.NumberColumn(format="%d")
-    else:
-        dfg = dfg.assign(
-            _valor=pd.to_numeric(dfg[COL_IMPORTE], errors="coerce").fillna(0.0)
-        )
-        es_dinero = True
-        formato = "${:,.2f}"
-        etiqueta_valor = "Importe (MXN)"
-        fmt_columna = st.column_config.NumberColumn(format="$%.2f")
+    # Las gráficas se miden por IMPORTE (en pesos). La cantidad de reclamaciones
+    # se lleva en paralelo (_conteo) para mostrarla como dato informativo.
+    es_dinero = True
+    etiqueta_valor = "Importe (MXN)"
+    fmt_columna = st.column_config.NumberColumn(format="$%.2f")
+    dfg = dfg.assign(
+        _valor=pd.to_numeric(dfg[COL_IMPORTE], errors="coerce").fillna(0.0),
+        _conteo=1,
+    )
+    st.caption("💡 Las gráficas se muestran por **importe en pesos**. La cantidad "
+               "de reclamaciones aparece a un lado como dato informativo.")
 
     dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
     dfg["_proveedor"] = dfg[COL_PROVEEDOR].replace("", "SIN PROVEEDOR")
@@ -2361,31 +2367,32 @@ def vista_graficas(df: pd.DataFrame) -> None:
         st.info("No hay reclamaciones en etapas de la Jefatura con los filtros actuales.")
     else:
         # A1) Total de reclamos por proveedor (solo el total, sin desglose)
-        st.markdown(f"##### 1. Reclamos por proveedor · {etiqueta_valor}")
-        st.caption("Total de reclamaciones de la Jefatura agrupadas por proveedor.")
+        st.markdown("##### 1. Reclamos por proveedor")
+        st.caption("Importe total de la Jefatura por proveedor. Entre paréntesis, "
+                   "la cantidad de reclamaciones.")
         serie_prov = (dfg_jef.groupby("_proveedor")["_valor"].sum()
                       .sort_values(ascending=False))
         serie_prov.index.name = "Proveedor"
+        conteo_prov = dfg_jef.groupby("_proveedor")["_conteo"].sum()
         _grafica_barra_simple(serie_prov, etiqueta_valor, es_dinero,
-                              altura=max(320, 22 * len(serie_prov)))
+                              altura=max(320, 22 * len(serie_prov)),
+                              conteo=conteo_prov)
 
         # A2) Por proveedor y por etapa (solo etapas de Jefatura)
-        st.markdown(f"##### 2. Reclamos por proveedor y etapa · {etiqueta_valor}")
-        st.caption("Las reclamaciones de la Jefatura por proveedor, divididas en "
-                   "sus tres etapas (sin incluir Gestión).")
+        st.markdown("##### 2. Reclamos por proveedor y etapa")
+        st.caption("El importe de la Jefatura por proveedor, dividido en sus tres "
+                   "etapas (sin incluir Gestión).")
         tabla_pe = (dfg_jef.pivot_table(index="_proveedor", columns=COL_ETAPA,
                                         values="_valor", aggfunc="sum", fill_value=0))
         cols_pe = [e for e in etapas_jef if e in tabla_pe.columns]
         tabla_pe = tabla_pe[cols_pe]
         tabla_pe = tabla_pe.loc[tabla_pe.sum(axis=1).sort_values(ascending=False).index]
         tabla_pe.index.name = "Proveedor"
-        if not es_dinero:
-            tabla_pe = tabla_pe.round(0).astype(int)
         _grafica_barras(tabla_pe, etiqueta_valor, es_dinero,
                         orden_series=cols_pe, altura=max(340, 26 * len(tabla_pe)))
 
     # A3) Reclamaciones en Cuarentena por proveedor (se tratan aparte)
-    st.markdown(f"##### 3. Reclamaciones en cuarentena por proveedor · {etiqueta_valor}")
+    st.markdown("##### 3. Reclamaciones en cuarentena por proveedor")
     st.caption(f"Reclamaciones con importe ≤ ${UMBRAL_CUARENTENA:,.0f} en espera "
                "de acumular monto. No cuentan en las gráficas anteriores ni en el "
                "vencimiento de 90 días.")
@@ -2396,11 +2403,14 @@ def vista_graficas(df: pd.DataFrame) -> None:
         serie_cuar = (dfg_cuar.groupby("_proveedor")["_valor"].sum()
                       .sort_values(ascending=False))
         serie_cuar.index.name = "Proveedor"
+        conteo_cuar = dfg_cuar.groupby("_proveedor")["_conteo"].sum()
         total_cuar = serie_cuar.sum()
-        st.caption(f"Total en cuarentena: **{_fmt_valor(total_cuar, es_dinero)}** "
-                   f"en {len(serie_cuar)} proveedor(es).")
+        st.caption(f"Total en cuarentena: **${total_cuar:,.2f}** "
+                   f"({int(conteo_cuar.sum())} reclamaciones) en "
+                   f"{len(serie_cuar)} proveedor(es).")
         _grafica_barra_simple(serie_cuar, etiqueta_valor, es_dinero,
-                              altura=max(280, 22 * len(serie_cuar)), color="#2980b9")
+                              altura=max(280, 22 * len(serie_cuar)), color="#2980b9",
+                              conteo=conteo_cuar)
 
     st.divider()
 
@@ -2415,18 +2425,21 @@ def vista_graficas(df: pd.DataFrame) -> None:
     dfg_gest = dfg[dfg[COL_ETAPA] == ETAPA_COMPRADORES]
 
     # B1) Cuántas reclamaciones tiene cada comprador EN Gestión (+ total)
-    st.markdown(f"##### 4. Reclamaciones en Gestión por comprador · {etiqueta_valor}")
+    st.markdown("##### 4. Reclamaciones en Gestión por comprador")
     if dfg_gest.empty:
         st.info("No hay reclamaciones actualmente en Gestión con los filtros actuales.")
     else:
         serie_gest = (dfg_gest.groupby("_comprador")["_valor"].sum()
                       .sort_values(ascending=False))
         serie_gest.index.name = "Comprador"
+        conteo_gest = dfg_gest.groupby("_comprador")["_conteo"].sum()
         total_gest = serie_gest.sum()
-        st.caption(f"Total en Gestión: **{_fmt_valor(total_gest, es_dinero)}** "
-                   f"en {len(serie_gest)} comprador(es).")
+        st.caption(f"Total en Gestión: **${total_gest:,.2f}** "
+                   f"({int(conteo_gest.sum())} reclamaciones) en "
+                   f"{len(serie_gest)} comprador(es).")
         _grafica_barra_simple(serie_gest, etiqueta_valor, es_dinero,
-                              altura=max(280, 26 * len(serie_gest)), color="#F58518")
+                              altura=max(280, 26 * len(serie_gest)), color="#F58518",
+                              conteo=conteo_gest)
 
     # B2) Tiempo promedio que tardan en Gestión
     st.markdown("##### 5. Tiempo promedio en Gestión por comprador")
@@ -2459,40 +2472,44 @@ def vista_graficas(df: pd.DataFrame) -> None:
     #  Tabla de reclamaciones por comprador y su avance (descargable)
     # =====================================================================
     st.markdown("### 📋 Detalle por comprador")
-    st.caption("Reclamaciones de cada comprador y su avance. Cambia entre "
-               "cantidad e importe con el selector de arriba. Se puede descargar.")
+    st.caption("Importe por etapa de cada comprador, importe total y la cantidad "
+               "de reclamaciones vigentes (sin contar las que están en cuarentena). "
+               "Ordena por cualquier encabezado. Se puede descargar.")
 
+    # Importe por etapa (todas las etapas, incluida cuarentena como columna aparte)
     tabla_det = (dfg.pivot_table(index="_comprador", columns=COL_ETAPA,
                                  values="_valor", aggfunc="sum", fill_value=0))
     orden_cols = [e for e in ORDEN_ETAPAS if e in tabla_det.columns]
     orden_cols += [c for c in tabla_det.columns if c not in orden_cols]
     tabla_det = tabla_det[orden_cols]
-    tabla_det["TOTAL"] = tabla_det.sum(axis=1)
+
+    # Importe total y cantidad de reclamaciones VIGENTES (excluye cuarentena)
+    dfg_vig = dfg[dfg[COL_ETAPA] != ETAPA_CUARENTENA]
+    importe_vig = dfg_vig.groupby("_comprador")["_valor"].sum()
+    conteo_vig = dfg_vig.groupby("_comprador")["_conteo"].sum()
+    tabla_det["Importe vigente"] = importe_vig.reindex(tabla_det.index).fillna(0)
+    tabla_det["Reclamos vigentes"] = (conteo_vig.reindex(tabla_det.index)
+                                      .fillna(0).astype(int))
+
+    # % de avance = finalizadas / vigentes
     finalizadas = (dfg[dfg[COL_ETAPA] == ETAPA_FINAL].groupby("_comprador")["_valor"]
                    .sum().reindex(tabla_det.index).fillna(0))
-    tabla_det["% avance"] = (finalizadas / tabla_det["TOTAL"].replace(0, pd.NA)
+    tabla_det["% avance"] = (finalizadas / tabla_det["Importe vigente"].replace(0, pd.NA)
                              * 100).round(1).fillna(0)
-    tabla_det = tabla_det.sort_values("TOTAL", ascending=False)
-    if not es_dinero:
-        for c in orden_cols + ["TOTAL"]:
-            tabla_det[c] = tabla_det[c].round(0).astype(int)
-
+    tabla_det = tabla_det.sort_values("Importe vigente", ascending=False)
     tabla_det.index.name = "Comprador"
-    st.dataframe(
-        tabla_det, use_container_width=True,
-        column_config={
-            **{c: fmt_columna for c in orden_cols},
-            "TOTAL": fmt_columna,
-            "% avance": st.column_config.NumberColumn(format="%.1f%%"),
-        },
-    )
 
-    # Descarga en Excel
-    unidad = "importe" if es_dinero else "cantidad"
+    # Formato: importes con moneda, reclamos como entero
+    cfg = {c: st.column_config.NumberColumn(format="$%.2f") for c in orden_cols}
+    cfg["Importe vigente"] = st.column_config.NumberColumn(format="$%.2f")
+    cfg["Reclamos vigentes"] = st.column_config.NumberColumn(format="%d")
+    cfg["% avance"] = st.column_config.NumberColumn(format="%.1f%%")
+    st.dataframe(tabla_det, use_container_width=True, column_config=cfg)
+
     st.download_button(
-        f"⬇️ Descargar tabla ({unidad})",
+        "⬇️ Descargar tabla (Excel)",
         data=_tabla_a_excel(tabla_det),
-        file_name=f"avance_por_comprador_{unidad}.xlsx",
+        file_name="avance_por_comprador.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
