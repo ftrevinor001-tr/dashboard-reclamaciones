@@ -2207,11 +2207,13 @@ def _grafica_dias_promedio(df: pd.DataFrame, altura: int = 360) -> None:
             text=alt.Text("Promedio:Q", format=".1f"),
         )
     )
+    # El facetado (row) debe aplicarse a la CAPA combinada con alt.layer().facet(),
+    # no con .encode(row=...) sobre la suma de capas (eso rompe el esquema).
     grafica = (
-        (barras + etiquetas)
-        .encode(row=alt.Row("Mes:N", title=None, sort=orden_meses,
-                            header=alt.Header(labelAngle=0, labelAlign="left")))
-        .properties(height=max(60, altura // max(1, len(orden_meses))))
+        alt.layer(barras, etiquetas)
+        .facet(row=alt.Row("Mes:N", title=None, sort=orden_meses,
+                           header=alt.Header(labelAngle=0, labelAlign="left")))
+        .properties(title="")
     )
     st.altair_chart(grafica, use_container_width=True)
 
@@ -2361,6 +2363,24 @@ def vista_graficas(df: pd.DataFrame) -> None:
         _grafica_barras(tabla_pe, etiqueta_valor, es_dinero,
                         orden_series=cols_pe, altura=max(340, 26 * len(tabla_pe)))
 
+    # A3) Reclamaciones en Cuarentena por proveedor (se tratan aparte)
+    st.markdown(f"##### 3. Reclamaciones en cuarentena por proveedor · {etiqueta_valor}")
+    st.caption(f"Reclamaciones con importe ≤ ${UMBRAL_CUARENTENA:,.0f} en espera "
+               "de acumular monto. No cuentan en las gráficas anteriores ni en el "
+               "vencimiento de 90 días.")
+    dfg_cuar = dfg[dfg[COL_ETAPA] == ETAPA_CUARENTENA]
+    if dfg_cuar.empty:
+        st.info("No hay reclamaciones en cuarentena con los filtros actuales.")
+    else:
+        serie_cuar = (dfg_cuar.groupby("_proveedor")["_valor"].sum()
+                      .sort_values(ascending=False))
+        serie_cuar.index.name = "Proveedor"
+        total_cuar = serie_cuar.sum()
+        st.caption(f"Total en cuarentena: **{_fmt_valor(total_cuar, es_dinero)}** "
+                   f"en {len(serie_cuar)} proveedor(es).")
+        _grafica_barra_simple(serie_cuar, etiqueta_valor, es_dinero,
+                              altura=max(280, 22 * len(serie_cuar)), color="#2980b9")
+
     st.divider()
 
     # =====================================================================
@@ -2374,7 +2394,7 @@ def vista_graficas(df: pd.DataFrame) -> None:
     dfg_gest = dfg[dfg[COL_ETAPA] == ETAPA_COMPRADORES]
 
     # B1) Cuántas reclamaciones tiene cada comprador EN Gestión (+ total)
-    st.markdown(f"##### 3. Reclamaciones en Gestión por comprador · {etiqueta_valor}")
+    st.markdown(f"##### 4. Reclamaciones en Gestión por comprador · {etiqueta_valor}")
     if dfg_gest.empty:
         st.info("No hay reclamaciones actualmente en Gestión con los filtros actuales.")
     else:
@@ -2388,7 +2408,7 @@ def vista_graficas(df: pd.DataFrame) -> None:
                               altura=max(280, 26 * len(serie_gest)), color="#F58518")
 
     # B2) Tiempo promedio que tardan en Gestión
-    st.markdown("##### 4. Tiempo promedio en Gestión por comprador")
+    st.markdown("##### 5. Tiempo promedio en Gestión por comprador")
     st.caption("Días promedio que cada comprador tardó en cerrar la etapa de "
                "Gestión (solo reclamaciones con Gestión terminada). Entre "
                "paréntesis, el número de reclamaciones promediadas.")
