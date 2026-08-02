@@ -111,6 +111,14 @@ ETAPA_3 = "Cuentas por pagar"
 ETAPA_4 = "Disposición final"
 ETAPA_CUARENTENA = "Cuarentena"
 
+# Actores responsables de las etapas:
+#   - Jefatura de incidencias: Reporte de reclamo, Disposición final, Cuentas por pagar
+#   - Compradores (con nombre): Gestión
+ACTOR_JEFATURA = "Jefatura de incidencias"
+ACTOR_COMPRADORES = "Compradores"
+ETAPAS_JEFATURA = [ETAPA_1, ETAPA_4, ETAPA_3]  # en orden de flujo
+ETAPA_COMPRADORES = ETAPA_2
+
 # Nombres antiguos que puedan existir en la base de datos, para migrarlos
 # automáticamente al cargar (evita que aparezcan etiquetas obsoletas en
 # tablas, filtros y gráficas).
@@ -501,9 +509,14 @@ def vencido_90_sin_definicion(fila: pd.Series) -> bool:
 
     'Sin definición' significa que el proceso aún no ha llegado a su fin
     (la etapa no es FINALIZADO), por lo que debe enviarse a destrucción.
+
+    Las reclamaciones en Cuarentena quedan EXCLUIDAS: tienen su propio
+    vencimiento (gestionado en el área de cuarentena) y el conteo de 90 días
+    solo empieza cuando salen de ahí, ya sea por liberación con clave o porque
+    se cumplió su plazo de cuarentena.
     """
     etapa = str(fila.get(COL_ETAPA, "")).strip()
-    if etapa == ETAPA_FINAL:
+    if etapa in (ETAPA_FINAL, ETAPA_CUARENTENA):
         return False
     limite = fecha_vencimiento_90(fila)
     return limite is not None and hoy_mx() > limite
@@ -1562,11 +1575,14 @@ def mostrar_kpis(df: pd.DataFrame) -> None:
     total = len(df)
     importe = pd.to_numeric(df.get(COL_IMPORTE), errors="coerce").fillna(0).sum()
     finalizados = int((df[COL_ETAPA] == ETAPA_FINAL).sum())
-    en_proceso = total - finalizados
+    en_cuarentena = int((df[COL_ETAPA] == ETAPA_CUARENTENA).sum())
+    # En proceso = ni finalizadas ni en cuarentena (la cuarentena es un limbo aparte)
+    en_proceso = total - finalizados - en_cuarentena
+    # Las vencidas a 90 días ya excluyen la cuarentena (ver vencido_90_sin_definicion)
     vencidos_90 = int(df.apply(vencido_90_sin_definicion, axis=1).sum()) if total else 0
 
     st.markdown(
-        f"""<div style='display:flex;gap:1.6rem;flex-wrap:wrap;
+        f"""<div style='display:flex;gap:1.4rem;flex-wrap:wrap;
                         padding:0.35rem 0.7rem;margin-bottom:0.4rem;
                         border:1px solid #e6e6e6;border-radius:8px;
                         font-size:0.85rem;align-items:center'>
@@ -1574,6 +1590,7 @@ def mostrar_kpis(df: pd.DataFrame) -> None:
           <span>💰 <b>${importe:,.2f}</b></span>
           <span>⏳ <b>{en_proceso}</b> en proceso</span>
           <span>✅ <b>{finalizados}</b> finalizadas</span>
+          <span style='color:#2980b9'>🧊 <b>{en_cuarentena}</b> en cuarentena</span>
           <span style='color:#c0392b'>🚨 <b>{vencidos_90}</b> vencidas
             ({DIAS_VENCIMIENTO_TOTAL} días)</span>
         </div>""",
@@ -2127,6 +2144,34 @@ def _grafica_dias_promedio(df: pd.DataFrame, altura: int = 360) -> None:
         )
 
 
+def _grafica_dias_comprador(prom: pd.DataFrame, altura: int = 320) -> None:
+    """Barras horizontales del tiempo promedio en Gestión por comprador."""
+    if prom.empty:
+        st.info("Sin datos para graficar.")
+        return
+    if not ALTAIR_OK:
+        st.bar_chart(prom[["Promedio"]], height=altura, horizontal=True,
+                     x_label="Días promedio", y_label="Comprador")
+        return
+    datos = prom.reset_index()
+    grafica = (
+        alt.Chart(datos)
+        .mark_bar()
+        .encode(
+            y=alt.Y("_comprador:N", title=None, sort=list(prom.index)),
+            x=alt.X("Promedio:Q", title="Días promedio en Gestión",
+                    axis=alt.Axis(format=".1f")),
+            tooltip=[
+                alt.Tooltip("_comprador:N", title="Comprador"),
+                alt.Tooltip("Promedio:Q", title="Días promedio", format=".1f"),
+                alt.Tooltip("Casos:Q", title="Reclamaciones", format=",d"),
+            ],
+        )
+        .properties(height=altura)
+    )
+    st.altair_chart(grafica, use_container_width=True)
+
+
 def vista_graficas(df: pd.DataFrame) -> None:
     """Gráficas de avance por comprador, con filtro de mes y medida propios."""
     st.subheader("📈 Avance por comprador")
@@ -2175,100 +2220,111 @@ def vista_graficas(df: pd.DataFrame) -> None:
     dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
 
     # =====================================================================
-    # 1) Reclamaciones por etapa (barras apiladas)
+    #  SECCIÓN A — JEFATURA DE INCIDENCIAS
+    #  Administra: Reporte de reclamo, Disposición final, Cuentas por pagar
     # =====================================================================
-    st.markdown(f"##### 1. Distribución por etapa · {etiqueta_valor}")
-    st.caption("Muestra en qué fase del proceso está el trabajo de cada comprador.")
+    st.markdown("### 🏛️ Jefatura de incidencias")
+    st.caption("Etapas a cargo de la Jefatura: Reporte de reclamo, "
+               "Disposición final y Cuentas por pagar.")
 
-    tabla_etapas = (dfg.pivot_table(index="_comprador", columns=COL_ETAPA,
-                                    values="_valor", aggfunc="sum", fill_value=0))
-    # Ordenar columnas por el flujo del proceso
-    columnas_orden = [e for e in ORDEN_ETAPAS if e in tabla_etapas.columns]
-    columnas_orden += [c for c in tabla_etapas.columns if c not in columnas_orden]
-    tabla_etapas = tabla_etapas[columnas_orden]
-    tabla_etapas = tabla_etapas.loc[tabla_etapas.sum(axis=1).sort_values(ascending=False).index]
-    # Las cantidades son conteos: se muestran como enteros.
-    if not es_dinero:
-        tabla_etapas = tabla_etapas.round(0).astype(int)
+    etapas_jef = [e for e in ETAPAS_JEFATURA if e in set(dfg[COL_ETAPA])]
+    dfg_jef = dfg[dfg[COL_ETAPA].isin(ETAPAS_JEFATURA)]
 
-    _grafica_barras(tabla_etapas, etiqueta_valor, es_dinero,
-                    orden_series=columnas_orden, altura=340)
-
-    # =====================================================================
-    # 2) Porcentaje finalizado por comprador
-    # =====================================================================
-    st.markdown("##### 2. Porcentaje finalizado")
-    st.caption("Qué proporción del trabajo de cada comprador ya cerró todo el proceso.")
-
-    resumen = dfg.groupby("_comprador").agg(
-        total=("_valor", "sum"),
-        finalizado=("_valor", lambda s: s[dfg.loc[s.index, COL_ETAPA] == ETAPA_FINAL].sum()),
-    )
-    resumen["% finalizado"] = (resumen["finalizado"] / resumen["total"] * 100).round(1)
-    resumen = resumen.sort_values("% finalizado", ascending=False)
-
-    cg1, cg2 = st.columns([3, 2])
-    with cg1:
-        _grafica_porcentaje(resumen, altura=320)
-    with cg2:
-        tabla_pct = resumen.copy()
+    # A1) Total de la Jefatura por etapa
+    st.markdown(f"##### 1. Carga total de la Jefatura por etapa · {etiqueta_valor}")
+    if dfg_jef.empty:
+        st.info("No hay reclamaciones en etapas de la Jefatura con los filtros actuales.")
+    else:
+        serie_jef = (dfg_jef.groupby(COL_ETAPA)["_valor"].sum()
+                     .reindex(etapas_jef).fillna(0))
+        tabla_jef_total = pd.DataFrame({"Jefatura de incidencias": serie_jef}).T
+        tabla_jef_total = tabla_jef_total[etapas_jef]
         if not es_dinero:
-            tabla_pct["total"] = tabla_pct["total"].round(0).astype(int)
-            tabla_pct["finalizado"] = tabla_pct["finalizado"].round(0).astype(int)
-        tabla_pct = tabla_pct.rename(columns={
-            "total": etiqueta_valor, "finalizado": "Finalizado"})
-        st.dataframe(
-            tabla_pct, use_container_width=True, height=320,
-            column_config={
-                etiqueta_valor: fmt_columna,
-                "Finalizado": fmt_columna,
-                "% finalizado": st.column_config.NumberColumn(format="%.1f%%"),
-            },
-        )
+            tabla_jef_total = tabla_jef_total.round(0).astype(int)
+        _grafica_barras(tabla_jef_total, etiqueta_valor, es_dinero,
+                        orden_series=etapas_jef, altura=180)
+
+        # A2) Desglose por comprador de origen
+        st.markdown(f"##### 2. Desglose por comprador de origen · {etiqueta_valor}")
+        st.caption("Las mismas etapas de Jefatura, separadas según el comprador "
+                   "que originó cada reclamación.")
+        tabla_jef = (dfg_jef.pivot_table(index="_comprador", columns=COL_ETAPA,
+                                         values="_valor", aggfunc="sum", fill_value=0))
+        cols_jef = [e for e in etapas_jef if e in tabla_jef.columns]
+        tabla_jef = tabla_jef[cols_jef]
+        tabla_jef = tabla_jef.loc[tabla_jef.sum(axis=1).sort_values(ascending=False).index]
+        if not es_dinero:
+            tabla_jef = tabla_jef.round(0).astype(int)
+        _grafica_barras(tabla_jef, etiqueta_valor, es_dinero,
+                        orden_series=cols_jef, altura=340)
+
+    st.divider()
 
     # =====================================================================
-    # 3) Estado de vencimiento por comprador
+    #  SECCIÓN B — COMPRADORES (Gestión)
     # =====================================================================
-    st.markdown("##### 3. Estado de vencimiento")
-    st.caption("Reclamaciones vencidas, por vencerse o en tiempo, según su etapa activa. "
-               f"La categoría crítica es la de {DIAS_VENCIMIENTO_TOTAL} días sin definición.")
+    st.markdown("### 🧑‍💼 Compradores · Gestión")
+    st.caption("Etapa de Gestión, a cargo de cada comprador.")
 
-    dfg["_urgencia"] = dfg.apply(_clasificar_urgencia, axis=1)
-    orden_urgencia = [f"Vencida {DIAS_VENCIMIENTO_TOTAL} días", "Etapa vencida",
-                      "Por vencerse", "En tiempo", "Finalizada"]
-    tabla_urg = (dfg.pivot_table(index="_comprador", columns="_urgencia",
-                                 values="_valor", aggfunc="sum", fill_value=0))
-    cols_urg = [c for c in orden_urgencia if c in tabla_urg.columns]
-    cols_urg += [c for c in tabla_urg.columns if c not in cols_urg]
-    tabla_urg = tabla_urg[cols_urg]
-    # Ordenar por lo más urgente primero
-    criticas = [c for c in cols_urg if "Vencida" in c or "vencida" in c]
-    if criticas:
-        tabla_urg = tabla_urg.loc[
-            tabla_urg[criticas].sum(axis=1).sort_values(ascending=False).index]
-    if not es_dinero:
-        tabla_urg = tabla_urg.round(0).astype(int)
+    dfg_gest = dfg[dfg[COL_ETAPA] == ETAPA_COMPRADORES]
 
-    _grafica_barras(tabla_urg, etiqueta_valor, es_dinero,
-                    orden_series=cols_urg, altura=340)
+    # B1) Cuántas de cada comprador ya pasaron a la siguiente etapa
+    st.markdown("##### 3. Gestión: en curso vs. ya avanzadas")
+    st.caption("Por comprador: cuántas reclamaciones siguen en Gestión y cuántas "
+               "ya cerró (pasaron a Disposición final o más adelante).")
 
-    # --- Resumen numérico general ---
-    with st.expander("📋 Ver detalle numérico por comprador"):
-        detalle = tabla_etapas.copy()
-        detalle["TOTAL"] = detalle.sum(axis=1)
-        if es_dinero:
-            detalle = detalle.round(2)
-        st.dataframe(
-            detalle, use_container_width=True,
-            column_config={c: fmt_columna for c in detalle.columns},
-        )
+    # "En Gestión" = etapa actual es Gestión · "Avanzó" = terminó Gestión (E2)
+    dfg["_gestion_estado"] = dfg.apply(
+        lambda f: "En Gestión" if str(f.get(COL_ETAPA, "")).strip() == ETAPA_COMPRADORES
+        else ("Avanzó de Gestión" if es_verdadero(f.get(COL_E2_TERM)) else None),
+        axis=1,
+    )
+    dfg_g = dfg[dfg["_gestion_estado"].notna()]
+    if dfg_g.empty:
+        st.info("No hay reclamaciones en Gestión ni avanzadas con los filtros actuales.")
+    else:
+        tabla_g = (dfg_g.pivot_table(index="_comprador", columns="_gestion_estado",
+                                     values="_valor", aggfunc="sum", fill_value=0))
+        orden_g = [c for c in ["En Gestión", "Avanzó de Gestión"] if c in tabla_g.columns]
+        tabla_g = tabla_g[orden_g]
+        tabla_g = tabla_g.loc[tabla_g.sum(axis=1).sort_values(ascending=False).index]
+        if not es_dinero:
+            tabla_g = tabla_g.round(0).astype(int)
+        _grafica_barras(tabla_g, etiqueta_valor, es_dinero,
+                        orden_series=orden_g, altura=320)
+
+    # B2) Tiempo promedio que tardan en Gestión
+    st.markdown("##### 4. Tiempo promedio en Gestión por comprador")
+    st.caption("Días promedio que cada comprador tardó en cerrar la etapa de "
+               "Gestión (solo reclamaciones con Gestión terminada).")
+
+    filas_dias = []
+    for _, fila in dfg.iterrows():
+        if es_verdadero(fila.get(COL_E2_TERM)):
+            try:
+                d = float(fila.get(COL_E2_DIAS))
+                if d == d:  # no NaN
+                    filas_dias.append({"_comprador": fila[COL_COMPRADOR] or "SIN COMPRADOR",
+                                       "Días": d})
+            except (TypeError, ValueError):
+                pass
+    if not filas_dias:
+        st.info("Todavía no hay reclamaciones con Gestión terminada para promediar.")
+    else:
+        prom = (pd.DataFrame(filas_dias).groupby("_comprador")
+                .agg(Promedio=("Días", "mean"), Casos=("Días", "size")))
+        prom["Promedio"] = prom["Promedio"].round(1)
+        prom = prom.sort_values("Promedio", ascending=False)
+        _grafica_dias_comprador(prom, altura=320)
+
+    st.divider()
 
     # =====================================================================
-    # 4) Días promedio por etapa y mes
+    #  Días promedio por etapa y mes (visión global del proceso)
     # =====================================================================
-    st.markdown("##### 4. Días promedio por etapa")
-    st.caption("Cuánto tardó en promedio cada etapa, agrupado por mes de "
-               "reclamación. Solo considera etapas ya terminadas.")
+    st.markdown("### ⏱️ Días promedio por etapa y mes")
+    st.caption("Visión global: cuánto tardó en promedio cada etapa, agrupado por "
+               "mes de reclamación. Solo considera etapas ya terminadas.")
     _grafica_dias_promedio(dfg, altura=360)
 
 
