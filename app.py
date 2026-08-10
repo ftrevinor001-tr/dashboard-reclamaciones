@@ -27,6 +27,7 @@ try:
 except Exception:
     ZONA_MX = None
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -2491,11 +2492,13 @@ def vista_graficas(df: pd.DataFrame) -> None:
     tabla_det["Reclamos vigentes"] = (conteo_vig.reindex(tabla_det.index)
                                       .fillna(0).astype(int))
 
-    # % de avance = finalizadas / vigentes
+    # % de avance = finalizadas / vigentes (evitando división entre cero sin usar pd.NA,
+    # que causaba TypeError al redondear cuando la tabla queda con una sola fila)
     finalizadas = (dfg[dfg[COL_ETAPA] == ETAPA_FINAL].groupby("_comprador")["_valor"]
-                   .sum().reindex(tabla_det.index).fillna(0))
-    tabla_det["% avance"] = (finalizadas / tabla_det["Importe vigente"].replace(0, pd.NA)
-                             * 100).round(1).fillna(0)
+                   .sum().reindex(tabla_det.index).fillna(0)).astype(float)
+    importe_vig_num = tabla_det["Importe vigente"].astype(float)
+    pct = np.where(importe_vig_num > 0, finalizadas / importe_vig_num.replace(0, 1) * 100, 0.0)
+    tabla_det["% avance"] = pd.Series(pct, index=tabla_det.index).round(1)
     tabla_det = tabla_det.sort_values("Importe vigente", ascending=False)
     tabla_det.index.name = "Comprador"
 
