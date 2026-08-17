@@ -184,7 +184,12 @@ COL_E2_ESTATUS, COL_E2_OBS = "E2 ESTATUS", "E2 OBSERVACIONES"
 COL_E2_COMPROMISO = "E2 FECHA COMPROMISO RECOLECCION"
 COL_E2_LIMITE, COL_E2_DIAS, COL_E2_TERM = "E2 FECHA LIMITE", "E2 DIAS TARDO", "E2 TERMINADA"
 COL_E3_ESTATUS, COL_E3_OBS = "E3 ESTATUS", "E3 OBSERVACIONES"
-COL_E3_FOLIO_DEV = "E3 FOLIO DEVOLUCION AJUSTE"
+# Tres campos de referencia capturados en Cuentas por pagar
+COL_E3_FOLIO_DEV_NUEVO = "E3 FOLIO DEVOLUCION"
+COL_E3_FOLIO_AJUSTE = "E3 FOLIO AJUSTE"
+COL_E3_NOTA_CREDITO = "E3 NOTA CREDITO"
+# Columna vieja (nombre anterior) — se migra al primer campo si trae valor.
+COL_E3_FOLIO_DEV_VIEJO = "E3 FOLIO DEVOLUCION AJUSTE"
 COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM = "E3 FECHA LIMITE", "E3 DIAS TARDO", "E3 TERMINADA"
 COL_E4_MODALIDAD, COL_E4_ESTATUS, COL_E4_OBS = "E4 MODALIDAD", "E4 ESTATUS", "E4 OBSERVACIONES"
 COL_E4_LIMITE_REC, COL_E4_TERM = "E4 FECHA LIMITE RECOLECCION", "E4 TERMINADA"
@@ -209,7 +214,9 @@ COLUMNAS_REQUERIDAS = [
     COL_ETAPA, COL_RESPUESTA_TIPO,
     COL_E1_ESTATUS, COL_E1_OBS, COL_E1_LIMITE, COL_E1_DIAS, COL_E1_TERM,
     COL_E2_ESTATUS, COL_E2_OBS, COL_E2_COMPROMISO, COL_E2_LIMITE, COL_E2_DIAS, COL_E2_TERM,
-    COL_E3_ESTATUS, COL_E3_OBS, COL_E3_FOLIO_DEV, COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM,
+    COL_E3_ESTATUS, COL_E3_OBS,
+    COL_E3_FOLIO_DEV_NUEVO, COL_E3_FOLIO_AJUSTE, COL_E3_NOTA_CREDITO,
+    COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM,
     COL_E4_MODALIDAD, COL_E4_ESTATUS, COL_E4_OBS, COL_E4_LIMITE_REC, COL_E4_TERM,
     COL_CUAR_EN, COL_CUAR_FECHA_INICIO, COL_CUAR_DIAS, COL_CUAR_FECHA_FIN,
     COL_CUAR_OBS, COL_ETAPA_PREVIA,
@@ -338,6 +345,18 @@ def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
     for col in (COL_PROVEEDOR, COL_COMPRADOR, COL_FOLIO):
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).str.strip()
+
+    # Migración de la columna vieja "E3 FOLIO DEVOLUCION AJUSTE" (un solo campo)
+    # a "E3 FOLIO DEVOLUCION" (uno de los tres campos nuevos): si el nuevo está
+    # vacío y el viejo trae valor, se copia.
+    if COL_E3_FOLIO_DEV_VIEJO in df.columns:
+        vieja = df[COL_E3_FOLIO_DEV_VIEJO].fillna("").astype(str).str.strip()
+        nueva = df[COL_E3_FOLIO_DEV_NUEVO].fillna("").astype(str).str.strip()
+        mig = (nueva == "") & (vieja != "")
+        if mig.any():
+            df.loc[mig, COL_E3_FOLIO_DEV_NUEVO] = vieja[mig]
+        # La columna vieja se conserva en el Excel para no perder el historial,
+        # pero la app ya no la usa.
 
     # FOLIO REPORTE es el identificador principal y único.
     df["CLAVE"] = df[COL_FOLIO].astype(str)
@@ -1190,8 +1209,15 @@ def pestania_etapa3(fila: pd.Series) -> None:
     if terminada:
         st.success("🎉 Proceso TERMINADO. Todas las etapas y fechas quedaron registradas.")
         _resumen_pasos(fila, PASOS_E3)
-        if str(fila.get(COL_E3_FOLIO_DEV, "")).strip():
-            st.info(f"📄 Folio de devolución o ajuste: {fila.get(COL_E3_FOLIO_DEV)}")
+        campos_lectura = [
+            ("📄 Folio de devolución", COL_E3_FOLIO_DEV_NUEVO),
+            ("📝 Folio de ajuste", COL_E3_FOLIO_AJUSTE),
+            ("💳 Nota de crédito", COL_E3_NOTA_CREDITO),
+        ]
+        for etiqueta, col in campos_lectura:
+            valor = str(fila.get(col, "") or "").strip()
+            if valor:
+                st.info(f"{etiqueta}: {valor}")
         if str(fila.get(COL_E3_OBS, "")).strip():
             st.info(f"📝 Observaciones: {fila.get(COL_E3_OBS)}")
         _boton_reactivar("E3", clave)
@@ -1200,10 +1226,22 @@ def pestania_etapa3(fila: pd.Series) -> None:
 
     with st.form(f"form_e3_{clave}"):
         cambios, cols_usuario = _registrar_pasos_form(fila, PASOS_E3, "e3", solo_lectura=False)
-        folio_dev = st.text_input(
-            "Folio de devolución o ajuste",
-            value=str(fila.get(COL_E3_FOLIO_DEV, "") or ""),
+        st.markdown("##### Referencias del pago")
+        c_f1, c_f2, c_f3 = st.columns(3)
+        folio_dev = c_f1.text_input(
+            "Folio de devolución",
+            value=str(fila.get(COL_E3_FOLIO_DEV_NUEVO, "") or ""),
             placeholder="Ej. FD-2026-0451",
+        )
+        folio_aj = c_f2.text_input(
+            "Folio de ajuste",
+            value=str(fila.get(COL_E3_FOLIO_AJUSTE, "") or ""),
+            placeholder="Ej. FA-2026-0088",
+        )
+        nota_cred = c_f3.text_input(
+            "Nota de crédito",
+            value=str(fila.get(COL_E3_NOTA_CREDITO, "") or ""),
+            placeholder="Ej. NC-2026-0123",
         )
         obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E3_OBS, "") or ""))
         st.caption("Al registrar 'Aplicación de pago' se da por terminado TODO el "
@@ -1224,7 +1262,9 @@ def pestania_etapa3(fila: pd.Series) -> None:
     for cu in cols_usuario:
         cambios[cu] = usuario.strip()
     cambios[COL_E3_OBS] = obs.strip()
-    cambios[COL_E3_FOLIO_DEV] = folio_dev.strip()
+    cambios[COL_E3_FOLIO_DEV_NUEVO] = folio_dev.strip()
+    cambios[COL_E3_FOLIO_AJUSTE] = folio_aj.strip()
+    cambios[COL_E3_NOTA_CREDITO] = nota_cred.strip()
     if limites["E3"]:
         cambios[COL_E3_LIMITE] = pd.Timestamp(limites["E3"])
 
@@ -1676,7 +1716,8 @@ def mostrar_tabla(df: pd.DataFrame) -> None:
 
     columnas = [COL_FOLIO, COL_PROVEEDOR, COL_COMPRADOR, COL_IMPORTE, COL_FECHA_CORTE,
                 "VENCE 90D", COL_ALERTA,
-                COL_ETAPA, COL_E3_FOLIO_DEV,
+                COL_ETAPA,
+                COL_E3_FOLIO_DEV_NUEVO, COL_E3_FOLIO_AJUSTE, COL_E3_NOTA_CREDITO,
                 COL_RESPUESTA_TIPO, COL_E1_TERM, COL_E2_TERM, COL_E3_TERM,
                 COL_E4_TERM, COL_E1_DIAS, COL_E2_DIAS, COL_E3_DIAS,
                 COL_MODIFICADO_POR, COL_FECHA_MODIFICACION]
@@ -1688,7 +1729,9 @@ def mostrar_tabla(df: pd.DataFrame) -> None:
             COL_IMPORTE: st.column_config.NumberColumn("Importe (MXN)", format="$%.2f"),
             COL_FECHA_CORTE: st.column_config.DateColumn(format="DD/MM/YYYY"),
             "VENCE 90D": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            COL_E3_FOLIO_DEV: st.column_config.TextColumn("Folio devolución/ajuste"),
+            COL_E3_FOLIO_DEV_NUEVO: st.column_config.TextColumn("Folio devolución"),
+            COL_E3_FOLIO_AJUSTE: st.column_config.TextColumn("Folio ajuste"),
+            COL_E3_NOTA_CREDITO: st.column_config.TextColumn("Nota de crédito"),
             COL_E1_DIAS: st.column_config.NumberColumn("Días E1", format="%d"),
             COL_E2_DIAS: st.column_config.NumberColumn("Días E2", format="%d"),
             COL_E3_DIAS: st.column_config.NumberColumn("Días E3", format="%d"),
