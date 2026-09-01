@@ -1856,16 +1856,8 @@ def vista_cuarentena(df: pd.DataFrame) -> None:
                 mensaje = aplicar_guardado(
                     dfc, folio_ej, {}, "Admin cuarentena",
                     f"Duración de cuarentena de {prov_sel} ajustada a {int(nuevos_dias)} días")
-                cargar_datos.clear()
-                st.session_state["version_datos"] += 1
-                st.session_state["df"] = cargar_datos(
-                    RUTA_EXCEL, st.session_state["version_datos"])
-                with st.spinner("Guardando…"):
-                    exito, msg = subir_a_github(mensaje)
-                st.session_state["flash_cuar"] = (
-                    "success" if exito else "warning",
-                    f"Duración actualizada. {msg}")
-                st.rerun()
+                # Guarda a Excel, sube a GitHub y recarga en el ORDEN correcto.
+                persistir_y_sincronizar(dfc, mensaje, "Duración actualizada.")
 
     # --- Liberar / finalizar ---
     with cb:
@@ -1891,16 +1883,10 @@ def vista_cuarentena(df: pd.DataFrame) -> None:
                     dfc, folio_ej, {}, "Admin cuarentena",
                     f"{n} reclamación(es) de {prov_sel} liberadas de cuarentena → "
                     f"{ETAPA_1}")
-                cargar_datos.clear()
-                st.session_state["version_datos"] += 1
-                st.session_state["df"] = cargar_datos(
-                    RUTA_EXCEL, st.session_state["version_datos"])
-                with st.spinner("Guardando…"):
-                    exito, msg = subir_a_github(mensaje)
-                st.session_state["flash_cuar"] = (
-                    "success" if exito else "warning",
-                    f"{n} reclamación(es) liberadas. {msg}")
-                st.rerun()
+                # Guarda a Excel, sube a GitHub y recarga en el ORDEN correcto.
+                # (Antes se recargaba ANTES de guardar y los cambios se perdían.)
+                persistir_y_sincronizar(dfc, mensaje,
+                                        f"{n} reclamación(es) liberadas.")
 
 
 def vista_guia() -> None:
