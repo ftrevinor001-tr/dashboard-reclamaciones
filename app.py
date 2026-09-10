@@ -2374,8 +2374,12 @@ def vista_graficas(df: pd.DataFrame) -> None:
     )
 
     dfg = df[df[COL_MES_ETIQUETA].isin(sel_meses)] if sel_meses else df.copy()
+
+    # Descartar folios FINALIZADOS de todas las gráficas: solo folios activos.
+    dfg = dfg[dfg[COL_ETAPA] != ETAPA_FINAL]
+
     if dfg.empty:
-        st.info("No hay registros para los meses seleccionados.")
+        st.info("No hay folios activos con los filtros actuales.")
         return
 
     # Las gráficas se miden por IMPORTE (en pesos). La cantidad de reclamaciones
@@ -2387,8 +2391,9 @@ def vista_graficas(df: pd.DataFrame) -> None:
         _valor=pd.to_numeric(dfg[COL_IMPORTE], errors="coerce").fillna(0.0),
         _conteo=1,
     )
-    st.caption("💡 Las gráficas se muestran por **importe en pesos**. La cantidad "
-               "de reclamaciones aparece a un lado como dato informativo.")
+    st.caption("💡 Las gráficas muestran solo **folios activos** (excluyen "
+               "finalizados) medidos por **importe en pesos**. La cantidad de "
+               "reclamaciones aparece a un lado como dato informativo.")
 
     dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
     dfg["_proveedor"] = dfg[COL_PROVEEDOR].replace("", "SIN PROVEEDOR")
@@ -2513,32 +2518,25 @@ def vista_graficas(df: pd.DataFrame) -> None:
     #  Tabla de reclamaciones por comprador y su avance (descargable)
     # =====================================================================
     st.markdown("### 📋 Detalle por comprador")
-    st.caption("Importe por etapa de cada comprador, importe total y la cantidad "
-               "de reclamaciones vigentes (sin contar las que están en cuarentena). "
-               "Ordena por cualquier encabezado. Se puede descargar.")
+    st.caption("Importe por etapa de cada comprador y su total, considerando solo "
+               "folios activos (excluye finalizados). La cantidad de reclamos "
+               "vigentes no incluye las que están en cuarentena. Ordena por "
+               "cualquier encabezado. Se puede descargar.")
 
-    # Importe por etapa (todas las etapas, incluida cuarentena como columna aparte)
+    # Importe por etapa activa (finalizados ya fueron descartados de dfg)
     tabla_det = (dfg.pivot_table(index="_comprador", columns=COL_ETAPA,
                                  values="_valor", aggfunc="sum", fill_value=0))
     orden_cols = [e for e in ORDEN_ETAPAS if e in tabla_det.columns]
     orden_cols += [c for c in tabla_det.columns if c not in orden_cols]
     tabla_det = tabla_det[orden_cols]
 
-    # Importe total y cantidad de reclamaciones VIGENTES (excluye cuarentena)
+    # Importe y cantidad de reclamaciones VIGENTES (excluyen también cuarentena)
     dfg_vig = dfg[dfg[COL_ETAPA] != ETAPA_CUARENTENA]
     importe_vig = dfg_vig.groupby("_comprador")["_valor"].sum()
     conteo_vig = dfg_vig.groupby("_comprador")["_conteo"].sum()
     tabla_det["Importe vigente"] = importe_vig.reindex(tabla_det.index).fillna(0)
     tabla_det["Reclamos vigentes"] = (conteo_vig.reindex(tabla_det.index)
                                       .fillna(0).astype(int))
-
-    # % de avance = finalizadas / vigentes (evitando división entre cero sin usar pd.NA,
-    # que causaba TypeError al redondear cuando la tabla queda con una sola fila)
-    finalizadas = (dfg[dfg[COL_ETAPA] == ETAPA_FINAL].groupby("_comprador")["_valor"]
-                   .sum().reindex(tabla_det.index).fillna(0)).astype(float)
-    importe_vig_num = tabla_det["Importe vigente"].astype(float)
-    pct = np.where(importe_vig_num > 0, finalizadas / importe_vig_num.replace(0, 1) * 100, 0.0)
-    tabla_det["% avance"] = pd.Series(pct, index=tabla_det.index).round(1)
     tabla_det = tabla_det.sort_values("Importe vigente", ascending=False)
     tabla_det.index.name = "Comprador"
 
@@ -2546,7 +2544,6 @@ def vista_graficas(df: pd.DataFrame) -> None:
     cfg = {c: st.column_config.NumberColumn(format="$%.2f") for c in orden_cols}
     cfg["Importe vigente"] = st.column_config.NumberColumn(format="$%.2f")
     cfg["Reclamos vigentes"] = st.column_config.NumberColumn(format="%d")
-    cfg["% avance"] = st.column_config.NumberColumn(format="%.1f%%")
     st.dataframe(tabla_det, use_container_width=True, column_config=cfg)
 
     st.download_button(
