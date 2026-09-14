@@ -2406,39 +2406,36 @@ def vista_graficas(df: pd.DataFrame) -> None:
     st.caption("Etapas a cargo de la Jefatura: Reporte de reclamo, "
                "Disposición final y Cuentas por pagar.")
 
-    etapas_jef = [e for e in ETAPAS_JEFATURA if e in set(dfg[COL_ETAPA])]
-    dfg_jef = dfg[dfg[COL_ETAPA].isin(ETAPAS_JEFATURA)]
+    # Reclamos por proveedor: TODAS las etapas activas (incluye Gestión), sin cuarentena.
+    # Antes solo consideraba las etapas de la Jefatura, lo que no cuadraba con el
+    # total real por proveedor.
+    dfg_activos = dfg[dfg[COL_ETAPA] != ETAPA_CUARENTENA]
 
-    if dfg_jef.empty:
-        st.info("No hay reclamaciones en etapas de la Jefatura con los filtros actuales.")
+    if dfg_activos.empty:
+        st.info("No hay reclamaciones activas con los filtros actuales.")
     else:
-        # A1) Total de reclamos por proveedor (solo el total, sin desglose)
-        st.markdown("##### 1. Reclamos por proveedor")
-        st.caption("Importe total de la Jefatura por proveedor. Entre paréntesis, "
-                   "la cantidad de reclamaciones.")
-        serie_prov = (dfg_jef.groupby("_proveedor")["_valor"].sum()
+        st.markdown("##### 1. Reclamos por proveedor · Top 10")
+        st.caption("Importe total por proveedor considerando **todas las etapas "
+                   "activas** (incluye Gestión, excluye cuarentena y finalizadas). "
+                   "Entre paréntesis, la cantidad de reclamaciones. Solo se muestran "
+                   "los 10 proveedores con mayor importe.")
+        serie_prov = (dfg_activos.groupby("_proveedor")["_valor"].sum()
                       .sort_values(ascending=False))
-        serie_prov.index.name = "Proveedor"
-        conteo_prov = dfg_jef.groupby("_proveedor")["_conteo"].sum()
-        _grafica_barra_simple(serie_prov, etiqueta_valor, es_dinero,
-                              altura=max(320, 22 * len(serie_prov)),
-                              conteo=conteo_prov)
-
-        # A2) Por proveedor y por etapa (solo etapas de Jefatura)
-        st.markdown("##### 2. Reclamos por proveedor y etapa")
-        st.caption("El importe de la Jefatura por proveedor, dividido en sus tres "
-                   "etapas (sin incluir Gestión).")
-        tabla_pe = (dfg_jef.pivot_table(index="_proveedor", columns=COL_ETAPA,
-                                        values="_valor", aggfunc="sum", fill_value=0))
-        cols_pe = [e for e in etapas_jef if e in tabla_pe.columns]
-        tabla_pe = tabla_pe[cols_pe]
-        tabla_pe = tabla_pe.loc[tabla_pe.sum(axis=1).sort_values(ascending=False).index]
-        tabla_pe.index.name = "Proveedor"
-        _grafica_barras(tabla_pe, etiqueta_valor, es_dinero,
-                        orden_series=cols_pe, altura=max(340, 26 * len(tabla_pe)))
+        conteo_prov = dfg_activos.groupby("_proveedor")["_conteo"].sum()
+        total_prov = len(serie_prov)
+        # Top 10
+        serie_top = serie_prov.head(10)
+        serie_top.index.name = "Proveedor"
+        conteo_top = conteo_prov.reindex(serie_top.index)
+        if total_prov > 10:
+            st.caption(f"Mostrando **10 de {total_prov}** proveedores con reclamos "
+                       "activos, ordenados por importe.")
+        _grafica_barra_simple(serie_top, etiqueta_valor, es_dinero,
+                              altura=max(320, 32 * len(serie_top)),
+                              conteo=conteo_top)
 
     # A3) Reclamaciones en Cuarentena por proveedor (se tratan aparte)
-    st.markdown("##### 3. Reclamaciones en cuarentena por proveedor")
+    st.markdown("##### 2. Reclamaciones en cuarentena por proveedor")
     st.caption(f"Reclamaciones con importe ≤ ${UMBRAL_CUARENTENA:,.0f} en espera "
                "de acumular monto. No cuentan en las gráficas anteriores ni en el "
                "vencimiento de 90 días.")
@@ -2471,7 +2468,7 @@ def vista_graficas(df: pd.DataFrame) -> None:
     dfg_gest = dfg[dfg[COL_ETAPA] == ETAPA_COMPRADORES]
 
     # B1) Cuántas reclamaciones tiene cada comprador EN Gestión (+ total)
-    st.markdown("##### 4. Reclamaciones en Gestión por comprador")
+    st.markdown("##### 3. Reclamaciones en Gestión por comprador")
     if dfg_gest.empty:
         st.info("No hay reclamaciones actualmente en Gestión con los filtros actuales.")
     else:
@@ -2488,7 +2485,7 @@ def vista_graficas(df: pd.DataFrame) -> None:
                               conteo=conteo_gest)
 
     # B2) Tiempo promedio que tardan en Gestión
-    st.markdown("##### 5. Tiempo promedio en Gestión por comprador")
+    st.markdown("##### 4. Tiempo promedio en Gestión por comprador")
     st.caption("Días promedio que cada comprador tardó en cerrar la etapa de "
                "Gestión (solo reclamaciones con Gestión terminada). Entre "
                "paréntesis, el número de reclamaciones promediadas.")
