@@ -398,56 +398,26 @@ def cargar_datos(ruta: str, _version: int) -> dict:
 
 
 def guardar_excel(datos: dict, ruta: str) -> None:
-    """Sobrescribe el Excel con las tres hojas.
-
-    Si alguna hoja viene vacía (None), se escribe una hoja mínima con solo los
-    encabezados para no romper el writer (openpyxl no admite libros vacíos).
-    """
+    """Sobrescribe el Excel con las tres hojas."""
     with pd.ExcelWriter(ruta, engine="openpyxl",
                         datetime_format="DD/MM/YYYY",
                         date_format="DD/MM/YYYY") as writer:
-        # Garantías (siempre escribir algo, aunque sea plantilla vacía)
-        g = datos.get("garantias")
-        if g is not None:
-            g = g.copy().drop(columns=["MES ETIQUETA"], errors="ignore")
-        else:
-            g = pd.DataFrame(columns=[
-                COL_G_MES, COL_G_FOLIO, COL_G_ID, COL_G_PROVEEDOR, COL_G_CARTA,
-                COL_G_IMPORTE, COL_G_COMPRADOR, COL_G_FECHA_CORTE,
-                COL_G_FECHA_RECEPCION, COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE,
-                COL_G_NOTA_CREDITO, COL_G_RESPUESTA, COL_G_NOTAS,
-                COL_G_ESTADO, COL_G_CUAR_INICIO, COL_G_CUAR_FIN,
-                COL_G_FECHA_RESUELTO, COL_G_MODIFICADO])
-        g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
-
-        # Devoluciones
-        d = datos.get("devoluciones")
-        if d is not None:
-            d = d.copy().drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
-        else:
-            d = pd.DataFrame(columns=[
-                COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR, COL_D_TOTAL,
-                COL_D_PENDIENTE, COL_D_APLICADO_MXN, COL_D_APLICADO_EST,
-                COL_D_RESOLUCION, COL_D_TIPO_CLIENTE, COL_D_EJECUTIVO,
-                COL_D_COMPRADOR, COL_D_ESTADO, COL_D_NOTAS])
-        d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
-
-        # NC
-        nc = datos.get("nc")
-        if nc is not None:
-            nc = nc.copy().drop(columns=["MES ETIQUETA"], errors="ignore")
+        if datos.get("garantias") is not None:
+            g = datos["garantias"].copy()
+            g = g.drop(columns=["MES ETIQUETA"], errors="ignore")
+            g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
+        if datos.get("devoluciones") is not None:
+            d = datos["devoluciones"].copy()
+            d = d.drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
+            d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
+        if datos.get("nc") is not None:
+            nc = datos["nc"].copy()
+            nc = nc.drop(columns=["MES ETIQUETA"], errors="ignore")
+            # Restaurar el nombre largo de la observación
             nc = nc.rename(columns={
                 COL_NC_OBSERVACIONES:
                 "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC"})
-        else:
-            nc = pd.DataFrame(columns=[
-                COL_NC_ENTRADA, COL_NC_FECHA_FACTURA, COL_NC_FECHA_REPORTE,
-                COL_NC_FISCAL, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
-                COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE, COL_NC_FECHA_NC,
-                COL_NC_FOLIO_NC,
-                "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC",
-                COL_NC_EJECUTIVA, COL_NC_COMPRADOR, COL_NC_ESTADO])
-        nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
+            nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
 
 
 # =============================================================================
@@ -653,71 +623,129 @@ def persistir(datos: dict, mensaje_commit: str, mensaje_ok: str) -> None:
 
 
 # =============================================================================
-# 7. TABLERO DIRECTIVO
+# 7. FILTROS COMPARTIDOS
 # =============================================================================
+#
+#   Todas las pestañas usan el mismo conjunto de filtros: periodo (mes o rango),
+#   proveedor, comprador y búsqueda por folio. Cada pestaña pasa el DataFrame
+#   correspondiente (garantías o NC) y recibe el mismo DataFrame ya filtrado.
 
-def _filtro_periodo(df_g: pd.DataFrame, df_nc: pd.DataFrame,
-                     prefijo: str = "dir") -> tuple:
-    """Filtro por rango de fechas o por mes. Aplica a ambos DataFrames."""
-    c1, c2, c3 = st.columns([1, 1.5, 1.5])
-    modo = c1.radio("Filtrar por", ["Mes", "Rango de fechas"],
+
+def _orden_mes(etiqueta: str) -> str:
+    """Devuelve una clave AAAA-MM ordenable a partir de 'Marzo 2026'."""
+    if etiqueta == "Sin fecha":
+        return "0000-00"
+    try:
+        nombre, año = etiqueta.split()
+        m = list(MESES_ES.values()).index(nombre) + 1
+        return f"{año}-{m:02d}"
+    except Exception:
+        return "0000-00"
+
+
+def _filtros_barra(df: pd.DataFrame, prefijo: str,
+                    col_fecha: str, col_folio: str,
+                    col_proveedor: str, col_comprador: str,
+                    etiqueta_folio: str = "Buscar folio") -> tuple:
+    """Barra de filtros común: periodo, proveedor, comprador, folio.
+
+    Devuelve (df_filtrado, etiqueta_periodo). Las claves de widget llevan
+    `prefijo` para no chocar entre pestañas.
+    """
+    # ---- FILA 1: periodo ----
+    cA, cB = st.columns([1, 3])
+    modo = cA.radio("Filtrar periodo por", ["Mes", "Rango de fechas"],
                      horizontal=True, key=f"{prefijo}_modo")
 
     hoy = hoy_mx()
-    meses_disp = sorted(
-        set(df_g["MES ETIQUETA"].dropna().unique()) |
-        set(df_nc["MES ETIQUETA"].dropna().unique()) - {"Sin fecha"},
-        key=lambda x: pd.to_datetime(
-            f"{x.split()[1]}-{list(MESES_ES).__getitem__(list(MESES_ES.values()).index(x.split()[0]))}-01"
-            if x != "Sin fecha" else "1900-01-01"),
-    )
-
     if modo == "Mes":
-        opciones = meses_disp if meses_disp else ["Sin fecha"]
-        # Preseleccionar el mes más reciente
-        sel = c2.multiselect("Mes(es)", options=opciones,
-                              default=[opciones[-1]] if opciones else [],
-                              key=f"{prefijo}_meses")
-        c3.empty()
-        if sel:
-            g_filt = df_g[df_g["MES ETIQUETA"].isin(sel)]
-            nc_filt = df_nc[df_nc["MES ETIQUETA"].isin(sel)]
+        meses_disp = sorted(
+            [m for m in df["MES ETIQUETA"].dropna().unique()
+             if m != "Sin fecha"], key=_orden_mes)
+        sel_meses = cB.multiselect(
+            "Mes(es)", options=meses_disp,
+            placeholder="Todos los meses",
+            key=f"{prefijo}_meses")
+        if sel_meses:
+            df_p = df[df["MES ETIQUETA"].isin(sel_meses)]
+            etiqueta_periodo = ", ".join(sel_meses)
         else:
-            g_filt, nc_filt = df_g, df_nc
-        etiqueta = ", ".join(sel) if sel else "Todo el periodo"
+            df_p = df
+            etiqueta_periodo = "Todos los meses"
     else:
-        # Rango
-        fmin_g = df_g[COL_G_FECHA_RECEPCION].min()
-        fmin_nc = df_nc[COL_NC_FECHA_REPORTE].min()
-        fmin = min([f for f in [fmin_g, fmin_nc] if pd.notna(f)],
-                   default=pd.Timestamp(hoy - timedelta(days=180)))
-        rango = c2.date_input(
-            "Rango de fechas", value=(fmin.date(), hoy),
-            format="DD/MM/YYYY", key=f"{prefijo}_rango")
-        c3.empty()
+        # Rango de fechas
+        fmin_val = df[col_fecha].min()
+        fmin = _a_fecha(fmin_val) if pd.notna(fmin_val) else hoy - timedelta(days=180)
+        default = (fmin, hoy)
+        rango = cB.date_input("Rango de fechas", value=default,
+                                format="DD/MM/YYYY", key=f"{prefijo}_rango")
         if isinstance(rango, tuple) and len(rango) == 2:
             desde, hasta = rango
-            g_filt = df_g[
-                (df_g[COL_G_FECHA_RECEPCION].dt.date >= desde) &
-                (df_g[COL_G_FECHA_RECEPCION].dt.date <= hasta)]
-            nc_filt = df_nc[
-                (df_nc[COL_NC_FECHA_REPORTE].dt.date >= desde) &
-                (df_nc[COL_NC_FECHA_REPORTE].dt.date <= hasta)]
-            etiqueta = f"{desde:%d/%m/%Y} — {hasta:%d/%m/%Y}"
+            df_p = df[(df[col_fecha].dt.date >= desde) &
+                       (df[col_fecha].dt.date <= hasta)]
+            etiqueta_periodo = f"{desde:%d/%m/%Y} — {hasta:%d/%m/%Y}"
         else:
-            g_filt, nc_filt = df_g, df_nc
-            etiqueta = "Todo el periodo"
+            df_p = df
+            etiqueta_periodo = "Todo el periodo"
 
-    return g_filt, nc_filt, etiqueta
+    # ---- FILA 2: proveedor, comprador, folio ----
+    c1, c2, c3 = st.columns(3)
+    proveedores = sorted([p for p in df_p[col_proveedor].dropna().unique()
+                          if str(p).strip()])
+    sel_prov = c1.multiselect("Proveedor", options=proveedores,
+                                placeholder="Todos", key=f"{prefijo}_prov")
+
+    compradores = sorted([c for c in df_p[col_comprador].dropna().unique()
+                           if str(c).strip()]) if col_comprador in df_p.columns else []
+    sel_comp = c2.multiselect("Comprador", options=compradores,
+                                placeholder="Todos", key=f"{prefijo}_comp")
+
+    txt_folio = c3.text_input(etiqueta_folio, placeholder="Ej. DC-MZ017",
+                                key=f"{prefijo}_folio")
+
+    df_f = df_p.copy()
+    if sel_prov:
+        df_f = df_f[df_f[col_proveedor].isin(sel_prov)]
+    if sel_comp and col_comprador in df_f.columns:
+        df_f = df_f[df_f[col_comprador].isin(sel_comp)]
+    if txt_folio.strip():
+        df_f = df_f[df_f[col_folio].astype(str).str.contains(
+            txt_folio.strip(), case=False, na=False)]
+
+    n_activos = sum([bool(sel_meses if modo == "Mes" else False),
+                     bool(sel_prov), bool(sel_comp), bool(txt_folio.strip())])
+    if n_activos > 0:
+        c1, c2 = st.columns([4, 1])
+        c1.caption(f"**{len(df_f)}** de **{len(df)}** registros · "
+                    f"{n_activos} filtro(s) activo(s)")
+        if c2.button("🧹 Limpiar filtros", key=f"{prefijo}_limpiar",
+                       use_container_width=True):
+            for k in [f"{prefijo}_meses", f"{prefijo}_prov",
+                       f"{prefijo}_comp", f"{prefijo}_folio"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.rerun()
+    else:
+        st.caption(f"**{len(df_f)}** registros")
+
+    return df_f, etiqueta_periodo
+
+
+# =============================================================================
+# 8. TABLERO DIRECTIVO
+# =============================================================================
+#
+#   Vista de presentación para juntas. Puede mostrar SOLO Garantías, SOLO NC o
+#   AMBOS. Cada sección con sus KPIs y sus gráficas. Los filtros son opcionales
+#   arriba (periodo).
 
 
 def _tarjeta_kpi(col, icono: str, titulo: str, valor: str,
                   subtitulo: str = "", color: str = "#1f4e79") -> None:
-    """Tarjeta grande de KPI para el tablero directivo."""
     col.markdown(
         f"""<div style='padding:1rem 1.2rem;border-left:5px solid {color};
                        background:#f8f9fa;border-radius:6px;
-                       box-shadow:0 1px 3px rgba(0,0,0,0.08);height:100%;'>
+                       box-shadow:0 1px 3px rgba(0,0,0,0.08);height:100%'>
               <div style='color:#666;font-size:0.85rem;
                           text-transform:uppercase;letter-spacing:0.5px'>
                 {icono} {titulo}
@@ -734,256 +762,368 @@ def _tarjeta_kpi(col, icono: str, titulo: str, valor: str,
     )
 
 
-def vista_tablero(datos: dict) -> None:
-    """Pestaña 1: Tablero Directivo — visión general para juntas."""
-    st.markdown("### 📊 Tablero Directivo")
-    st.caption("Panorama general para presentación en juntas. "
-               "Filtra por mes o rango de fechas.")
+def _filtro_periodo_tablero(df: pd.DataFrame, col_fecha: str,
+                              prefijo: str) -> tuple:
+    """Solo filtro de periodo, para el tablero directivo."""
+    cA, cB = st.columns([1, 3])
+    modo = cA.radio("Periodo", ["Mes", "Rango de fechas"],
+                     horizontal=True, key=f"{prefijo}_t_modo")
+    hoy = hoy_mx()
+    if modo == "Mes":
+        meses_disp = sorted(
+            [m for m in df["MES ETIQUETA"].dropna().unique()
+             if m != "Sin fecha"], key=_orden_mes)
+        sel = cB.multiselect("Mes(es)", options=meses_disp,
+                               placeholder="Todos los meses",
+                               key=f"{prefijo}_t_meses")
+        if sel:
+            return df[df["MES ETIQUETA"].isin(sel)], ", ".join(sel)
+        return df, "Todos los meses"
+    else:
+        fmin_val = df[col_fecha].min()
+        fmin = _a_fecha(fmin_val) if pd.notna(fmin_val) else hoy - timedelta(days=180)
+        rango = cB.date_input("Rango de fechas", value=(fmin, hoy),
+                                format="DD/MM/YYYY", key=f"{prefijo}_t_rango")
+        if isinstance(rango, tuple) and len(rango) == 2:
+            d, h = rango
+            df_f = df[(df[col_fecha].dt.date >= d) &
+                       (df[col_fecha].dt.date <= h)]
+            return df_f, f"{d:%d/%m/%Y} — {h:%d/%m/%Y}"
+        return df, "Todo el periodo"
 
-    df_g = datos["garantias"]
-    df_nc = datos["nc"]
-    if df_g is None or df_nc is None:
-        st.error("No se pudieron cargar los datos.")
+
+def vista_tablero(datos: dict) -> None:
+    st.markdown("### 📊 Tablero Directivo")
+    st.caption("Panorama general para presentación en juntas.")
+
+    seccion = st.radio(
+        "Sección a mostrar",
+        ["Solo Garantías", "Solo NC pendientes", "Ambos"],
+        horizontal=True, key="tab_seccion")
+
+    st.divider()
+
+    if seccion in ("Solo Garantías", "Ambos"):
+        _tablero_seccion_garantias(datos)
+
+    if seccion == "Ambos":
+        st.divider()
+
+    if seccion in ("Solo NC pendientes", "Ambos"):
+        _tablero_seccion_nc(datos)
+
+
+def _tablero_seccion_garantias(datos: dict) -> None:
+    df = datos.get("garantias")
+    if df is None or df.empty:
+        st.info("Sin datos de garantías.")
         return
 
-    g_filt, nc_filt, etiqueta_periodo = _filtro_periodo(df_g, df_nc, "dir")
+    st.markdown("## 📋 Folios de Garantía")
+    df_f, etiq = _filtro_periodo_tablero(df, COL_G_FECHA_RECEPCION, "gar")
+    st.caption(f"📅 Periodo: **{etiq}**")
 
-    st.markdown(f"<div style='color:#666;font-size:0.85rem;margin-bottom:0.8rem'>"
-                f"📅 Periodo: <b>{etiqueta_periodo}</b></div>",
-                unsafe_allow_html=True)
+    # ---- KPIs ----
+    total = len(df_f)
+    activos = (df_f[COL_G_ESTADO] == ESTADO_ACTIVO).sum()
+    cuarentena = (df_f[COL_G_ESTADO] == ESTADO_CUARENTENA).sum()
+    resueltos = (df_f[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
+    cancelados = (df_f[COL_G_ESTADO] == ESTADO_CANCELADO).sum()
+    monto_total = df_f[COL_G_IMPORTE].sum()
+    monto_activo = df_f.loc[df_f[COL_G_ESTADO].isin(
+        [ESTADO_ACTIVO, ESTADO_CUARENTENA]), COL_G_IMPORTE].sum()
+    monto_resuelto = df_f.loc[df_f[COL_G_ESTADO] == ESTADO_RESUELTO,
+                                COL_G_IMPORTE].sum()
+    valido = total - cancelados
+    pct_res = (resueltos / valido * 100) if valido > 0 else 0.0
+    vencidos = int(df_f.apply(esta_vencido_garantia, axis=1).sum()) if not df_f.empty else 0
 
-    # ================ TARJETAS KPI ================
-    total_folios = len(g_filt)
-    monto_total = g_filt[COL_G_IMPORTE].sum()
-
-    activos_mask = g_filt[COL_G_ESTADO] == ESTADO_ACTIVO
-    cuar_mask = g_filt[COL_G_ESTADO] == ESTADO_CUARENTENA
-    resueltos_mask = g_filt[COL_G_ESTADO] == ESTADO_RESUELTO
-    cancelados_mask = g_filt[COL_G_ESTADO] == ESTADO_CANCELADO
-
-    n_activos = activos_mask.sum()
-    n_cuar = cuar_mask.sum()
-    n_resueltos = resueltos_mask.sum()
-    n_cancelados = cancelados_mask.sum()
-
-    # % resueltos = resueltos / (total - cancelados)
-    total_valido = total_folios - n_cancelados
-    pct_resueltos = (n_resueltos / total_valido * 100) if total_valido > 0 else 0.0
-
-    # Vencidos (activos con >90 días)
-    if activos_mask.any():
-        n_vencidos = int(g_filt[activos_mask].apply(esta_vencido_garantia,
-                                                     axis=1).sum())
-    else:
-        n_vencidos = 0
-
-    # Notas de crédito conseguidas (folios resueltos)
-    monto_resuelto = g_filt.loc[resueltos_mask, COL_G_IMPORTE].sum()
-    n_nc_conseguidas = n_resueltos
-
-    # NC pendientes
-    nc_pend = nc_filt[nc_filt[COL_NC_ESTADO] == "Pendiente"]
-    n_nc_pend = len(nc_pend)
-    monto_nc_pend = nc_pend[COL_NC_IMP_PENDIENTE].sum()
-
-    # --- FILA 1: 4 KPIs principales ---
     c1, c2, c3, c4 = st.columns(4)
-    _tarjeta_kpi(c1, "📁", "Folios totales",
-                 f"{total_folios:,}",
-                 f"{n_activos} activos · {n_cuar} en cuarentena",
+    _tarjeta_kpi(c1, "📁", "Folios totales", f"{total:,}",
+                 f"{activos} activos · {cuarentena} en cuarentena",
                  color="#1f4e79")
     _tarjeta_kpi(c2, "💰", "Monto total",
                  _fmt_mxn(monto_total),
-                 f"{_fmt_mxn(monto_resuelto)} ya resueltos",
+                 f"{_fmt_mxn(monto_activo)} por cobrar",
                  color="#0f766e")
-    _tarjeta_kpi(c3, "✅", "% Resuelto",
-                 f"{pct_resueltos:.1f}%",
-                 f"{n_resueltos:,} de {total_valido:,} folios (sin cancelados)",
+    _tarjeta_kpi(c3, "✅", "% Resueltos",
+                 f"{pct_res:.1f}%",
+                 f"{resueltos:,} de {valido:,} folios",
                  color="#059669")
-    _tarjeta_kpi(c4, "📝", "NC conseguidas",
-                 f"{n_nc_conseguidas:,}",
-                 f"{_fmt_mxn(monto_resuelto)} en notas de crédito",
-                 color="#7c3aed")
+    _tarjeta_kpi(c4, "🚨", "Vencidos (90 días)",
+                 f"{vencidos:,}",
+                 MSG_VENCIDO if vencidos > 0 else "Sin vencimientos",
+                 color="#dc2626" if vencidos > 0 else "#94a3b8")
 
-    # --- FILA 2: Alertas ---
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ---- Gráficas ----
     c1, c2 = st.columns(2)
-    _tarjeta_kpi(c1, "🚨", "Folios vencidos (90 días)",
-                 f"{n_vencidos:,}",
-                 f"{MSG_VENCIDO}" if n_vencidos > 0 else "Sin vencimientos",
-                 color="#dc2626" if n_vencidos > 0 else "#94a3b8")
-    _tarjeta_kpi(c2, "⏳", "NC pendientes (concepto varios)",
-                 f"{n_nc_pend:,}",
-                 f"{_fmt_mxn(monto_nc_pend)} por conseguir",
-                 color="#ea580c" if n_nc_pend > 0 else "#94a3b8")
+    with c1:
+        st.markdown("#### 🏭 Top 10 proveedores por monto")
+        _grafica_top_prov_garantias(df_f)
+    with c2:
+        st.markdown("#### 📅 Folios por mes y estado")
+        _grafica_evolucion_mensual(df_f)
 
-    st.divider()
-
-    # ================ GRÁFICAS ================
-    st.markdown("#### 📈 Análisis por proveedor")
-
-    # Top 10 proveedores por importe (activos + cuarentena, sin cancelados)
-    g_vig = g_filt[g_filt[COL_G_ESTADO].isin([ESTADO_ACTIVO, ESTADO_CUARENTENA])]
-    if not g_vig.empty:
-        top = (g_vig.groupby(COL_G_PROVEEDOR)
-               .agg(Monto=(COL_G_IMPORTE, "sum"),
-                    Folios=(COL_G_FOLIO, "count"))
-               .sort_values("Monto", ascending=False).head(10))
-        _grafica_top_proveedores(top)
-    else:
-        st.info("No hay folios vigentes para graficar.")
-
-    st.divider()
-    st.markdown("#### 📅 Evolución mensual")
-    _grafica_evolucion_mensual(df_g)
+    st.markdown("#### 👥 Distribución por comprador")
+    _grafica_por_comprador(df_f)
 
 
-def _grafica_top_proveedores(top: pd.DataFrame) -> None:
-    """Barras horizontales de Top 10 proveedores por monto."""
-    if not ALTAIR_OK or top.empty:
+def _tablero_seccion_nc(datos: dict) -> None:
+    df = datos.get("nc")
+    if df is None or df.empty:
+        st.info("Sin datos de notas de crédito.")
+        return
+
+    st.markdown("## 💳 Notas de Crédito Pendientes")
+    df_f, etiq = _filtro_periodo_tablero(df, COL_NC_FECHA_REPORTE, "nc")
+    st.caption(f"📅 Periodo: **{etiq}**")
+
+    pend = df_f[df_f[COL_NC_ESTADO] == "Pendiente"]
+    res = df_f[df_f[COL_NC_ESTADO] == "Resuelto"]
+
+    n_pend = len(pend)
+    monto_pend = pend[COL_NC_IMP_PENDIENTE].sum()
+    n_res = len(res)
+    monto_res = res[COL_NC_IMP_PENDIENTE].sum()
+    n_venc = int(pend.apply(esta_vencida_nc, axis=1).sum()) if not pend.empty else 0
+    prov_pend = pend[COL_NC_PROVEEDOR].nunique()
+
+    c1, c2, c3, c4 = st.columns(4)
+    _tarjeta_kpi(c1, "⏳", "NC pendientes", f"{n_pend:,}",
+                 f"{_fmt_mxn(monto_pend)} por conseguir",
+                 color="#ea580c")
+    _tarjeta_kpi(c2, "✅", "NC ya conseguidas", f"{n_res:,}",
+                 f"{_fmt_mxn(monto_res)} entregadas",
+                 color="#059669")
+    _tarjeta_kpi(c3, "🚨", f"Vencidas (>{DIAS_PLAZO_NC} días)",
+                 f"{n_venc:,}",
+                 "Requieren atención inmediata" if n_venc > 0 else "Sin vencidas",
+                 color="#dc2626" if n_venc > 0 else "#94a3b8")
+    _tarjeta_kpi(c4, "🏭", "Proveedores con NC pend.",
+                 f"{prov_pend:,}",
+                 f"con {n_pend} nota(s) por conseguir",
+                 color="#1f4e79")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### 🏭 Top 10 proveedores por monto pendiente")
+        _grafica_top_prov_nc(pend)
+    with c2:
+        st.markdown("#### 📅 NC por mes de recepción")
+        _grafica_nc_por_mes(df_f)
+
+
+def _grafica_top_prov_garantias(df: pd.DataFrame) -> None:
+    """Top 10 proveedores por monto (folios activos + cuarentena)."""
+    d = df[df[COL_G_ESTADO].isin([ESTADO_ACTIVO, ESTADO_CUARENTENA])]
+    if d.empty:
+        st.info("Sin folios vigentes para graficar.")
+        return
+    top = (d.groupby(COL_G_PROVEEDOR)
+           .agg(Monto=(COL_G_IMPORTE, "sum"),
+                Folios=(COL_G_FOLIO, "count"))
+           .sort_values("Monto", ascending=False).head(10))
+    _dibujar_barras_prov(top, "#1f4e79")
+
+
+def _grafica_top_prov_nc(df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info("Sin NC pendientes para graficar.")
+        return
+    top = (df.groupby(COL_NC_PROVEEDOR)
+           .agg(Monto=(COL_NC_IMP_PENDIENTE, "sum"),
+                Folios=(COL_NC_ENTRADA, "count"))
+           .sort_values("Monto", ascending=False).head(10))
+    _dibujar_barras_prov(top, "#ea580c")
+
+
+def _dibujar_barras_prov(top: pd.DataFrame, color: str) -> None:
+    if not ALTAIR_OK:
         st.dataframe(top, use_container_width=True)
         return
-    datos = top.reset_index().rename(columns={COL_G_PROVEEDOR: "Proveedor"})
-    datos["_txt"] = datos.apply(
-        lambda r: f"${r['Monto']:,.2f} ({int(r['Folios'])})", axis=1)
-    base = alt.Chart(datos)
-    barras = base.mark_bar(color="#1f4e79").encode(
+    d = top.reset_index()
+    d.columns = ["Proveedor", "Monto", "Folios"]
+    d["_txt"] = d.apply(lambda r: f"${r['Monto']:,.2f} ({int(r['Folios'])})",
+                          axis=1)
+    base = alt.Chart(d)
+    barras = base.mark_bar(color=color).encode(
         y=alt.Y("Proveedor:N", title=None, sort="-x"),
         x=alt.X("Monto:Q", title="Monto (MXN)",
                 axis=alt.Axis(format="$,.0f")),
         tooltip=[
             alt.Tooltip("Proveedor:N"),
-            alt.Tooltip("Monto:Q", title="Monto", format="$,.2f"),
-            alt.Tooltip("Folios:Q", title="Folios", format=",d"),
+            alt.Tooltip("Monto:Q", format="$,.2f"),
+            alt.Tooltip("Folios:Q", format=",d"),
         ],
     )
-    etiquetas = base.mark_text(align="left", dx=4, fontSize=11,
-                                 fontWeight="bold", color="#333").encode(
+    etq = base.mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
+                          color="#333").encode(
         y=alt.Y("Proveedor:N", sort="-x"),
         x=alt.X("Monto:Q"),
-        text=alt.Text("_txt:N"),
-    )
-    st.altair_chart(
-        (barras + etiquetas).properties(
-            height=max(280, 30 * len(datos)),
-            title="Top 10 proveedores por monto (folios vigentes)"),
-        use_container_width=True)
+        text=alt.Text("_txt:N"))
+    st.altair_chart((barras + etq).properties(height=max(280, 30 * len(d))),
+                     use_container_width=True)
 
 
-def _grafica_evolucion_mensual(df_g: pd.DataFrame) -> None:
-    """Barras apiladas por mes: folios activos, resueltos, cancelados."""
-    if df_g.empty:
-        st.info("Sin datos para graficar.")
-        return
-    d = df_g.copy()
-    # Solo meses con datos válidos
-    d = d[d["MES ETIQUETA"] != "Sin fecha"]
+def _grafica_evolucion_mensual(df: pd.DataFrame) -> None:
+    d = df[df["MES ETIQUETA"] != "Sin fecha"]
     if d.empty:
         st.info("Sin datos por mes.")
         return
     tabla = (d.groupby(["MES ETIQUETA", COL_G_ESTADO])[COL_G_FOLIO]
              .count().unstack(fill_value=0))
-    # Orden cronológico
-    def _mes_key(x):
-        try:
-            nombre, año = x.split()
-            m = list(MESES_ES.values()).index(nombre) + 1
-            return f"{año}-{m:02d}"
-        except Exception:
-            return "0000-00"
-    tabla = tabla.reindex(sorted(tabla.index, key=_mes_key))
+    tabla = tabla.reindex(sorted(tabla.index, key=_orden_mes))
     if not ALTAIR_OK:
         st.bar_chart(tabla, height=320)
         return
     largo = tabla.reset_index().melt(id_vars="MES ETIQUETA",
                                       var_name="Estado", value_name="Folios")
     largo = largo[largo["Folios"] > 0]
-    orden_estados = [ESTADO_ACTIVO, ESTADO_CUARENTENA, ESTADO_RESUELTO,
-                     ESTADO_CANCELADO]
+    orden = [ESTADO_ACTIVO, ESTADO_CUARENTENA, ESTADO_RESUELTO,
+             ESTADO_CANCELADO]
     colores = ["#f59e0b", "#3b82f6", "#10b981", "#94a3b8"]
-    grafica = alt.Chart(largo).mark_bar().encode(
+    g = alt.Chart(largo).mark_bar().encode(
         x=alt.X("MES ETIQUETA:N", title="Mes", sort=list(tabla.index),
                 axis=alt.Axis(labelAngle=-30)),
-        y=alt.Y("Folios:Q", title="Cantidad de folios"),
-        color=alt.Color("Estado:N", sort=orden_estados,
-                         scale=alt.Scale(domain=orden_estados, range=colores),
+        y=alt.Y("Folios:Q", title="Folios"),
+        color=alt.Color("Estado:N", sort=orden,
+                         scale=alt.Scale(domain=orden, range=colores),
                          legend=alt.Legend(orient="bottom")),
         tooltip=["MES ETIQUETA", "Estado", "Folios"],
-    ).properties(height=320,
-                 title="Folios de garantía por mes y estado")
-    st.altair_chart(grafica, use_container_width=True)
+    ).properties(height=320)
+    st.altair_chart(g, use_container_width=True)
+
+
+def _grafica_por_comprador(df: pd.DataFrame) -> None:
+    d = df[df[COL_G_ESTADO].isin([ESTADO_ACTIVO, ESTADO_CUARENTENA])]
+    if d.empty:
+        st.info("Sin folios vigentes para graficar por comprador.")
+        return
+    d = d.copy()
+    d["_comp"] = d[COL_G_COMPRADOR].replace("", "Sin comprador")
+    agr = (d.groupby("_comp")
+           .agg(Monto=(COL_G_IMPORTE, "sum"),
+                Folios=(COL_G_FOLIO, "count"))
+           .sort_values("Monto", ascending=False))
+    if not ALTAIR_OK:
+        st.dataframe(agr, use_container_width=True)
+        return
+    dd = agr.reset_index()
+    dd.columns = ["Comprador", "Monto", "Folios"]
+    dd["_txt"] = dd.apply(lambda r: f"${r['Monto']:,.2f} ({int(r['Folios'])})",
+                            axis=1)
+    base = alt.Chart(dd)
+    barras = base.mark_bar(color="#7c3aed").encode(
+        y=alt.Y("Comprador:N", title=None, sort="-x"),
+        x=alt.X("Monto:Q", title="Monto (MXN)",
+                axis=alt.Axis(format="$,.0f")),
+        tooltip=[alt.Tooltip("Comprador:N"),
+                 alt.Tooltip("Monto:Q", format="$,.2f"),
+                 alt.Tooltip("Folios:Q", format=",d")],
+    )
+    etq = base.mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
+                          color="#333").encode(
+        y=alt.Y("Comprador:N", sort="-x"),
+        x=alt.X("Monto:Q"),
+        text=alt.Text("_txt:N"))
+    st.altair_chart((barras + etq).properties(height=max(280, 30 * len(dd))),
+                     use_container_width=True)
+
+
+def _grafica_nc_por_mes(df: pd.DataFrame) -> None:
+    d = df[df["MES ETIQUETA"] != "Sin fecha"]
+    if d.empty:
+        st.info("Sin datos por mes.")
+        return
+    tabla = (d.groupby(["MES ETIQUETA", COL_NC_ESTADO])[COL_NC_ENTRADA]
+             .count().unstack(fill_value=0))
+    tabla = tabla.reindex(sorted(tabla.index, key=_orden_mes))
+    if not ALTAIR_OK:
+        st.bar_chart(tabla, height=320)
+        return
+    largo = tabla.reset_index().melt(id_vars="MES ETIQUETA",
+                                      var_name="Estado", value_name="NC")
+    largo = largo[largo["NC"] > 0]
+    orden = ["Pendiente", "Resuelto", "Cancelado"]
+    colores = ["#ea580c", "#10b981", "#94a3b8"]
+    g = alt.Chart(largo).mark_bar().encode(
+        x=alt.X("MES ETIQUETA:N", title="Mes", sort=list(tabla.index),
+                axis=alt.Axis(labelAngle=-30)),
+        y=alt.Y("NC:Q", title="Notas de crédito"),
+        color=alt.Color("Estado:N", sort=orden,
+                         scale=alt.Scale(domain=orden, range=colores),
+                         legend=alt.Legend(orient="bottom")),
+        tooltip=["MES ETIQUETA", "Estado", "NC"],
+    ).properties(height=320)
+    st.altair_chart(g, use_container_width=True)
 
 
 # =============================================================================
-# 8. FOLIOS DE GARANTÍA (Pestaña 2)
+# 9. FOLIOS DE GARANTÍA
 # =============================================================================
+
 
 def vista_garantias(datos: dict) -> None:
     st.markdown("### 📋 Folios de Garantía")
-    st.caption("Lista completa de folios. Selecciona uno para editarlo. "
-               "Plazo total: **90 días** desde la fecha de recepción.")
+    st.caption("Lista completa de folios. Plazo total: **90 días** desde la "
+                "fecha de recepción del reporte. Un folio queda RESUELTO al "
+                "capturar su nota de crédito.")
 
-    df = datos["garantias"]
-    if df is None:
-        st.error("No hay datos de garantías.")
+    df = datos.get("garantias")
+    if df is None or df.empty:
+        st.info("No hay folios de garantía cargados.")
         return
 
     if "flash" in st.session_state:
         tipo, msg = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(msg)
 
-    # ---- Filtros ----
-    c1, c2, c3, c4 = st.columns(4)
-    estados_disp = ["Todos", ESTADO_ACTIVO, ESTADO_CUARENTENA, ESTADO_RESUELTO,
-                    ESTADO_CANCELADO]
-    f_estado = c1.selectbox("Estado", estados_disp, key="g_f_estado")
-    proveedores = sorted(df[COL_G_PROVEEDOR].dropna().unique().tolist())
-    f_prov = c2.multiselect("Proveedor", proveedores, placeholder="Todos",
-                             key="g_f_prov")
-    compradores = sorted(df[COL_G_COMPRADOR].dropna().unique().tolist())
-    f_comp = c3.multiselect("Comprador", compradores, placeholder="Todos",
-                             key="g_f_comp")
-    f_folio = c4.text_input("Buscar folio", placeholder="Ej. DC-MZ017",
-                             key="g_f_folio")
+    # ---- Filtro adicional por estado (solo aquí) ----
+    estados_disp = ["Todos", ESTADO_ACTIVO, ESTADO_CUARENTENA,
+                    ESTADO_RESUELTO, ESTADO_CANCELADO]
+    f_estado = st.selectbox("Estado", estados_disp, key="g_estado")
 
-    d = df.copy()
-    if f_estado != "Todos":
-        d = d[d[COL_G_ESTADO] == f_estado]
-    if f_prov:
-        d = d[d[COL_G_PROVEEDOR].isin(f_prov)]
-    if f_comp:
-        d = d[d[COL_G_COMPRADOR].isin(f_comp)]
-    if f_folio.strip():
-        d = d[d[COL_G_FOLIO].str.contains(f_folio.strip(), case=False, na=False)]
+    df_e = df if f_estado == "Todos" else df[df[COL_G_ESTADO] == f_estado]
 
-    st.caption(f"**{len(d)}** de **{len(df)}** folios")
+    # ---- Filtros comunes ----
+    df_f, etiq = _filtros_barra(
+        df_e, prefijo="g",
+        col_fecha=COL_G_FECHA_RECEPCION,
+        col_folio=COL_G_FOLIO,
+        col_proveedor=COL_G_PROVEEDOR,
+        col_comprador=COL_G_COMPRADOR,
+        etiqueta_folio="Buscar folio reporte")
 
-    # Alerta al inicio
-    vencidos = d[d.apply(esta_vencido_garantia, axis=1)]
-    if not vencidos.empty:
-        st.error(f"🚨 **{len(vencidos)}** folio(s) vencido(s) sin resolverse "
-                 f"({MSG_VENCIDO}).")
+    # ---- Alerta al inicio ----
+    if not df_f.empty:
+        venc = df_f[df_f.apply(esta_vencido_garantia, axis=1)]
+        if not venc.empty:
+            st.error(f"🚨 **{len(venc)}** folio(s) vencido(s): {MSG_VENCIDO}")
 
-    # ---- Tabla resumen ----
-    if d.empty:
+    if df_f.empty:
         st.info("No hay folios con los filtros actuales.")
         return
 
-    vista = d.copy()
+    # ---- Tabla ----
+    vista = df_f.copy()
     vista["🚦"] = vista.apply(lambda f: semaforo_garantia(f)[0], axis=1)
-    vista["Días transcurridos"] = vista.apply(dias_transcurridos_garantia, axis=1)
+    vista["Días transc."] = vista.apply(dias_transcurridos_garantia, axis=1)
     vista["Días restantes"] = vista.apply(dias_restantes_garantia, axis=1)
     vista["Vence"] = vista.apply(fecha_vencimiento_garantia, axis=1)
 
-    cols_vista = ["🚦", COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_COMPRADOR,
-                  COL_G_IMPORTE, COL_G_FECHA_RECEPCION, "Vence",
-                  "Días transcurridos", "Días restantes", COL_G_ESTADO,
-                  COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE, COL_G_NOTA_CREDITO]
+    cols = ["🚦", COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_COMPRADOR,
+            COL_G_IMPORTE, COL_G_FECHA_RECEPCION, "Vence",
+            "Días transc.", "Días restantes", COL_G_ESTADO,
+            COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE, COL_G_NOTA_CREDITO]
     st.dataframe(
-        vista[cols_vista], use_container_width=True, hide_index=True,
+        vista[cols], use_container_width=True, hide_index=True,
         column_config={
-            COL_G_IMPORTE: st.column_config.NumberColumn("Importe",
-                                                          format="$%.2f"),
+            COL_G_IMPORTE: st.column_config.NumberColumn(
+                "Importe", format="$%.2f"),
             COL_G_FECHA_RECEPCION: st.column_config.DateColumn(
                 "Recepción", format="DD/MM/YYYY"),
             "Vence": st.column_config.DateColumn(format="DD/MM/YYYY"),
@@ -994,16 +1134,16 @@ def vista_garantias(datos: dict) -> None:
     )
 
     st.divider()
-
-    # ---- Editor de folio individual ----
     st.markdown("#### ✏️ Editar folio")
-    d_sel = d.copy()
-    d_sel["etiqueta"] = (d_sel[COL_G_FOLIO] + " · "
-                          + d_sel[COL_G_PROVEEDOR].str.slice(0, 40)
-                          + " · [" + d_sel[COL_G_ESTADO] + "]")
-    etiqueta_sel = st.selectbox("Selecciona un folio",
-                                 options=d_sel["etiqueta"].tolist())
-    fila = d_sel[d_sel["etiqueta"] == etiqueta_sel].iloc[0]
+
+    df_sel = df_f.copy()
+    df_sel["etiqueta"] = (df_sel[COL_G_FOLIO] + " · "
+                           + df_sel[COL_G_PROVEEDOR].str.slice(0, 40)
+                           + " · [" + df_sel[COL_G_ESTADO] + "]")
+    sel = st.selectbox("Selecciona un folio",
+                        options=df_sel["etiqueta"].tolist(),
+                        key="g_edit_sel")
+    fila = df_sel[df_sel["etiqueta"] == sel].iloc[0]
     _editor_garantia(fila, datos)
 
 
@@ -1030,7 +1170,8 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
     estado = str(fila[COL_G_ESTADO]).strip()
 
     if estado == ESTADO_CUARENTENA:
-        _panel_cuarentena(fila, datos)
+        st.info("Este folio está en cuarentena. Gestionalo desde la pestaña "
+                 "**🧊 Cuarentena**.")
         return
 
     if estado == ESTADO_CANCELADO:
@@ -1054,15 +1195,12 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
             value=str(fila.get(COL_G_NOTA_CREDITO, "") or ""),
             help="Al capturar la nota de crédito, el folio queda RESUELTO.")
 
+        opciones_resp = ["", "Recolección", "Destrucción", "Sin respuesta"]
+        actual_resp = str(fila.get(COL_G_RESPUESTA, "") or "")
+        idx_resp = opciones_resp.index(actual_resp) if actual_resp in opciones_resp else 0
         respuesta = st.selectbox(
-            "Respuesta del proveedor",
-            options=["", "Recolección", "Destrucción", "Sin respuesta"],
-            index=(["", "Recolección", "Destrucción", "Sin respuesta"]
-                   .index(str(fila.get(COL_G_RESPUESTA, "") or ""))
-                   if str(fila.get(COL_G_RESPUESTA, "") or "")
-                   in ["", "Recolección", "Destrucción", "Sin respuesta"]
-                   else 0),
-        )
+            "Respuesta del proveedor", options=opciones_resp,
+            index=idx_resp)
 
         notas = st.text_area("Notas / acciones",
                               value=str(fila.get(COL_G_NOTAS, "") or ""),
@@ -1087,7 +1225,6 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
             COL_G_RESPUESTA: respuesta,
             COL_G_NOTAS: notas.strip(),
         }
-        # Si tiene NC → automáticamente Resuelto
         if nota_cred.strip():
             cambios[COL_G_ESTADO] = ESTADO_RESUELTO
             cambios[COL_G_FECHA_RESUELTO] = pd.Timestamp(hoy_mx())
@@ -1112,35 +1249,6 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
             }, "Folio marcado como RESUELTO")
 
 
-def _panel_cuarentena(fila: pd.Series, datos: dict) -> None:
-    """Panel especial para folios en cuarentena."""
-    inicio = _a_fecha(fila.get(COL_G_CUAR_INICIO))
-    fin = _a_fecha(fila.get(COL_G_CUAR_FIN))
-    if fin:
-        faltan = (fin - hoy_mx()).days
-        if faltan > 0:
-            st.info(f"🧊 En cuarentena desde {inicio:%d/%m/%Y} — sale en "
-                     f"**{faltan} día(s)** ({fin:%d/%m/%Y}).")
-        else:
-            st.warning(f"🧊 Cuarentena vencida el {fin:%d/%m/%Y}. Al recargar "
-                        "se activará automáticamente.")
-    st.caption(f"Los folios con importe ≤ ${UMBRAL_CUARENTENA:,.0f} entran a "
-                "cuarentena para acumular monto por proveedor. Se liberan solos "
-                "al vencer el plazo.")
-    c1, c2 = st.columns(2)
-    if c1.button("🚀 Liberar ahora", key=f"lib_{fila[COL_G_FOLIO]}",
-                  use_container_width=True, type="primary"):
-        _actualizar_garantia(fila[COL_G_FOLIO], datos, {
-            COL_G_ESTADO: ESTADO_ACTIVO,
-            COL_G_FECHA_RECEPCION: pd.Timestamp(hoy_mx()),
-        }, "Folio liberado de cuarentena")
-    if c2.button("⛔ Cancelar folio", key=f"can_{fila[COL_G_FOLIO]}",
-                  use_container_width=True):
-        _actualizar_garantia(fila[COL_G_FOLIO], datos,
-                              {COL_G_ESTADO: ESTADO_CANCELADO},
-                              "Folio cancelado desde cuarentena")
-
-
 def _actualizar_garantia(folio: str, datos: dict, cambios: dict,
                           mensaje: str) -> None:
     df = datos["garantias"]
@@ -1152,95 +1260,217 @@ def _actualizar_garantia(folio: str, datos: dict, cambios: dict,
 
 
 # =============================================================================
-# 9. NOTAS DE CRÉDITO PENDIENTES (Pestaña 3)
+# 10. CUARENTENA
 # =============================================================================
+#
+#   Pestaña dedicada. Los folios ≤ $300 entran automáticamente y se acumulan
+#   por proveedor. Al vencer el plazo se liberan solos y ahí arrancan los 90
+#   días. Se puede liberar manualmente sin clave.
 
-def vista_nc_pendientes(datos: dict) -> None:
-    st.markdown("### 💳 Notas de Crédito Pendientes")
-    st.caption(f"Notas por conceptos varios que aún no llegan a administración. "
-               f"Plazo de **{DIAS_PLAZO_NC} días** desde la fecha de recepción "
-               "del reporte.")
 
-    df = datos["nc"]
+def vista_cuarentena(datos: dict) -> None:
+    st.markdown("### 🧊 Cuarentena")
+    st.caption(f"Folios con importe ≤ **${UMBRAL_CUARENTENA:,.0f}** en espera "
+                f"de acumular monto por proveedor. Plazo: {DIAS_CUARENTENA} "
+                "días. Al vencer se liberan solos y ahí comienzan los 90 días.")
+
+    df = datos.get("garantias")
     if df is None:
-        st.error("No hay datos de notas de crédito.")
+        st.info("No hay folios cargados.")
         return
 
     if "flash" in st.session_state:
         tipo, msg = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(msg)
 
-    # Solo pendientes por defecto
-    df_pend = df[df[COL_NC_ESTADO] == "Pendiente"]
-    df_resueltas = df[df[COL_NC_ESTADO] == "Resuelto"]
+    en_cuar = df[df[COL_G_ESTADO] == ESTADO_CUARENTENA].copy()
 
-    # Alerta al inicio
-    if not df_pend.empty:
-        vencidas = df_pend[df_pend.apply(esta_vencida_nc, axis=1)]
-        if not vencidas.empty:
-            st.error(f"🚨 **{len(vencidas)}** nota(s) de crédito VENCIDA(S) "
-                     f"(más de {DIAS_PLAZO_NC} días sin resolver).")
+    if en_cuar.empty:
+        st.success("✅ No hay folios en cuarentena en este momento.")
+        return
 
-    c1, c2, c3, c4 = st.columns(4)
-    _tarjeta_kpi(c1, "⏳", "NC pendientes",
-                 f"{len(df_pend):,}",
-                 f"{_fmt_mxn(df_pend[COL_NC_IMP_PENDIENTE].sum())} por conseguir",
-                 color="#ea580c")
-    _tarjeta_kpi(c2, "✅", "NC resueltas",
-                 f"{len(df_resueltas):,}",
-                 f"{_fmt_mxn(df_resueltas[COL_NC_IMP_PENDIENTE].sum())} entregadas",
+    # ---- Filtros ----
+    df_f, etiq = _filtros_barra(
+        en_cuar, prefijo="q",
+        col_fecha=COL_G_CUAR_INICIO,
+        col_folio=COL_G_FOLIO,
+        col_proveedor=COL_G_PROVEEDOR,
+        col_comprador=COL_G_COMPRADOR,
+        etiqueta_folio="Buscar folio")
+
+    # ---- KPIs ----
+    c1, c2, c3 = st.columns(3)
+    _tarjeta_kpi(c1, "🧊", "Folios en cuarentena",
+                 f"{len(df_f):,}",
+                 f"de {len(en_cuar):,} totales",
+                 color="#3b82f6")
+    _tarjeta_kpi(c2, "💰", "Monto acumulado",
+                 _fmt_mxn(df_f[COL_G_IMPORTE].sum()),
+                 f"promedio {_fmt_mxn(df_f[COL_G_IMPORTE].mean() if len(df_f) else 0)}",
+                 color="#0f766e")
+    prov_listos = 0
+    if not df_f.empty:
+        acum = df_f.groupby(COL_G_PROVEEDOR)[COL_G_IMPORTE].sum()
+        prov_listos = int((acum > UMBRAL_CUARENTENA).sum())
+    _tarjeta_kpi(c3, "✅", "Proveedores listos",
+                 f"{prov_listos:,}",
+                 f"acumulado > ${UMBRAL_CUARENTENA:,.0f}",
                  color="#059669")
-    n_venc = int(df_pend.apply(esta_vencida_nc, axis=1).sum()) if not df_pend.empty else 0
-    _tarjeta_kpi(c3, "🚨", "Vencidas (>20 días)",
-                 f"{n_venc:,}",
-                 "Requieren atención inmediata" if n_venc > 0 else "Sin vencidas",
-                 color="#dc2626" if n_venc > 0 else "#94a3b8")
-    proveedores_pend = df_pend[COL_NC_PROVEEDOR].nunique()
-    _tarjeta_kpi(c4, "🏭", "Proveedores",
-                 f"{proveedores_pend:,}",
-                 "con NC pendientes",
-                 color="#1f4e79")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ---- Acumulado por proveedor ----
+    st.markdown("#### 🏭 Acumulado por proveedor")
+    resumen = (df_f.groupby(COL_G_PROVEEDOR)
+               .agg(Folios=(COL_G_FOLIO, "count"),
+                    Acumulado=(COL_G_IMPORTE, "sum"))
+               .sort_values("Acumulado", ascending=False))
+    resumen["¿Supera umbral?"] = resumen["Acumulado"].apply(
+        lambda v: "✅ Sí" if v > UMBRAL_CUARENTENA else "—")
+    st.dataframe(
+        resumen, use_container_width=True,
+        column_config={
+            "Folios": st.column_config.NumberColumn(format="%d"),
+            "Acumulado": st.column_config.NumberColumn(format="$%.2f"),
+        })
 
     st.divider()
 
-    # Filtros
-    c1, c2, c3 = st.columns(3)
-    ver_resueltas = c1.checkbox("Mostrar también resueltas", value=False,
+    # ---- Administrar por proveedor ----
+    st.markdown("#### ⚙️ Administrar cuarentena por proveedor")
+    st.caption("Selecciona un proveedor para ver el detalle y liberar sus "
+                "folios al flujo normal (sin clave).")
+
+    prov_sel = st.selectbox("Proveedor", options=resumen.index.tolist(),
+                              key="q_prov_sel")
+    grupo = df_f[df_f[COL_G_PROVEEDOR] == prov_sel].copy()
+    grupo["Días restantes cuar."] = grupo[COL_G_CUAR_FIN].apply(
+        lambda f: (_a_fecha(f) - hoy_mx()).days if pd.notna(f) else None)
+
+    st.dataframe(
+        grupo[[COL_G_FOLIO, COL_G_IMPORTE, COL_G_CUAR_INICIO,
+               COL_G_CUAR_FIN, "Días restantes cuar."]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            COL_G_IMPORTE: st.column_config.NumberColumn("Importe",
+                                                          format="$%.2f"),
+            COL_G_CUAR_INICIO: st.column_config.DateColumn("Inicio",
+                                                            format="DD/MM/YYYY"),
+            COL_G_CUAR_FIN: st.column_config.DateColumn("Sale",
+                                                        format="DD/MM/YYYY"),
+            "Días restantes cuar.": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    c1, c2 = st.columns(2)
+    if c1.button(f"🚀 Liberar TODOS los folios de {prov_sel}",
+                  key=f"lib_all_{prov_sel}", type="primary",
+                  use_container_width=True):
+        dfx = datos["garantias"]
+        m = ((dfx[COL_G_ESTADO] == ESTADO_CUARENTENA) &
+             (dfx[COL_G_PROVEEDOR] == prov_sel))
+        n = int(m.sum())
+        dfx.loc[m, COL_G_ESTADO] = ESTADO_ACTIVO
+        dfx.loc[m, COL_G_FECHA_RECEPCION] = pd.Timestamp(hoy_mx())
+        dfx.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+        persistir(datos,
+                    f"Cuarentena: {n} folio(s) de {prov_sel} liberados",
+                    f"{n} folio(s) liberados al flujo normal.")
+
+    if c2.button(f"⛔ Cancelar TODOS los folios de {prov_sel}",
+                  key=f"can_all_{prov_sel}", use_container_width=True):
+        dfx = datos["garantias"]
+        m = ((dfx[COL_G_ESTADO] == ESTADO_CUARENTENA) &
+             (dfx[COL_G_PROVEEDOR] == prov_sel))
+        n = int(m.sum())
+        dfx.loc[m, COL_G_ESTADO] = ESTADO_CANCELADO
+        dfx.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+        persistir(datos,
+                    f"Cuarentena: {n} folio(s) de {prov_sel} cancelados",
+                    f"{n} folio(s) cancelados.")
+
+
+# =============================================================================
+# 11. NOTAS DE CRÉDITO PENDIENTES
+# =============================================================================
+
+
+def vista_nc_pendientes(datos: dict) -> None:
+    st.markdown("### 💳 Notas de Crédito Pendientes")
+    st.caption(f"Notas por conceptos varios que aún no llegan a administración. "
+                f"Plazo de **{DIAS_PLAZO_NC} días** desde la fecha de recepción "
+                "del reporte.")
+
+    df = datos.get("nc")
+    if df is None or df.empty:
+        st.info("No hay notas de crédito cargadas.")
+        return
+
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
+
+    # ---- Alerta inicial ----
+    df_pend = df[df[COL_NC_ESTADO] == "Pendiente"]
+    if not df_pend.empty:
+        venc = df_pend[df_pend.apply(esta_vencida_nc, axis=1)]
+        if not venc.empty:
+            st.error(f"🚨 **{len(venc)}** nota(s) de crédito VENCIDA(S) "
+                     f"(más de {DIAS_PLAZO_NC} días sin resolver).")
+
+    # ---- KPIs generales ----
+    df_res = df[df[COL_NC_ESTADO] == "Resuelto"]
+    c1, c2, c3, c4 = st.columns(4)
+    _tarjeta_kpi(c1, "⏳", "NC pendientes", f"{len(df_pend):,}",
+                 f"{_fmt_mxn(df_pend[COL_NC_IMP_PENDIENTE].sum())} por conseguir",
+                 color="#ea580c")
+    _tarjeta_kpi(c2, "✅", "NC ya conseguidas", f"{len(df_res):,}",
+                 f"{_fmt_mxn(df_res[COL_NC_IMP_PENDIENTE].sum())} entregadas",
+                 color="#059669")
+    n_venc = int(df_pend.apply(esta_vencida_nc, axis=1).sum()) if not df_pend.empty else 0
+    _tarjeta_kpi(c3, "🚨", f"Vencidas (>{DIAS_PLAZO_NC} días)",
+                 f"{n_venc:,}",
+                 "Requieren atención" if n_venc > 0 else "Sin vencidas",
+                 color="#dc2626" if n_venc > 0 else "#94a3b8")
+    _tarjeta_kpi(c4, "🏭", "Proveedores", f"{df_pend[COL_NC_PROVEEDOR].nunique():,}",
+                 "con NC pendientes", color="#1f4e79")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ---- Filtro adicional: mostrar resueltas ----
+    ver_resueltas = st.checkbox("Mostrar también resueltas", value=False,
                                  key="nc_ver_res")
-    proveedores = sorted(df[COL_NC_PROVEEDOR].dropna().unique().tolist())
-    f_prov = c2.multiselect("Proveedor", proveedores, placeholder="Todos",
-                             key="nc_f_prov")
-    f_folio = c3.text_input("Buscar folio de entrada",
-                             placeholder="Ej. 176054", key="nc_f_folio")
 
-    d = df.copy()
-    if not ver_resueltas:
-        d = d[d[COL_NC_ESTADO] != "Resuelto"]
-    d = d[d[COL_NC_ESTADO] != "Cancelado"]
-    if f_prov:
-        d = d[d[COL_NC_PROVEEDOR].isin(f_prov)]
-    if f_folio.strip():
-        d = d[d[COL_NC_ENTRADA].astype(str).str.contains(
-            f_folio.strip(), case=False, na=False)]
+    df_base = df if ver_resueltas else df[df[COL_NC_ESTADO] != "Resuelto"]
+    df_base = df_base[df_base[COL_NC_ESTADO] != "Cancelado"]
 
-    if d.empty:
+    # ---- Filtros comunes ----
+    df_f, etiq = _filtros_barra(
+        df_base, prefijo="nc",
+        col_fecha=COL_NC_FECHA_REPORTE,
+        col_folio=COL_NC_ENTRADA,
+        col_proveedor=COL_NC_PROVEEDOR,
+        col_comprador=COL_NC_COMPRADOR,
+        etiqueta_folio="Buscar folio de entrada")
+
+    if df_f.empty:
         st.info("No hay notas de crédito con los filtros actuales.")
         return
 
-    # Tabla
-    vista = d.copy()
+    # ---- Tabla ----
+    vista = df_f.copy()
     vista["🚦"] = vista.apply(lambda f: semaforo_nc(f)[0], axis=1)
-    vista["Días transcurridos"] = vista.apply(dias_transcurridos_nc, axis=1)
+    vista["Días transc."] = vista.apply(dias_transcurridos_nc, axis=1)
     vista["Días restantes"] = vista.apply(dias_restantes_nc, axis=1)
 
-    cols_vista = ["🚦", COL_NC_ENTRADA, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
-                  COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE,
-                  COL_NC_FECHA_REPORTE, "Días transcurridos", "Días restantes",
-                  COL_NC_FECHA_NC, COL_NC_FOLIO_NC, COL_NC_ESTADO,
-                  COL_NC_COMPRADOR, COL_NC_OBSERVACIONES]
-    cols_vista = [c for c in cols_vista if c in vista.columns]
+    cols = ["🚦", COL_NC_ENTRADA, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
+            COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE,
+            COL_NC_FECHA_REPORTE, "Días transc.", "Días restantes",
+            COL_NC_FECHA_NC, COL_NC_FOLIO_NC, COL_NC_ESTADO,
+            COL_NC_COMPRADOR, COL_NC_OBSERVACIONES]
+    cols = [c for c in cols if c in vista.columns]
     st.dataframe(
-        vista[cols_vista], use_container_width=True, hide_index=True,
+        vista[cols], use_container_width=True, hide_index=True,
         column_config={
             COL_NC_IMP_FACTURA: st.column_config.NumberColumn(
                 "Importe factura", format="$%.2f"),
@@ -1255,17 +1485,15 @@ def vista_nc_pendientes(datos: dict) -> None:
     )
 
     st.divider()
-
-    # Editor de NC individual
     st.markdown("#### ✏️ Actualizar nota de crédito")
-    d_sel = d.copy()
-    d_sel["etiqueta"] = (d_sel[COL_NC_ENTRADA].astype(str) + " · "
-                          + d_sel[COL_NC_PROVEEDOR].str.slice(0, 40)
-                          + " · " + d_sel[COL_NC_IMP_PENDIENTE].apply(_fmt_mxn))
-    etiqueta_sel = st.selectbox("Selecciona una nota",
-                                 options=d_sel["etiqueta"].tolist(),
-                                 key="nc_edit_sel")
-    fila = d_sel[d_sel["etiqueta"] == etiqueta_sel].iloc[0]
+    df_sel = df_f.copy()
+    df_sel["etiqueta"] = (df_sel[COL_NC_ENTRADA].astype(str) + " · "
+                           + df_sel[COL_NC_PROVEEDOR].str.slice(0, 40)
+                           + " · " + df_sel[COL_NC_IMP_PENDIENTE].apply(_fmt_mxn))
+    sel = st.selectbox("Selecciona una nota",
+                        options=df_sel["etiqueta"].tolist(),
+                        key="nc_edit_sel")
+    fila = df_sel[df_sel["etiqueta"] == sel].iloc[0]
     _editor_nc(fila, datos)
 
 
@@ -1350,16 +1578,17 @@ def _actualizar_nc(folio_entrada, datos: dict, cambios: dict,
 
 
 # =============================================================================
-# 10. FOLIOS DE DEVOLUCIÓN SUELTOS (dentro de garantías, vista aparte)
+# 12. FOLIOS DE DEVOLUCIÓN HISTÓRICOS
 # =============================================================================
+
 
 def vista_devoluciones_sueltas(datos: dict) -> None:
     st.markdown("### 📦 Folios de devolución históricos")
     st.caption("Folios de devolución que no se ligan a un folio reporte actual "
-               "(en su mayoría de 2023-2024). Aquí puedes revisarlos, "
-               "cancelarlos o bloquearlos cuando ya no procedan.")
+                "(en su mayoría de 2023-2024). Puedes activarlos, bloquearlos o "
+                "cancelarlos cuando ya no procedan.")
 
-    df = datos["devoluciones"]
+    df = datos.get("devoluciones")
     if df is None or df.empty:
         st.info("No hay folios de devolución cargados.")
         return
@@ -1368,36 +1597,32 @@ def vista_devoluciones_sueltas(datos: dict) -> None:
         tipo, msg = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(msg)
 
-    # Filtros
-    c1, c2, c3 = st.columns(3)
-    f_estado = c1.selectbox("Estado", ["Todos", "Activo", "Bloqueado", "Cancelado"],
-                             key="d_f_estado")
-    f_tipo = c2.selectbox("Tipo",
-                           ["Todos", "Garantía (cliente)",
-                            "Incidente proveedor", "Otro"], key="d_f_tipo")
-    f_prov = c3.text_input("Buscar proveedor", key="d_f_prov")
+    # Filtro por estado
+    f_estado = st.selectbox("Estado",
+                              ["Todos", "Activo", "Bloqueado", "Cancelado"],
+                              key="d_estado")
+    df_e = df if f_estado == "Todos" else df[df[COL_D_ESTADO] == f_estado]
 
-    d = df.copy()
-    if f_estado != "Todos":
-        d = d[d[COL_D_ESTADO] == f_estado]
-    if f_tipo != "Todos":
-        d = d[d["TIPO"] == f_tipo]
-    if f_prov.strip():
-        d = d[d[COL_D_PROVEEDOR].str.contains(f_prov.strip(), case=False, na=False)]
+    df_f, etiq = _filtros_barra(
+        df_e, prefijo="dev",
+        col_fecha=COL_D_FECHA,
+        col_folio=COL_D_FOLIO,
+        col_proveedor=COL_D_PROVEEDOR,
+        col_comprador=COL_D_COMPRADOR,
+        etiqueta_folio="Buscar folio")
 
-    st.caption(f"**{len(d)}** de **{len(df)}** folios · "
-                f"Total pendiente: **{_fmt_mxn(d[COL_D_PENDIENTE].sum())}**")
-
-    if d.empty:
+    if df_f.empty:
         st.info("No hay folios con los filtros actuales.")
         return
+
+    st.caption(f"Total pendiente: **{_fmt_mxn(df_f[COL_D_PENDIENTE].sum())}**")
 
     cols = [COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR, COL_D_TOTAL,
             COL_D_PENDIENTE, COL_D_APLICADO_MXN, "TIPO", COL_D_RESOLUCION,
             COL_D_COMPRADOR, COL_D_ESTADO]
-    cols = [c for c in cols if c in d.columns]
+    cols = [c for c in cols if c in df_f.columns]
     st.dataframe(
-        d[cols], use_container_width=True, hide_index=True,
+        df_f[cols], use_container_width=True, hide_index=True,
         column_config={
             COL_D_TOTAL: st.column_config.NumberColumn("Total", format="$%.2f"),
             COL_D_PENDIENTE: st.column_config.NumberColumn("Pendiente",
@@ -1409,15 +1634,15 @@ def vista_devoluciones_sueltas(datos: dict) -> None:
     )
 
     st.divider()
-
-    # Editor
     st.markdown("#### ✏️ Actualizar folio")
-    d_sel = d.copy()
-    d_sel["etiqueta"] = (d_sel[COL_D_FOLIO].astype(str) + " · "
-                          + d_sel[COL_D_PROVEEDOR].str.slice(0, 40)
-                          + " · " + d_sel[COL_D_PENDIENTE].apply(_fmt_mxn))
-    sel = st.selectbox("Selecciona un folio", options=d_sel["etiqueta"].tolist())
-    fila = d_sel[d_sel["etiqueta"] == sel].iloc[0]
+    df_sel = df_f.copy()
+    df_sel["etiqueta"] = (df_sel[COL_D_FOLIO].astype(str) + " · "
+                           + df_sel[COL_D_PROVEEDOR].str.slice(0, 40)
+                           + " · " + df_sel[COL_D_PENDIENTE].apply(_fmt_mxn))
+    sel = st.selectbox("Selecciona un folio",
+                        options=df_sel["etiqueta"].tolist(),
+                        key="d_edit_sel")
+    fila = df_sel[df_sel["etiqueta"] == sel].iloc[0]
 
     st.markdown(
         f"""<div style='padding:0.5rem 0.8rem;margin:0.3rem 0 0.8rem 0;
@@ -1439,10 +1664,10 @@ def vista_devoluciones_sueltas(datos: dict) -> None:
         blq = c2.form_submit_button("🔒 Bloquear", use_container_width=True)
         can = c3.form_submit_button("⛔ Cancelar", use_container_width=True)
 
-    def _act_dev(nuevo_estado, msg):
+    def _act_dev(nuevo, msg):
         df2 = datos["devoluciones"]
         m = df2[COL_D_FOLIO] == fila[COL_D_FOLIO]
-        df2.loc[m, COL_D_ESTADO] = nuevo_estado
+        df2.loc[m, COL_D_ESTADO] = nuevo
         df2.loc[m, COL_D_NOTAS] = notas.strip()
         persistir(datos, f"Devolución {fila[COL_D_FOLIO]}: {msg}", msg)
 
@@ -1455,8 +1680,9 @@ def vista_devoluciones_sueltas(datos: dict) -> None:
 
 
 # =============================================================================
-# 11. CARGA / DESCARGA DE BASE DE DATOS
+# 13. BASE DE DATOS Y GUÍA
 # =============================================================================
+
 
 def _excel_en_memoria(datos: dict) -> bytes:
     buffer = io.BytesIO()
@@ -1477,8 +1703,7 @@ def vista_base_datos(datos: dict) -> None:
 
     if hay_datos:
         st.markdown("#### ⬇️ Descargar base actual")
-        st.caption("Descarga el Excel con las tres hojas tal como están hoy. "
-                    "Puedes editarlo, agregar nuevas filas y volver a cargarlo.")
+        st.caption("Descarga el Excel con las tres hojas tal como están hoy.")
         hoy_str = ahora_mx().strftime("%Y%m%d_%H%M")
         try:
             excel_bytes = _excel_en_memoria(datos)
@@ -1492,15 +1717,14 @@ def vista_base_datos(datos: dict) -> None:
         except Exception as e:
             st.warning(f"No se pudo generar el Excel para descarga: {e}")
     else:
-        st.info("📥 **Primera carga:** No hay datos válidos aún. "
-                 "Sube abajo el archivo Excel con las tres hojas requeridas.")
-        # Ofrecer una plantilla vacía descargable para que sepa la estructura
+        st.info("📥 **Primera carga:** No hay datos válidos aún. Sube abajo el "
+                "archivo con las tres hojas requeridas.")
         try:
             plantilla_bytes = _excel_en_memoria({"garantias": None,
                                                   "devoluciones": None,
                                                   "nc": None})
             st.download_button(
-                "📄 Descargar plantilla vacía (solo estructura)",
+                "📄 Descargar plantilla vacía",
                 data=plantilla_bytes,
                 file_name="plantilla_datos.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1513,9 +1737,9 @@ def vista_base_datos(datos: dict) -> None:
     st.divider()
 
     st.markdown("#### ⬆️ Cargar nueva base")
-    st.caption("Sube un Excel con las tres hojas: "
-                f"**{HOJA_GARANTIAS}**, **{HOJA_DEVOLUCIONES}** y **{HOJA_NC}**. "
-                "Reemplazará por completo la base actual.")
+    st.caption(f"Sube un Excel con las tres hojas: **{HOJA_GARANTIAS}**, "
+                f"**{HOJA_DEVOLUCIONES}** y **{HOJA_NC}**. Reemplazará por "
+                "completo la base actual.")
     archivo = st.file_uploader("Selecciona el archivo", type=["xlsx"])
     if archivo is None:
         return
@@ -1526,11 +1750,11 @@ def vista_base_datos(datos: dict) -> None:
         st.error(f"No se pudo leer el archivo: {e}")
         return
 
-    hojas_encontradas = xl.sheet_names
     faltantes = [h for h in [HOJA_GARANTIAS, HOJA_DEVOLUCIONES, HOJA_NC]
-                 if h not in hojas_encontradas]
+                 if h not in xl.sheet_names]
     if faltantes:
         st.error(f"Faltan hojas: {', '.join(faltantes)}")
+        st.caption(f"Hojas encontradas: {', '.join(xl.sheet_names)}")
         return
 
     c1, c2, c3 = st.columns(3)
@@ -1568,10 +1792,6 @@ def vista_base_datos(datos: dict) -> None:
         st.rerun()
 
 
-# =============================================================================
-# 12. GUÍA
-# =============================================================================
-
 def vista_guia() -> None:
     st.markdown("### 📖 Guía del sistema")
     st.markdown(f"""
@@ -1584,46 +1804,38 @@ la lleva **una sola persona** con acceso mediante contraseña única.
 - El plazo total es de **{DIAS_PLAZO_TOTAL} días**.
 - Un folio queda **RESUELTO** en el momento en que se captura la nota de crédito.
 
+### 📊 Tablero Directivo
+Es la pestaña para juntas. Puedes elegir mostrar **Solo Garantías**, **Solo NC
+pendientes** o **Ambos**. Cada sección con sus propias tarjetas de indicadores
+y sus propias gráficas: KPIs, top proveedores, evolución mensual y distribución
+por comprador (para garantías).
+
+### 📋 Folios de Garantía
+Lista completa con filtros por estado, periodo, proveedor, comprador y folio.
+Editor con los tres campos: Folio Devolución, Folio Ajuste y Nota de Crédito.
+Al capturar la nota de crédito, el folio pasa automáticamente a **Resuelto**.
+
 ### 🧊 Cuarentena
-- Los folios con importe menor o igual a **${UMBRAL_CUARENTENA:,.0f}** entran
-  automáticamente a **cuarentena** por **{DIAS_CUARENTENA} días** para acumular
-  monto con otros folios del mismo proveedor.
-- Al vencer el plazo, se liberan solos y **ahí empiezan a contar los
-  {DIAS_PLAZO_TOTAL} días**.
-- También puedes liberarlos manualmente en cualquier momento (sin clave).
+Pestaña dedicada. Los folios con importe ≤ **${UMBRAL_CUARENTENA:,.0f}** entran
+automáticamente por **{DIAS_CUARENTENA} días** para acumular monto con otros
+del mismo proveedor. Al vencer el plazo se liberan solos y ahí empiezan los
+{DIAS_PLAZO_TOTAL} días. También se pueden liberar manualmente sin clave.
 
 ### 💳 Notas de Crédito Pendientes
-- Pestaña aparte para NC de conceptos varios (faltantes, rebates, descuentos,
-  fletes, etc.).
-- Plazo: **{DIAS_PLAZO_NC} días** desde la fecha de recepción del reporte hasta
-  que se envía la NC a administración.
-- Cuando se captura la fecha de la NC, la NC pasa a estado **Resuelto** y sale
-  del listado de pendientes.
+Pestaña aparte para NC de conceptos varios (faltantes, rebates, descuentos,
+fletes, etc.). Plazo: **{DIAS_PLAZO_NC} días** desde la fecha de recepción del
+reporte. Al capturar la fecha de la NC pasa a **Resuelto**.
+
+### 📦 Folios de devolución históricos
+Folios de la hoja 2 que no se ligan a un folio reporte actual. Se pueden
+activar, bloquear o cancelar.
 
 ### 🚦 Semáforo
 - 🟢 En tiempo · 🟡 Por vencerse · 🔴 Vencido · ✅ Resuelto · 🧊 Cuarentena · ⚫ Cancelado
 
-### 📊 Tablero Directivo
-Es la pestaña que se presenta en juntas. Muestra:
-- Número de folios y monto total
-- % de folios resueltos
-- Notas de crédito conseguidas
-- Alertas de folios vencidos
-- Top 10 proveedores por importe
-- Evolución mensual
-
-Todo con **filtro por mes o rango de fechas**.
-
 ### ✏️ Modificaciones
-- Ya no se requieren claves para editar, cancelar o reactivar folios.
-- Todos los cambios se guardan automáticamente y se sincronizan con el
-  repositorio.
-
-### 🗄️ Base de datos
-- Se puede **descargar** el Excel actual en cualquier momento.
-- Se puede **cargar** una versión actualizada (reemplaza toda la base).
-- El archivo debe tener las tres hojas:
-  `{HOJA_GARANTIAS}`, `{HOJA_DEVOLUCIONES}` y `{HOJA_NC}`.
+Sin claves para editar, cancelar o reactivar. Todos los cambios se guardan
+automáticamente y se sincronizan con el repositorio.
 """)
 
 
@@ -1674,6 +1886,7 @@ def main() -> None:
     tabs = st.tabs([
         "📊 Tablero directivo",
         "📋 Folios de garantía",
+        "🧊 Cuarentena",
         "💳 NC pendientes",
         "📦 Devoluciones históricas",
         "🗄️ Base de datos",
@@ -1684,12 +1897,14 @@ def main() -> None:
     with tabs[1]:
         vista_garantias(datos)
     with tabs[2]:
-        vista_nc_pendientes(datos)
+        vista_cuarentena(datos)
     with tabs[3]:
-        vista_devoluciones_sueltas(datos)
+        vista_nc_pendientes(datos)
     with tabs[4]:
-        vista_base_datos(datos)
+        vista_devoluciones_sueltas(datos)
     with tabs[5]:
+        vista_base_datos(datos)
+    with tabs[6]:
         vista_guia()
 
 
