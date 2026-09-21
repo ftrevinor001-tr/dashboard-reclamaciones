@@ -94,6 +94,12 @@ HOJA_NC = "NC PENDIENTES"
 # --- Umbrales del proceso ---
 DIAS_PLAZO_TOTAL = 90     # plazo total de un folio de garantía
 DIAS_PLAZO_NC = 20        # plazo para gestionar una nota de crédito pendiente
+
+# Metas de cumplimiento e indicadores de bono
+META_CUMPLIMIENTO_GARANTIA = 95.0   # % objetivo de folios cerrados en 90 días
+META_CUMPLIMIENTO_NC = 90.0         # % objetivo de NC cerradas en 20 días
+DIAS_ALERTA_ROJA = 120              # folio abierto > 120 días penaliza bono
+DIAS_ALERTA_NC = 60                 # NC abierta > 60 días penaliza bono
 DIAS_POR_VENCER = 15      # ventana amarilla antes del vencimiento
 DIAS_POR_VENCER_NC = 5    # ventana amarilla para NC (plazo más corto)
 UMBRAL_CUARENTENA = 300.0
@@ -978,25 +984,29 @@ def _tablero_seccion_garantias(datos: dict) -> None:
 
     st.markdown("## 📋 Folios de Garantía")
     df_f, etiq = _filtro_periodo_tablero(df, COL_G_FECHA_RECEPCION, "gar")
-    st.caption(f"📅 Periodo: **{etiq}**")
+    st.caption(f"📅 Periodo: **{etiq}** · Los tableros y gráficas excluyen "
+                "folios sin gestión (sin fecha de recepción o cancelados). "
+                "La tabla al final los conserva.")
+
+    # Excluir "no gestionados" para tableros y gráficas
+    df_g = df_f[
+        (df_f[COL_G_ESTADO] != ESTADO_CANCELADO) &
+        (df_f[COL_G_FECHA_RECEPCION].notna())
+    ].copy()
 
     # ---- KPIs ----
-    total = len(df_f)
-    activos = (df_f[COL_G_ESTADO] == ESTADO_ACTIVO).sum()
-    cuarentena = (df_f[COL_G_ESTADO] == ESTADO_CUARENTENA).sum()
-    resueltos = (df_f[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
-    cancelados = (df_f[COL_G_ESTADO] == ESTADO_CANCELADO).sum()
-    monto_total = df_f[COL_G_IMPORTE].sum()
-    monto_activo = df_f.loc[df_f[COL_G_ESTADO].isin(
+    total = len(df_g)
+    activos = (df_g[COL_G_ESTADO] == ESTADO_ACTIVO).sum()
+    cuarentena = (df_g[COL_G_ESTADO] == ESTADO_CUARENTENA).sum()
+    resueltos = (df_g[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
+    monto_total = df_g[COL_G_IMPORTE].sum()
+    monto_activo = df_g.loc[df_g[COL_G_ESTADO].isin(
         [ESTADO_ACTIVO, ESTADO_CUARENTENA]), COL_G_IMPORTE].sum()
-    monto_resuelto = df_f.loc[df_f[COL_G_ESTADO] == ESTADO_RESUELTO,
-                                COL_G_IMPORTE].sum()
-    valido = total - cancelados
-    pct_res = (resueltos / valido * 100) if valido > 0 else 0.0
-    vencidos = int(df_f.apply(esta_vencido_garantia, axis=1).sum()) if not df_f.empty else 0
+    pct_res = (resueltos / total * 100) if total > 0 else 0.0
+    vencidos = int(df_g.apply(esta_vencido_garantia, axis=1).sum()) if not df_g.empty else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    _tarjeta_kpi(c1, "📁", "Folios totales", f"{total:,}",
+    _tarjeta_kpi(c1, "📁", "Folios en gestión", f"{total:,}",
                  f"{activos} activos · {cuarentena} en cuarentena",
                  color="#1f4e79")
     _tarjeta_kpi(c2, "💰", "Monto total",
@@ -1005,33 +1015,137 @@ def _tablero_seccion_garantias(datos: dict) -> None:
                  color="#0f766e")
     _tarjeta_kpi(c3, "✅", "% Resueltos",
                  f"{pct_res:.1f}%",
-                 f"{resueltos:,} de {valido:,} folios",
+                 f"{resueltos:,} de {total:,} folios",
                  color="#059669")
     _tarjeta_kpi(c4, "🚨", "Vencidos (90 días)",
                  f"{vencidos:,}",
                  MSG_VENCIDO if vencidos > 0 else "Sin vencimientos",
                  color="#dc2626" if vencidos > 0 else "#94a3b8")
 
-    
+    # ---- INDICADOR DE CUMPLIMIENTO por mes ----
+    st.markdown("---")
+    st.markdown("#### 🎯 Indicador de cumplimiento — Folios de Garantía")
+    st.caption(f"**Objetivo:** {META_CUMPLIMIENTO_GARANTIA:.0f}% de folios cerrados "
+                f"dentro de los {DIAS_PLAZO_TOTAL} días · "
+                f"🔴 Alerta si algún folio abierto rebasa **{DIAS_ALERTA_ROJA} días** · "
+                "⚠️ No pueden pasar **3 meses consecutivos** sin cerrar folios.")
+    _tabla_cumplimiento_garantias(df_g)
+
     # ---- Gráficas (2 columnas x 2 filas para aprovechar el ancho) ----
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### 🏭 Top 10 proveedores por monto")
-        _grafica_top_prov_garantias(df_f)
+        _grafica_top_prov_garantias(df_g)
         st.markdown("#### 👥 Distribución por comprador")
-        _grafica_por_comprador(df_f)
+        _grafica_por_comprador(df_g)
     with c2:
         st.markdown("#### 📅 Folios por mes y estado")
-        _grafica_evolucion_mensual(df_f)
+        _grafica_evolucion_mensual(df_g)
         st.markdown("#### 🚨 Vencidos por mes de recepción")
-        _grafica_vencidos_por_mes(df_f)
+        _grafica_vencidos_por_mes(df_g)
 
-    # ---- Tabla mensual detallada (SIN filtros — usa df completo) ----
+    # ---- Tabla mensual detallada (SIN filtros — usa df completo, incluye no gestionados) ----
     st.markdown("---")
     st.markdown("#### 📋 Detalle mensual (base completa, sin filtros)")
-    st.caption("Folios y monto por mes, agrupados por estado. La fila **TOTAL** "
-                "acumula todas las columnas.")
+    st.caption("Folios y monto por mes, agrupados por estado. Incluye TODOS "
+                "los folios (aun los no gestionados). La fila **TOTAL** acumula "
+                "todas las columnas.")
     _tabla_detalle_mensual(datos["garantias"])
+
+
+def _tabla_cumplimiento_garantias(df_g: pd.DataFrame) -> None:
+    """Tabla de cumplimiento mensual para folios de garantía.
+
+    Por cada mes de recepción calcula:
+      - Total de folios (en gestión)
+      - Resueltos dentro de 90 días
+      - % cumplimiento
+      - Semáforo vs META_CUMPLIMIENTO_GARANTIA
+      - Folios abiertos > DIAS_ALERTA_ROJA días (penalización)
+    """
+    if df_g is None or df_g.empty:
+        st.info("Sin folios en gestión para calcular cumplimiento.")
+        return
+    d = df_g[df_g["MES ETIQUETA"] != "Sin fecha"].copy()
+    if d.empty:
+        st.info("Sin folios con mes válido.")
+        return
+
+    filas = []
+    for mes, grupo in d.groupby("MES ETIQUETA"):
+        total = len(grupo)
+        # Resueltos dentro del plazo: FECHA RESUELTO - FECHA RECEPCION <= 90
+        resueltos = grupo[grupo[COL_G_ESTADO] == ESTADO_RESUELTO].copy()
+        cerrados_a_tiempo = 0
+        for _, r in resueltos.iterrows():
+            ini = _a_fecha(r.get(COL_G_FECHA_RECEPCION))
+            fin = _a_fecha(r.get(COL_G_FECHA_RESUELTO))
+            if ini and fin and (fin - ini).days <= DIAS_PLAZO_TOTAL:
+                cerrados_a_tiempo += 1
+        pct = (cerrados_a_tiempo / total * 100) if total > 0 else 0.0
+        # Folios que rebasan la penalización
+        penalizados = 0
+        for _, r in grupo.iterrows():
+            if r[COL_G_ESTADO] in (ESTADO_ACTIVO, ESTADO_CUARENTENA):
+                d_transc = dias_transcurridos_garantia(r)
+                if d_transc is not None and d_transc > DIAS_ALERTA_ROJA:
+                    penalizados += 1
+        estado_semaforo = ("🟢" if pct >= META_CUMPLIMIENTO_GARANTIA
+                           else "🟡" if pct >= META_CUMPLIMIENTO_GARANTIA - 10
+                           else "🔴")
+        if penalizados > 0:
+            estado_semaforo = "🔴"
+        filas.append({
+            "Mes": mes,
+            "_orden": _orden_mes(mes),
+            "Estado": estado_semaforo,
+            "Folios totales": total,
+            "Cerrados a tiempo (≤90 d)": cerrados_a_tiempo,
+            "% Cumplimiento": round(pct, 1),
+            f"Penalizados (>{DIAS_ALERTA_ROJA} d)": penalizados,
+        })
+    tabla = pd.DataFrame(filas).sort_values("_orden").drop(columns="_orden")
+
+    # Detectar 3 meses consecutivos sin cerrar
+    meses_ord = tabla["Mes"].tolist()
+    cerrados_por_mes = dict(zip(tabla["Mes"], tabla["Cerrados a tiempo (≤90 d)"]))
+    for i in range(len(meses_ord) - 2):
+        tres = [cerrados_por_mes[meses_ord[i + k]] for k in range(3)]
+        if all(v == 0 for v in tres):
+            st.error(f"⚠️ **3 meses consecutivos sin cerrar folios**: "
+                     f"{meses_ord[i]}, {meses_ord[i+1]}, {meses_ord[i+2]}.")
+
+    # Totales
+    total_folios = tabla["Folios totales"].sum()
+    total_cerrados = tabla["Cerrados a tiempo (≤90 d)"].sum()
+    total_penal = tabla[f"Penalizados (>{DIAS_ALERTA_ROJA} d)"].sum()
+    pct_global = (total_cerrados / total_folios * 100) if total_folios > 0 else 0.0
+
+    fila_total = pd.DataFrame([{
+        "Mes": "TOTAL",
+        "Estado": ("🟢" if pct_global >= META_CUMPLIMIENTO_GARANTIA
+                    else "🟡" if pct_global >= META_CUMPLIMIENTO_GARANTIA - 10
+                    else "🔴"),
+        "Folios totales": total_folios,
+        "Cerrados a tiempo (≤90 d)": total_cerrados,
+        "% Cumplimiento": round(pct_global, 1),
+        f"Penalizados (>{DIAS_ALERTA_ROJA} d)": total_penal,
+    }])
+    tabla_f = pd.concat([tabla, fila_total], ignore_index=True).set_index("Mes")
+
+    st.dataframe(
+        tabla_f, use_container_width=True,
+        column_config={
+            "Estado": st.column_config.TextColumn("🚦", width="small"),
+            "Folios totales": st.column_config.NumberColumn(format="%d"),
+            "Cerrados a tiempo (≤90 d)": st.column_config.NumberColumn(format="%d"),
+            "% Cumplimiento": st.column_config.NumberColumn(
+                "% Cumplimiento", format="%.1f%%",
+                help=f"Meta: {META_CUMPLIMIENTO_GARANTIA:.0f}%"),
+            f"Penalizados (>{DIAS_ALERTA_ROJA} d)":
+                st.column_config.NumberColumn(format="%d"),
+        },
+    )
 
 
 def _tabla_detalle_mensual(df_completo: pd.DataFrame) -> None:
@@ -1106,10 +1220,18 @@ def _tablero_seccion_nc(datos: dict) -> None:
 
     st.markdown("## 💳 Notas de Crédito Pendientes")
     df_f, etiq = _filtro_periodo_tablero(df, COL_NC_FECHA_REPORTE, "nc")
-    st.caption(f"📅 Periodo: **{etiq}**")
+    st.caption(f"📅 Periodo: **{etiq}** · Los tableros y gráficas excluyen NC "
+                "sin gestión (sin fecha de reporte o canceladas). La tabla al "
+                "final las conserva.")
 
-    pend = df_f[df_f[COL_NC_ESTADO] == "Pendiente"]
-    res = df_f[df_f[COL_NC_ESTADO] == "Resuelto"]
+    # Excluir "no gestionadas" para tableros y gráficas
+    df_nc = df_f[
+        (df_f[COL_NC_ESTADO] != "Cancelado") &
+        (df_f[COL_NC_FECHA_REPORTE].notna())
+    ].copy()
+
+    pend = df_nc[df_nc[COL_NC_ESTADO] == "Pendiente"]
+    res = df_nc[df_nc[COL_NC_ESTADO] == "Resuelto"]
 
     n_pend = len(pend)
     monto_pend = pend[COL_NC_IMP_PENDIENTE].sum()
@@ -1134,14 +1256,152 @@ def _tablero_seccion_nc(datos: dict) -> None:
                  f"con {n_pend} nota(s) por conseguir",
                  color="#1f4e79")
 
-    
+    # ---- INDICADOR DE CUMPLIMIENTO NC por mes ----
+    st.markdown("---")
+    st.markdown("#### 🎯 Indicador de cumplimiento — Notas de Crédito")
+    st.caption(f"**Objetivo:** {META_CUMPLIMIENTO_NC:.0f}% de NC cerradas dentro "
+                f"de los {DIAS_PLAZO_NC} días desde la fecha de reporte · "
+                f"🔴 Alerta si alguna NC abierta rebasa **{DIAS_ALERTA_NC} días**.")
+    _tabla_cumplimiento_nc(df_nc)
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### 🏭 Top 10 proveedores por monto pendiente")
         _grafica_top_prov_nc(pend)
     with c2:
         st.markdown("#### 📅 NC por mes de recepción")
-        _grafica_nc_por_mes(df_f)
+        _grafica_nc_por_mes(df_nc)
+
+    # ---- Tabla mensual detallada de NC (SIN filtros — incluye no gestionadas) ----
+    st.markdown("---")
+    st.markdown("#### 📋 Detalle mensual de NC (base completa)")
+    st.caption("NC por mes agrupadas por estado. Incluye TODAS las NC (aun las "
+                "no gestionadas). La fila **TOTAL** acumula todas las columnas.")
+    _tabla_detalle_mensual_nc(datos["nc"])
+
+
+def _tabla_cumplimiento_nc(df_nc: pd.DataFrame) -> None:
+    """Tabla de cumplimiento mensual para notas de crédito."""
+    if df_nc is None or df_nc.empty:
+        st.info("Sin NC en gestión para calcular cumplimiento.")
+        return
+    d = df_nc[df_nc["MES ETIQUETA"] != "Sin fecha"].copy()
+    if d.empty:
+        st.info("Sin NC con mes válido.")
+        return
+
+    filas = []
+    for mes, grupo in d.groupby("MES ETIQUETA"):
+        total = len(grupo)
+        # Cerradas a tiempo: FECHA NC - FECHA REPORTE <= 20 días
+        resueltas = grupo[grupo[COL_NC_ESTADO] == "Resuelto"]
+        cerradas_a_tiempo = 0
+        for _, r in resueltas.iterrows():
+            ini = _a_fecha(r.get(COL_NC_FECHA_REPORTE))
+            fin = _a_fecha(r.get(COL_NC_FECHA_NC))
+            if ini and fin and (fin - ini).days <= DIAS_PLAZO_NC:
+                cerradas_a_tiempo += 1
+        pct = (cerradas_a_tiempo / total * 100) if total > 0 else 0.0
+        # NC que rebasan la penalización
+        penalizadas = 0
+        for _, r in grupo.iterrows():
+            if r[COL_NC_ESTADO] == "Pendiente":
+                d_transc = dias_transcurridos_nc(r)
+                if d_transc is not None and d_transc > DIAS_ALERTA_NC:
+                    penalizadas += 1
+        semaforo = ("🟢" if pct >= META_CUMPLIMIENTO_NC
+                     else "🟡" if pct >= META_CUMPLIMIENTO_NC - 10
+                     else "🔴")
+        if penalizadas > 0:
+            semaforo = "🔴"
+        filas.append({
+            "Mes": mes,
+            "_orden": _orden_mes(mes),
+            "Estado": semaforo,
+            "NC totales": total,
+            "Cerradas a tiempo (≤20 d)": cerradas_a_tiempo,
+            "% Cumplimiento": round(pct, 1),
+            f"Penalizadas (>{DIAS_ALERTA_NC} d)": penalizadas,
+        })
+    tabla = pd.DataFrame(filas).sort_values("_orden").drop(columns="_orden")
+
+    # Totales
+    total_nc = tabla["NC totales"].sum()
+    total_cerr = tabla["Cerradas a tiempo (≤20 d)"].sum()
+    total_pen = tabla[f"Penalizadas (>{DIAS_ALERTA_NC} d)"].sum()
+    pct_g = (total_cerr / total_nc * 100) if total_nc > 0 else 0.0
+    fila_total = pd.DataFrame([{
+        "Mes": "TOTAL",
+        "Estado": ("🟢" if pct_g >= META_CUMPLIMIENTO_NC
+                    else "🟡" if pct_g >= META_CUMPLIMIENTO_NC - 10
+                    else "🔴"),
+        "NC totales": total_nc,
+        "Cerradas a tiempo (≤20 d)": total_cerr,
+        "% Cumplimiento": round(pct_g, 1),
+        f"Penalizadas (>{DIAS_ALERTA_NC} d)": total_pen,
+    }])
+    tabla_f = pd.concat([tabla, fila_total], ignore_index=True).set_index("Mes")
+
+    st.dataframe(
+        tabla_f, use_container_width=True,
+        column_config={
+            "Estado": st.column_config.TextColumn("🚦", width="small"),
+            "NC totales": st.column_config.NumberColumn(format="%d"),
+            "Cerradas a tiempo (≤20 d)": st.column_config.NumberColumn(format="%d"),
+            "% Cumplimiento": st.column_config.NumberColumn(
+                "% Cumplimiento", format="%.1f%%",
+                help=f"Meta: {META_CUMPLIMIENTO_NC:.0f}%"),
+            f"Penalizadas (>{DIAS_ALERTA_NC} d)":
+                st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+
+def _tabla_detalle_mensual_nc(df_completo: pd.DataFrame) -> None:
+    """Tabla mensual NC con conteo y monto por estado. Ignora filtros."""
+    if df_completo is None or df_completo.empty:
+        st.info("Sin datos.")
+        return
+    d = df_completo.copy()
+    d = d[d["MES ETIQUETA"] != "Sin fecha"]
+    if d.empty:
+        st.info("Sin NC con fecha de reporte.")
+        return
+    filas = []
+    for mes, grupo in d.groupby("MES ETIQUETA"):
+        pend = grupo[grupo[COL_NC_ESTADO] == "Pendiente"]
+        res = grupo[grupo[COL_NC_ESTADO] == "Resuelto"]
+        n_p, n_r = len(pend), len(res)
+        m_p = pend[COL_NC_IMP_PENDIENTE].sum()
+        m_r = res[COL_NC_IMP_PENDIENTE].sum()
+        filas.append({
+            "Mes": mes,
+            "_orden": _orden_mes(mes),
+            "NC pendientes": n_p,
+            "NC resueltas": n_r,
+            "NC TOTAL": n_p + n_r,
+            "Monto pendiente": m_p,
+            "Monto resuelto": m_r,
+            "Monto TOTAL": m_p + m_r,
+        })
+    tabla = pd.DataFrame(filas).sort_values("_orden").drop(columns="_orden")
+    tabla = tabla.set_index("Mes")
+    total = tabla.sum(numeric_only=True)
+    total.name = "TOTAL"
+    tabla = pd.concat([tabla, total.to_frame().T])
+    st.dataframe(
+        tabla, use_container_width=True,
+        column_config={
+            "NC pendientes": st.column_config.NumberColumn(format="%d"),
+            "NC resueltas": st.column_config.NumberColumn(format="%d"),
+            "NC TOTAL": st.column_config.NumberColumn(format="%d"),
+            "Monto pendiente": st.column_config.NumberColumn(
+                "Monto pendiente (por cobrar)", format="$%.2f"),
+            "Monto resuelto": st.column_config.NumberColumn(
+                "Monto resuelto (cobrado)", format="$%.2f"),
+            "Monto TOTAL": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
 
 
 def _grafica_top_prov_garantias(df: pd.DataFrame) -> None:
