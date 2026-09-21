@@ -398,26 +398,56 @@ def cargar_datos(ruta: str, _version: int) -> dict:
 
 
 def guardar_excel(datos: dict, ruta: str) -> None:
-    """Sobrescribe el Excel con las tres hojas."""
+    """Sobrescribe el Excel con las tres hojas.
+
+    Si alguna hoja viene vacía (None), se escribe una hoja mínima con solo los
+    encabezados para no romper el writer (openpyxl no admite libros vacíos).
+    """
     with pd.ExcelWriter(ruta, engine="openpyxl",
                         datetime_format="DD/MM/YYYY",
                         date_format="DD/MM/YYYY") as writer:
-        if datos.get("garantias") is not None:
-            g = datos["garantias"].copy()
-            g = g.drop(columns=["MES ETIQUETA"], errors="ignore")
-            g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
-        if datos.get("devoluciones") is not None:
-            d = datos["devoluciones"].copy()
-            d = d.drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
-            d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
-        if datos.get("nc") is not None:
-            nc = datos["nc"].copy()
-            nc = nc.drop(columns=["MES ETIQUETA"], errors="ignore")
-            # Restaurar el nombre largo de la observación
+        # Garantías (siempre escribir algo, aunque sea plantilla vacía)
+        g = datos.get("garantias")
+        if g is not None:
+            g = g.copy().drop(columns=["MES ETIQUETA"], errors="ignore")
+        else:
+            g = pd.DataFrame(columns=[
+                COL_G_MES, COL_G_FOLIO, COL_G_ID, COL_G_PROVEEDOR, COL_G_CARTA,
+                COL_G_IMPORTE, COL_G_COMPRADOR, COL_G_FECHA_CORTE,
+                COL_G_FECHA_RECEPCION, COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE,
+                COL_G_NOTA_CREDITO, COL_G_RESPUESTA, COL_G_NOTAS,
+                COL_G_ESTADO, COL_G_CUAR_INICIO, COL_G_CUAR_FIN,
+                COL_G_FECHA_RESUELTO, COL_G_MODIFICADO])
+        g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
+
+        # Devoluciones
+        d = datos.get("devoluciones")
+        if d is not None:
+            d = d.copy().drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
+        else:
+            d = pd.DataFrame(columns=[
+                COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR, COL_D_TOTAL,
+                COL_D_PENDIENTE, COL_D_APLICADO_MXN, COL_D_APLICADO_EST,
+                COL_D_RESOLUCION, COL_D_TIPO_CLIENTE, COL_D_EJECUTIVO,
+                COL_D_COMPRADOR, COL_D_ESTADO, COL_D_NOTAS])
+        d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
+
+        # NC
+        nc = datos.get("nc")
+        if nc is not None:
+            nc = nc.copy().drop(columns=["MES ETIQUETA"], errors="ignore")
             nc = nc.rename(columns={
                 COL_NC_OBSERVACIONES:
                 "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC"})
-            nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
+        else:
+            nc = pd.DataFrame(columns=[
+                COL_NC_ENTRADA, COL_NC_FECHA_FACTURA, COL_NC_FECHA_REPORTE,
+                COL_NC_FISCAL, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
+                COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE, COL_NC_FECHA_NC,
+                COL_NC_FOLIO_NC,
+                "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC",
+                COL_NC_EJECUTIVA, COL_NC_COMPRADOR, COL_NC_ESTADO])
+        nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
 
 
 # =============================================================================
@@ -1442,17 +1472,43 @@ def vista_base_datos(datos: dict) -> None:
         tipo, msg = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(msg)
 
-    st.markdown("#### ⬇️ Descargar base actual")
-    st.caption("Descarga el Excel con las tres hojas tal como están hoy. "
-                "Puedes editarlo, agregar nuevas filas y volver a cargarlo.")
-    hoy_str = ahora_mx().strftime("%Y%m%d_%H%M")
-    st.download_button(
-        "⬇️ Descargar datos.xlsx",
-        data=_excel_en_memoria(datos),
-        file_name=f"datos_{hoy_str}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    hay_datos = (datos.get("garantias") is not None and
+                 not datos["garantias"].empty)
+
+    if hay_datos:
+        st.markdown("#### ⬇️ Descargar base actual")
+        st.caption("Descarga el Excel con las tres hojas tal como están hoy. "
+                    "Puedes editarlo, agregar nuevas filas y volver a cargarlo.")
+        hoy_str = ahora_mx().strftime("%Y%m%d_%H%M")
+        try:
+            excel_bytes = _excel_en_memoria(datos)
+            st.download_button(
+                "⬇️ Descargar datos.xlsx",
+                data=excel_bytes,
+                file_name=f"datos_{hoy_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.warning(f"No se pudo generar el Excel para descarga: {e}")
+    else:
+        st.info("📥 **Primera carga:** No hay datos válidos aún. "
+                 "Sube abajo el archivo Excel con las tres hojas requeridas.")
+        # Ofrecer una plantilla vacía descargable para que sepa la estructura
+        try:
+            plantilla_bytes = _excel_en_memoria({"garantias": None,
+                                                  "devoluciones": None,
+                                                  "nc": None})
+            st.download_button(
+                "📄 Descargar plantilla vacía (solo estructura)",
+                data=plantilla_bytes,
+                file_name="plantilla_datos.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Estructura de las tres hojas requeridas, sin datos.",
+            )
+        except Exception:
+            pass
 
     st.divider()
 
