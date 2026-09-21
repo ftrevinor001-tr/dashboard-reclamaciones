@@ -163,6 +163,7 @@ COL_G_RESPUESTA = "RESPUESTA PROVEEDOR TIPO"
 COL_G_NOTAS = "ACCIONES / NOTAS"
 # Columnas de control interno
 COL_G_ESTADO = "ESTADO"                     # activo / cuarentena / resuelto / cancelado
+COL_G_ETAPA = "ETAPA"                       # estatus intermedio del flujo
 COL_G_CUAR_INICIO = "CUARENTENA INICIO"     # fecha entró
 COL_G_CUAR_FIN = "CUARENTENA FIN"           # fecha calculada de liberación
 COL_G_FECHA_RESUELTO = "FECHA RESUELTO"     # cuándo se capturó la NC
@@ -173,6 +174,30 @@ ESTADO_ACTIVO = "Activo"
 ESTADO_CUARENTENA = "Cuarentena"
 ESTADO_RESUELTO = "Resuelto"
 ESTADO_CANCELADO = "Cancelado"
+
+# Estatus intermedios (kanban) para folios de garantía activos
+# Lista ordenada de izquierda a derecha en el tablero de flujo.
+ETAPAS_GARANTIA = [
+    "📝 Reporte recibido",
+    "📤 Reportado al proveedor",
+    "⏳ Esperando respuesta",
+    "✉️ Respuesta recibida",
+    "🚚 En recolección",
+    "🗑️ En destrucción",
+    "📄 Folio devolución/ajuste generado",
+    "📨 Enviado a Cuentas por Pagar",
+]
+ETAPA_GARANTIA_INICIAL = ETAPAS_GARANTIA[0]
+
+# Estatus intermedios para NC pendientes
+ETAPAS_NC = [
+    "📥 Reporte recibido",
+    "📤 Solicitada al proveedor",
+    "🔍 En revisión del proveedor",
+    "✏️ Autorizada por proveedor",
+    "📄 Emitida (pendiente timbrar)",
+]
+ETAPA_NC_INICIAL = ETAPAS_NC[0]
 
 # --- Columnas de la hoja 2: FOLIOS DE DEVOLUCIÓN ---
 COL_D_FOLIO = "Folio"
@@ -204,6 +229,7 @@ COL_NC_OBSERVACIONES = "OBSERVACIONES"
 COL_NC_EJECUTIVA = "EJECUTIVA"
 COL_NC_COMPRADOR = "COMPRADOR"
 COL_NC_ESTADO = "ESTADO"  # pendiente / resuelto / cancelado
+COL_NC_ETAPA = "ETAPA"    # estatus intermedio del flujo
 
 
 def _normalizar_encabezados(df: pd.DataFrame) -> pd.DataFrame:
@@ -246,6 +272,7 @@ def cargar_datos(ruta: str, _version: int) -> dict:
             (COL_G_CUAR_FIN, pd.NaT),
             (COL_G_FECHA_RESUELTO, pd.NaT),
             (COL_G_MODIFICADO, ""),
+            (COL_G_ETAPA, ""),
         ]:
             if col not in g.columns:
                 g[col] = default
@@ -304,6 +331,34 @@ def cargar_datos(ruta: str, _version: int) -> dict:
                     else str(v).strip())
                 # Quitar el ".0" que agrega pandas a los enteros de Excel
                 g[col] = g[col].str.replace(r"\.0$", "", regex=True)
+
+        # ETAPA (estatus intermedio del flujo). Solo aplica a folios Activos.
+        # Si vacía, se infiere del avance ya capturado:
+        #   tiene folio devolución/ajuste  → "Folio devolución/ajuste generado"
+        #   respuesta = Destrucción         → "En destrucción"
+        #   respuesta = Recolección         → "En recolección"
+        #   respuesta = otra                → "Respuesta recibida"
+        #   sin respuesta                    → "Reporte recibido" (inicio)
+        g[COL_G_ETAPA] = g[COL_G_ETAPA].fillna("").astype(str).str.strip()
+        vacia_etapa = g[COL_G_ETAPA] == ""
+        activos = g[COL_G_ESTADO] == ESTADO_ACTIVO
+        tiene_folio_dev = g[COL_G_FOLIO_DEV].astype(str).str.strip() != ""
+        tiene_folio_aj = g[COL_G_FOLIO_AJUSTE].astype(str).str.strip() != ""
+        respuesta = g[COL_G_RESPUESTA].astype(str).str.strip().str.lower()
+        # Prioridad de inferencia
+        g.loc[vacia_etapa & activos & (tiene_folio_dev | tiene_folio_aj),
+              COL_G_ETAPA] = "📄 Folio devolución/ajuste generado"
+        aun = g[COL_G_ETAPA] == ""
+        g.loc[aun & activos & (respuesta == "destrucción"),
+              COL_G_ETAPA] = "🗑️ En destrucción"
+        aun = g[COL_G_ETAPA] == ""
+        g.loc[aun & activos & (respuesta == "recolección"),
+              COL_G_ETAPA] = "🚚 En recolección"
+        aun = g[COL_G_ETAPA] == ""
+        g.loc[aun & activos & respuesta.isin(["sin respuesta", ""]),
+              COL_G_ETAPA] = ETAPA_GARANTIA_INICIAL
+        aun = g[COL_G_ETAPA] == ""
+        g.loc[aun & activos, COL_G_ETAPA] = "✉️ Respuesta recibida"
 
         # Inicio de cuarentena si le falta
         m_cuar = (g[COL_G_ESTADO] == ESTADO_CUARENTENA) & (g[COL_G_CUAR_INICIO].isna())
@@ -365,6 +420,7 @@ def cargar_datos(ruta: str, _version: int) -> dict:
         for col, default in [
             (COL_NC_FECHA_REPORTE, pd.NaT),
             (COL_NC_ESTADO, ""),
+            (COL_NC_ETAPA, ""),
         ]:
             if col not in nc.columns:
                 nc[col] = default
@@ -391,6 +447,11 @@ def cargar_datos(ruta: str, _version: int) -> dict:
         con_nc_e = nc[COL_NC_FECHA_NC].notna()
         nc.loc[vacio_e & con_nc_e, COL_NC_ESTADO] = "Resuelto"
         nc.loc[vacio_e & ~con_nc_e, COL_NC_ESTADO] = "Pendiente"
+        # ETAPA inicial: pendientes empiezan en el paso 1 si vacía
+        nc[COL_NC_ETAPA] = nc[COL_NC_ETAPA].fillna("").astype(str).str.strip()
+        vacia_nc = nc[COL_NC_ETAPA] == ""
+        pendientes = nc[COL_NC_ESTADO] == "Pendiente"
+        nc.loc[vacia_nc & pendientes, COL_NC_ETAPA] = ETAPA_NC_INICIAL
         nc["MES ETIQUETA"] = nc[COL_NC_FECHA_REPORTE].apply(etiqueta_mes)
         resultado["nc"] = nc
 
@@ -398,26 +459,57 @@ def cargar_datos(ruta: str, _version: int) -> dict:
 
 
 def guardar_excel(datos: dict, ruta: str) -> None:
-    """Sobrescribe el Excel con las tres hojas."""
+    """Sobrescribe el Excel con las tres hojas.
+
+    Si alguna hoja viene vacía (None), se escribe una hoja mínima con solo los
+    encabezados para no romper el writer (openpyxl no admite libros vacíos).
+    """
     with pd.ExcelWriter(ruta, engine="openpyxl",
                         datetime_format="DD/MM/YYYY",
                         date_format="DD/MM/YYYY") as writer:
-        if datos.get("garantias") is not None:
-            g = datos["garantias"].copy()
-            g = g.drop(columns=["MES ETIQUETA"], errors="ignore")
-            g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
-        if datos.get("devoluciones") is not None:
-            d = datos["devoluciones"].copy()
-            d = d.drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
-            d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
-        if datos.get("nc") is not None:
-            nc = datos["nc"].copy()
-            nc = nc.drop(columns=["MES ETIQUETA"], errors="ignore")
-            # Restaurar el nombre largo de la observación
+        # Garantías (siempre escribir algo, aunque sea plantilla vacía)
+        g = datos.get("garantias")
+        if g is not None:
+            g = g.copy().drop(columns=["MES ETIQUETA"], errors="ignore")
+        else:
+            g = pd.DataFrame(columns=[
+                COL_G_MES, COL_G_FOLIO, COL_G_ID, COL_G_PROVEEDOR, COL_G_CARTA,
+                COL_G_IMPORTE, COL_G_COMPRADOR, COL_G_FECHA_CORTE,
+                COL_G_FECHA_RECEPCION, COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE,
+                COL_G_NOTA_CREDITO, COL_G_RESPUESTA, COL_G_NOTAS,
+                COL_G_ESTADO, COL_G_ETAPA, COL_G_CUAR_INICIO, COL_G_CUAR_FIN,
+                COL_G_FECHA_RESUELTO, COL_G_MODIFICADO])
+        g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
+
+        # Devoluciones
+        d = datos.get("devoluciones")
+        if d is not None:
+            d = d.copy().drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
+        else:
+            d = pd.DataFrame(columns=[
+                COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR, COL_D_TOTAL,
+                COL_D_PENDIENTE, COL_D_APLICADO_MXN, COL_D_APLICADO_EST,
+                COL_D_RESOLUCION, COL_D_TIPO_CLIENTE, COL_D_EJECUTIVO,
+                COL_D_COMPRADOR, COL_D_ESTADO, COL_D_NOTAS])
+        d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
+
+        # NC
+        nc = datos.get("nc")
+        if nc is not None:
+            nc = nc.copy().drop(columns=["MES ETIQUETA"], errors="ignore")
             nc = nc.rename(columns={
                 COL_NC_OBSERVACIONES:
                 "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC"})
-            nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
+        else:
+            nc = pd.DataFrame(columns=[
+                COL_NC_ENTRADA, COL_NC_FECHA_FACTURA, COL_NC_FECHA_REPORTE,
+                COL_NC_FISCAL, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
+                COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE, COL_NC_FECHA_NC,
+                COL_NC_FOLIO_NC,
+                "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC",
+                COL_NC_EJECUTIVA, COL_NC_COMPRADOR, COL_NC_ESTADO,
+                COL_NC_ETAPA])
+        nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
 
 
 # =============================================================================
@@ -1082,12 +1174,19 @@ def vista_garantias(datos: dict) -> None:
         tipo, msg = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(msg)
 
-    # ---- Filtro adicional por estado (solo aquí) ----
+    # ---- Filtros adicionales: por estado y por etapa del flujo ----
+    c_e1, c_e2 = st.columns(2)
     estados_disp = ["Todos", ESTADO_ACTIVO, ESTADO_CUARENTENA,
                     ESTADO_RESUELTO, ESTADO_CANCELADO]
-    f_estado = st.selectbox("Estado", estados_disp, key="g_estado")
+    f_estado = c_e1.selectbox("Estado", estados_disp, key="g_estado")
+
+    etapas_disp = ["Todas"] + ETAPAS_GARANTIA
+    f_etapa = c_e2.selectbox("Etapa del flujo", etapas_disp, key="g_etapa",
+                              help="Filtra por el estatus intermedio del proceso.")
 
     df_e = df if f_estado == "Todos" else df[df[COL_G_ESTADO] == f_estado]
+    if f_etapa != "Todas":
+        df_e = df_e[df_e[COL_G_ETAPA] == f_etapa]
 
     # ---- Filtros comunes ----
     df_f, etiq = _filtros_barra(
@@ -1117,7 +1216,7 @@ def vista_garantias(datos: dict) -> None:
 
     cols = ["🚦", COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_COMPRADOR,
             COL_G_IMPORTE, COL_G_FECHA_RECEPCION, "Vence",
-            "Días transc.", "Días restantes", COL_G_ESTADO,
+            "Días transc.", "Días restantes", COL_G_ESTADO, COL_G_ETAPA,
             COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE, COL_G_NOTA_CREDITO]
     st.dataframe(
         vista[cols], use_container_width=True, hide_index=True,
@@ -1127,6 +1226,7 @@ def vista_garantias(datos: dict) -> None:
             COL_G_FECHA_RECEPCION: st.column_config.DateColumn(
                 "Recepción", format="DD/MM/YYYY"),
             "Vence": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            COL_G_ETAPA: "Etapa del flujo",
             COL_G_FOLIO_DEV: "F. Devolución",
             COL_G_FOLIO_AJUSTE: "F. Ajuste",
             COL_G_NOTA_CREDITO: "Nota Crédito",
@@ -1198,9 +1298,20 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
         opciones_resp = ["", "Recolección", "Destrucción", "Sin respuesta"]
         actual_resp = str(fila.get(COL_G_RESPUESTA, "") or "")
         idx_resp = opciones_resp.index(actual_resp) if actual_resp in opciones_resp else 0
-        respuesta = st.selectbox(
+
+        c_r1, c_r2 = st.columns(2)
+        respuesta = c_r1.selectbox(
             "Respuesta del proveedor", options=opciones_resp,
             index=idx_resp)
+
+        # Selector de ETAPA (estatus intermedio del flujo)
+        actual_etapa = str(fila.get(COL_G_ETAPA, "") or "")
+        idx_etapa = (ETAPAS_GARANTIA.index(actual_etapa)
+                     if actual_etapa in ETAPAS_GARANTIA else 0)
+        etapa = c_r2.selectbox(
+            "Etapa del flujo", options=ETAPAS_GARANTIA,
+            index=idx_etapa,
+            help="Marca en qué punto del proceso va este folio.")
 
         notas = st.text_area("Notas / acciones",
                               value=str(fila.get(COL_G_NOTAS, "") or ""),
@@ -1223,6 +1334,7 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
             COL_G_FOLIO_AJUSTE: folio_aj.strip(),
             COL_G_NOTA_CREDITO: nota_cred.strip(),
             COL_G_RESPUESTA: respuesta,
+            COL_G_ETAPA: etapa,
             COL_G_NOTAS: notas.strip(),
         }
         if nota_cred.strip():
@@ -1437,12 +1549,19 @@ def vista_nc_pendientes(datos: dict) -> None:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ---- Filtro adicional: mostrar resueltas ----
-    ver_resueltas = st.checkbox("Mostrar también resueltas", value=False,
-                                 key="nc_ver_res")
+    # ---- Filtros adicionales ----
+    c_a1, c_a2 = st.columns([1, 2])
+    ver_resueltas = c_a1.checkbox("Mostrar también resueltas", value=False,
+                                    key="nc_ver_res")
+    etapas_disp = ["Todas"] + ETAPAS_NC
+    f_etapa_nc = c_a2.selectbox("Etapa del flujo", etapas_disp,
+                                  key="nc_etapa",
+                                  help="Filtra por el estatus intermedio de la NC.")
 
     df_base = df if ver_resueltas else df[df[COL_NC_ESTADO] != "Resuelto"]
     df_base = df_base[df_base[COL_NC_ESTADO] != "Cancelado"]
+    if f_etapa_nc != "Todas":
+        df_base = df_base[df_base[COL_NC_ETAPA] == f_etapa_nc]
 
     # ---- Filtros comunes ----
     df_f, etiq = _filtros_barra(
@@ -1466,7 +1585,7 @@ def vista_nc_pendientes(datos: dict) -> None:
     cols = ["🚦", COL_NC_ENTRADA, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
             COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE,
             COL_NC_FECHA_REPORTE, "Días transc.", "Días restantes",
-            COL_NC_FECHA_NC, COL_NC_FOLIO_NC, COL_NC_ESTADO,
+            COL_NC_FECHA_NC, COL_NC_FOLIO_NC, COL_NC_ESTADO, COL_NC_ETAPA,
             COL_NC_COMPRADOR, COL_NC_OBSERVACIONES]
     cols = [c for c in cols if c in vista.columns]
     st.dataframe(
@@ -1480,6 +1599,7 @@ def vista_nc_pendientes(datos: dict) -> None:
                 "Fecha recepción", format="DD/MM/YYYY"),
             COL_NC_FECHA_NC: st.column_config.DateColumn(
                 "Fecha NC", format="DD/MM/YYYY"),
+            COL_NC_ETAPA: "Etapa del flujo",
             COL_NC_FOLIO_NC: "Folio NC",
         },
     )
@@ -1530,9 +1650,18 @@ def _editor_nc(fila: pd.Series, datos: dict) -> None:
             value=fecha_nc_actual is not None,
             key=f"cap_nc_{fila[COL_NC_ENTRADA]}")
 
-        folio_nc = st.text_input(
+        c_nc1, c_nc2 = st.columns(2)
+        folio_nc = c_nc1.text_input(
             "Folio de la nota de crédito",
             value=str(fila.get(COL_NC_FOLIO_NC, "") or ""))
+
+        # Selector de ETAPA
+        actual_etapa_nc = str(fila.get(COL_NC_ETAPA, "") or "")
+        idx_etapa_nc = (ETAPAS_NC.index(actual_etapa_nc)
+                        if actual_etapa_nc in ETAPAS_NC else 0)
+        etapa_nc = c_nc2.selectbox(
+            "Etapa del flujo", options=ETAPAS_NC, index=idx_etapa_nc,
+            help="Marca en qué punto va la gestión de esta NC.")
 
         observ = st.text_area(
             "Observaciones (qué se está haciendo para conseguirla)",
@@ -1550,6 +1679,7 @@ def _editor_nc(fila: pd.Series, datos: dict) -> None:
         cambios = {
             COL_NC_FECHA_REPORTE: pd.Timestamp(fecha_recep),
             COL_NC_FOLIO_NC: folio_nc.strip(),
+            COL_NC_ETAPA: etapa_nc,
             COL_NC_OBSERVACIONES: observ.strip(),
         }
         if capturar_nc:
@@ -1840,8 +1970,252 @@ automáticamente y se sincronizan con el repositorio.
 
 
 # =============================================================================
-# 13. MAIN
+# 13. TABLERO DE FLUJO (KANBAN)
 # =============================================================================
+#
+#   Vista de flujo tipo Kanban. Cada columna es una etapa del proceso. Las
+#   tarjetas son folios (o NC). Se puede arrastrar entre columnas si está
+#   instalado el paquete `streamlit-sortables`. Si no, se muestra el mismo
+#   layout con un menú "Mover a" en cada tarjeta.
+
+
+def vista_kanban(datos: dict) -> None:
+    """Tablero de flujo tipo Kanban VISUAL: columnas por etapa con tarjetas.
+
+    En cada tarjeta hay un selector "Mover a" para cambiarla de etapa. No
+    requiere paquetes externos y no genera commits al rozar la pantalla.
+    """
+    st.markdown("### 🔄 Tablero de flujo")
+    st.caption("Cada columna es una etapa del proceso. En cada tarjeta puedes "
+                "usar el selector para moverla a otra etapa. Solo se muestran "
+                "folios/NC en proceso (no resueltos ni cancelados).")
+
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
+
+    tipo = st.radio(
+        "Tipo de flujo",
+        ["📋 Folios de Garantía", "💳 NC Pendientes"],
+        horizontal=True, key="kanban_tipo")
+
+    st.divider()
+
+    if tipo == "📋 Folios de Garantía":
+        _kanban_garantias(datos)
+    else:
+        _kanban_nc(datos)
+
+
+def _kanban_garantias(datos: dict) -> None:
+    df = datos.get("garantias")
+    if df is None:
+        st.info("No hay folios de garantía cargados.")
+        return
+
+    df_act = df[df[COL_G_ESTADO] == ESTADO_ACTIVO].copy()
+    if df_act.empty:
+        st.info("No hay folios activos para mostrar en el flujo.")
+        return
+
+    # Filtro por proveedor
+    proveedores = sorted([p for p in df_act[COL_G_PROVEEDOR].dropna().unique()
+                          if str(p).strip()])
+    f_prov = st.multiselect("Filtrar por proveedor", options=proveedores,
+                              placeholder="Todos", key="kg_prov")
+    if f_prov:
+        df_act = df_act[df_act[COL_G_PROVEEDOR].isin(f_prov)]
+
+    # Normalizar la etapa
+    df_act[COL_G_ETAPA] = df_act[COL_G_ETAPA].fillna(ETAPA_GARANTIA_INICIAL)
+    df_act.loc[~df_act[COL_G_ETAPA].isin(ETAPAS_GARANTIA), COL_G_ETAPA] = \
+        ETAPA_GARANTIA_INICIAL
+
+    st.caption(f"**{len(df_act)}** folio(s) activo(s) en el flujo · "
+                f"Monto total: **{_fmt_mxn(df_act[COL_G_IMPORTE].sum())}**")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Layout: una columna por etapa
+    cols = st.columns(len(ETAPAS_GARANTIA))
+    for i, etapa in enumerate(ETAPAS_GARANTIA):
+        with cols[i]:
+            grupo = df_act[df_act[COL_G_ETAPA] == etapa]
+            # Encabezado de columna
+            st.markdown(
+                f"<div style='background:#1f4e79;color:white;padding:0.5rem;"
+                f"border-radius:6px 6px 0 0;text-align:center;font-weight:600;"
+                f"font-size:0.72rem;line-height:1.2'>"
+                f"{etapa}<br>"
+                f"<span style='color:#cbd5e1;font-size:0.7rem;font-weight:400'>"
+                f"{len(grupo)} folio(s) · {_fmt_mxn(grupo[COL_G_IMPORTE].sum())}"
+                f"</span></div>",
+                unsafe_allow_html=True)
+            _render_tarjetas_garantia(grupo, etapa, datos)
+
+
+def _render_tarjetas_garantia(grupo: pd.DataFrame, etapa_actual: str,
+                                 datos: dict) -> None:
+    """Renderiza las tarjetas de una columna del kanban de garantías."""
+    if grupo.empty:
+        st.markdown(
+            "<div style='color:#94a3b8;text-align:center;padding:1rem;"
+            "font-size:0.75rem;font-style:italic'>Vacío</div>",
+            unsafe_allow_html=True)
+        return
+
+    # Ordenar por días transcurridos (más urgentes primero)
+    grupo = grupo.copy()
+    grupo["_dias"] = grupo.apply(dias_transcurridos_garantia, axis=1)
+    grupo = grupo.sort_values("_dias", ascending=False)
+
+    # Mostrar hasta 30 tarjetas por columna (evita saturar la pantalla)
+    LIMITE = 30
+    for _, r in grupo.head(LIMITE).iterrows():
+        icono, _ = semaforo_garantia(r)
+        restantes = dias_restantes_garantia(r) or 0
+        color_dias = ("#dc2626" if restantes < 0
+                       else "#ea580c" if restantes <= 15
+                       else "#059669")
+        etiqueta_dias = (f"{abs(restantes)}d vencido" if restantes < 0
+                          else f"{restantes}d restantes")
+
+        st.markdown(
+            f"<div style='background:white;padding:0.5rem;"
+            f"border:1px solid #e5e7eb;border-radius:4px;"
+            f"margin-bottom:0.4rem;font-size:0.72rem;line-height:1.3'>"
+            f"<div style='display:flex;justify-content:space-between;"
+            f"align-items:center'>"
+            f"<b>{icono} {r[COL_G_FOLIO]}</b>"
+            f"<span style='color:{color_dias};font-size:0.68rem;"
+            f"font-weight:600'>{etiqueta_dias}</span>"
+            f"</div>"
+            f"<div style='color:#4b5563;margin-top:0.2rem'>"
+            f"{str(r[COL_G_PROVEEDOR])[:28]}</div>"
+            f"<div style='color:#0f766e;font-weight:600;margin-top:0.15rem'>"
+            f"{_fmt_mxn(r[COL_G_IMPORTE])}</div>"
+            f"</div>",
+            unsafe_allow_html=True)
+
+        # Selector "Mover a" (solo si hay otras etapas donde moverla)
+        opciones = ["— Mover a…"] + [e for e in ETAPAS_GARANTIA
+                                        if e != etapa_actual]
+        key_sel = f"mv_g_{r[COL_G_FOLIO]}"
+        seleccion = st.selectbox("", options=opciones, key=key_sel,
+                                    label_visibility="collapsed")
+        if seleccion != "— Mover a…":
+            df = datos["garantias"]
+            m = df[COL_G_FOLIO] == r[COL_G_FOLIO]
+            df.loc[m, COL_G_ETAPA] = seleccion
+            df.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+            persistir(datos,
+                        f"Kanban: folio {r[COL_G_FOLIO]} → {seleccion}",
+                        f"Folio {r[COL_G_FOLIO]} movido a: {seleccion}")
+
+    if len(grupo) > LIMITE:
+        st.caption(f"+ {len(grupo) - LIMITE} más (usa filtro por proveedor)")
+
+
+def _kanban_nc(datos: dict) -> None:
+    df = datos.get("nc")
+    if df is None:
+        st.info("No hay notas de crédito cargadas.")
+        return
+
+    df_pend = df[df[COL_NC_ESTADO] == "Pendiente"].copy()
+    if df_pend.empty:
+        st.info("No hay NC pendientes para mostrar en el flujo.")
+        return
+
+    proveedores = sorted([p for p in df_pend[COL_NC_PROVEEDOR].dropna().unique()
+                          if str(p).strip()])
+    f_prov = st.multiselect("Filtrar por proveedor", options=proveedores,
+                              placeholder="Todos", key="knc_prov")
+    if f_prov:
+        df_pend = df_pend[df_pend[COL_NC_PROVEEDOR].isin(f_prov)]
+
+    df_pend[COL_NC_ETAPA] = df_pend[COL_NC_ETAPA].fillna(ETAPA_NC_INICIAL)
+    df_pend.loc[~df_pend[COL_NC_ETAPA].isin(ETAPAS_NC), COL_NC_ETAPA] = \
+        ETAPA_NC_INICIAL
+
+    st.caption(f"**{len(df_pend)}** NC pendiente(s) · "
+                f"Monto: **{_fmt_mxn(df_pend[COL_NC_IMP_PENDIENTE].sum())}**")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    cols = st.columns(len(ETAPAS_NC))
+    for i, etapa in enumerate(ETAPAS_NC):
+        with cols[i]:
+            grupo = df_pend[df_pend[COL_NC_ETAPA] == etapa]
+            st.markdown(
+                f"<div style='background:#ea580c;color:white;padding:0.5rem;"
+                f"border-radius:6px 6px 0 0;text-align:center;font-weight:600;"
+                f"font-size:0.72rem;line-height:1.2'>"
+                f"{etapa}<br>"
+                f"<span style='color:#fed7aa;font-size:0.7rem;font-weight:400'>"
+                f"{len(grupo)} NC · "
+                f"{_fmt_mxn(grupo[COL_NC_IMP_PENDIENTE].sum())}"
+                f"</span></div>",
+                unsafe_allow_html=True)
+            _render_tarjetas_nc(grupo, etapa, datos)
+
+
+def _render_tarjetas_nc(grupo: pd.DataFrame, etapa_actual: str,
+                          datos: dict) -> None:
+    if grupo.empty:
+        st.markdown(
+            "<div style='color:#94a3b8;text-align:center;padding:1rem;"
+            "font-size:0.75rem;font-style:italic'>Vacío</div>",
+            unsafe_allow_html=True)
+        return
+
+    grupo = grupo.copy()
+    grupo["_dias"] = grupo.apply(dias_transcurridos_nc, axis=1)
+    grupo = grupo.sort_values("_dias", ascending=False)
+
+    LIMITE = 30
+    for _, r in grupo.head(LIMITE).iterrows():
+        icono, _ = semaforo_nc(r)
+        restantes = dias_restantes_nc(r) or 0
+        color_dias = ("#dc2626" if restantes < 0
+                       else "#ea580c" if restantes <= 5
+                       else "#059669")
+        etiqueta_dias = (f"{abs(restantes)}d vencida" if restantes < 0
+                          else f"{restantes}d restantes")
+
+        st.markdown(
+            f"<div style='background:white;padding:0.5rem;"
+            f"border:1px solid #e5e7eb;border-radius:4px;"
+            f"margin-bottom:0.4rem;font-size:0.72rem;line-height:1.3'>"
+            f"<div style='display:flex;justify-content:space-between;"
+            f"align-items:center'>"
+            f"<b>{icono} {r[COL_NC_ENTRADA]}</b>"
+            f"<span style='color:{color_dias};font-size:0.68rem;"
+            f"font-weight:600'>{etiqueta_dias}</span>"
+            f"</div>"
+            f"<div style='color:#4b5563;margin-top:0.2rem'>"
+            f"{str(r[COL_NC_PROVEEDOR])[:28]}</div>"
+            f"<div style='color:#ea580c;font-weight:600;margin-top:0.15rem'>"
+            f"{_fmt_mxn(r[COL_NC_IMP_PENDIENTE])}</div>"
+            f"</div>",
+            unsafe_allow_html=True)
+
+        opciones = ["— Mover a…"] + [e for e in ETAPAS_NC
+                                        if e != etapa_actual]
+        key_sel = f"mv_nc_{r[COL_NC_ENTRADA]}"
+        seleccion = st.selectbox("", options=opciones, key=key_sel,
+                                    label_visibility="collapsed")
+        if seleccion != "— Mover a…":
+            df = datos["nc"]
+            m = df[COL_NC_ENTRADA] == r[COL_NC_ENTRADA]
+            df.loc[m, COL_NC_ETAPA] = seleccion
+            persistir(datos,
+                        f"Kanban NC: {r[COL_NC_ENTRADA]} → {seleccion}",
+                        f"NC {r[COL_NC_ENTRADA]} movida a: {seleccion}")
+
+    if len(grupo) > LIMITE:
+        st.caption(f"+ {len(grupo) - LIMITE} más (usa filtro por proveedor)")
+
 
 def main() -> None:
     if not verificar_acceso():
@@ -1885,6 +2259,7 @@ def main() -> None:
 
     tabs = st.tabs([
         "📊 Tablero directivo",
+        "🔄 Flujo (Kanban)",
         "📋 Folios de garantía",
         "🧊 Cuarentena",
         "💳 NC pendientes",
@@ -1895,16 +2270,18 @@ def main() -> None:
     with tabs[0]:
         vista_tablero(datos)
     with tabs[1]:
-        vista_garantias(datos)
+        vista_kanban(datos)
     with tabs[2]:
-        vista_cuarentena(datos)
+        vista_garantias(datos)
     with tabs[3]:
-        vista_nc_pendientes(datos)
+        vista_cuarentena(datos)
     with tabs[4]:
-        vista_devoluciones_sueltas(datos)
+        vista_nc_pendientes(datos)
     with tabs[5]:
-        vista_base_datos(datos)
+        vista_devoluciones_sueltas(datos)
     with tabs[6]:
+        vista_base_datos(datos)
+    with tabs[7]:
         vista_guia()
 
 
