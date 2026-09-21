@@ -1,26 +1,32 @@
 # =============================================================================
-#  DASHBOARD DE DEVOLUCIONES Y RECLAMACIONES — Seguimiento por etapas
+#  SEGUIMIENTO A DEVOLUCIONES — REDISEÑO 2026-09
 #  -----------------------------------------------------------------------------
-#  Aplicación Streamlit que gestiona el ciclo de vida completo de una
-#  reclamación a través de 4 etapas encadenadas (máquina de estados):
+#  Aplicación Streamlit que sustituye por completo el modelo anterior por
+#  etapas. Ahora:
 #
-#     1) Reporte de reclamo   (7 días)
-#     2) Gestión              (30 días)
-#     3) Disposición final    (recolección con contador de 20 días / destrucción)
-#     4) Cuentas por pagar    (53 días) — cierra el proceso
+#    - Cada folio se mide de extremo a extremo (recepción → nota de crédito)
+#      con 90 días como plazo total.
+#    - Un folio queda RESUELTO cuando se captura su NOTA DE CRÉDITO.
+#    - Cuarentena automática para folios ≤ $300 (30 días); al vencer se
+#      liberan solos y ahí empiezan los 90 días.
+#    - Se agrega la pestaña "Notas de Crédito Pendientes" (medición: 20 días
+#      desde la fecha de recepción del reporte hasta el envío a admin).
+#    - Toda la gestión la lleva una sola persona → solo una contraseña de
+#      acceso, sin claves para modificar/reactivar/liberar.
 #
-#  Cada etapa registra fecha y usuario de cada estatus, observaciones, y al
-#  cerrarse bloquea su pestaña y activa la siguiente. Las etapas se pueden
-#  reabrir con la clave de reactivación. Los cambios se guardan en datos.xlsx
-#  y se suben automáticamente a GitHub con GitPython.
-#
-#  El identificador único de cada reclamación es FOLIO REPORTE.
+#  Fuentes de datos: un solo Excel con TRES hojas:
+#     1) "datos- FOLIO DE GARANTIA"          → folios de garantía (Pestaña 2)
+#     2) "FOLIOS DE DEVOLUCION-GARANTIA"     → folios sueltos de devolución
+#     3) "NC PENDIENTES"                     → notas de crédito por conceptos
+#                                              varios (Pestaña 3)
 # =============================================================================
 
 from __future__ import annotations
 
 import os
+import io
 from datetime import datetime, date, timedelta
+
 try:
     from zoneinfo import ZoneInfo
     ZONA_MX = ZoneInfo("America/Mexico_City")
@@ -31,32 +37,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Altair viene incluido con Streamlit; se usa para dar formato a los ejes y a
-# las etiquetas emergentes de las gráficas (separador de miles y moneda).
 try:
     import altair as alt
     ALTAIR_OK = True
 except Exception:
     ALTAIR_OK = False
 
-
-def hoy_mx() -> date:
-    """Fecha actual en la zona horaria de México (evita el desfase por UTC).
-
-    Streamlit Cloud corre en UTC; sin esto, en las tardes/noches de México
-    la app graba la fecha del día siguiente.
-    """
-    if ZONA_MX is not None:
-        return datetime.now(ZONA_MX).date()
-    # Respaldo: UTC menos 6 horas (horario del centro de México)
-    return (datetime.utcnow() - timedelta(hours=6)).date()
-
-
-def ahora_mx() -> datetime:
-    """Fecha y hora actual en la zona horaria de México (sin tzinfo, para logs)."""
-    if ZONA_MX is not None:
-        return datetime.now(ZONA_MX).replace(tzinfo=None)
-    return datetime.utcnow() - timedelta(hours=6)
 
 # =============================================================================
 # 1. CONFIGURACIÓN GENERAL Y CONSTANTES
@@ -71,168 +57,42 @@ st.set_page_config(
 
 RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
 RUTA_EXCEL = os.path.join(RUTA_BASE, "datos.xlsx")
-NOMBRE_HOJA = "datos"
 
-# Clave para las acciones protegidas (reactivar etapas, ajuste manual de fechas
-# y corrección de modalidad).
-#
-# Se lee de los secretos de Streamlit: CLAVE_REACTIVACION. Si no está definida
-# ahí, se usa la clave de respaldo de abajo. Para cambiarla sin tocar el código,
-# agrégala en Streamlit Cloud: ⋮ → Settings → Secrets
-#     CLAVE_REACTIVACION = "TuNuevaClave"
-CLAVE_REACTIVACION_RESPALDO = "devoluciones2026"
+# --- Hojas del Excel ---
+HOJA_GARANTIAS = "datos- FOLIO DE GARANTIA"
+HOJA_DEVOLUCIONES = "FOLIOS DE DEVOLUCION-GARANTIA"
+HOJA_NC = "NC PENDIENTES"
 
-
-def clave_autorizacion() -> str:
-    """Devuelve la clave para desbloquear acciones protegidas."""
-    return st.secrets.get("CLAVE_REACTIVACION", CLAVE_REACTIVACION_RESPALDO)
-
-# --- Columnas base (encabezados normalizados a MAYÚSCULAS sin saltos) ---
-COL_MES = "MES DE DEVOLUCION"
-COL_MES_ETIQUETA = "MES (ETIQUETA)"
-COL_FOLIO = "FOLIO REPORTE"          # identificador principal
-COL_ID = "ID"
-COL_PROVEEDOR = "PROVEEDOR"
-COL_CARTA_FIRMADA = "CARTA FIRMADA"  # informativo
-COL_IMPORTE = "IMPORTE (MXN)"
-COL_COMPRADOR = "COMPRADOR"
-COL_FECHA_CORTE = "FECHA CORTE"      # fecha de inicio para contar días
-COL_NOTAS = "ACCIONES / NOTAS"
-
-# --- Estado global de la reclamación ---
-COL_ETAPA = "ETAPA ACTUAL"
-COL_RESPUESTA_TIPO = "RESPUESTA PROVEEDOR TIPO"
-COL_MODIFICADO_POR = "MODIFICADO POR"
-COL_FECHA_MODIFICACION = "FECHA MODIFICACIÓN"
-
-# Nombres de las etapas
-ETAPA_1 = "Reporte de reclamo"
-ETAPA_2 = "Gestión"
-ETAPA_3 = "Cuentas por pagar"
-ETAPA_4 = "Disposición final"
-ETAPA_CUARENTENA = "Cuarentena"
-
-# Actores responsables de las etapas:
-#   - Jefatura de incidencias: Reporte de reclamo, Disposición final, Cuentas por pagar
-#   - Compradores (con nombre): Gestión
-ACTOR_JEFATURA = "Jefatura de incidencias"
-ACTOR_COMPRADORES = "Compradores"
-ETAPAS_JEFATURA = [ETAPA_1, ETAPA_4, ETAPA_3]  # en orden de flujo
-ETAPA_COMPRADORES = ETAPA_2
-
-# Nombres antiguos que puedan existir en la base de datos, para migrarlos
-# automáticamente al cargar (evita que aparezcan etiquetas obsoletas en
-# tablas, filtros y gráficas).
-NOMBRES_ETAPA_ANTIGUOS = {
-    "Destino final": ETAPA_4,
-    "DESTINO FINAL": ETAPA_4,
-    "Destino Final": ETAPA_4,
-}
-ETAPA_FINAL = "FINALIZADO"
-
-# --- Cuarentena: reclamaciones de importe bajo que se acumulan por proveedor ---
-# Las reclamaciones con importe menor o igual a este monto entran a Cuarentena
-# de forma automática, para juntarlas con otras del mismo proveedor y superar el
-# umbral antes de reclamar formalmente.
+# --- Umbrales del proceso ---
+DIAS_PLAZO_TOTAL = 90     # plazo total de un folio de garantía
+DIAS_PLAZO_NC = 20        # plazo para gestionar una nota de crédito pendiente
+DIAS_POR_VENCER = 15      # ventana amarilla antes del vencimiento
+DIAS_POR_VENCER_NC = 5    # ventana amarilla para NC (plazo más corto)
 UMBRAL_CUARENTENA = 300.0
-DIAS_CUARENTENA_DEFECTO = 30  # duración sugerida si el admin no especifica otra
+DIAS_CUARENTENA = 30
 
-# Duraciones (días) de cada etapa.
-DIAS_ETAPA_1 = 7    # desde FECHA CORTE
-DIAS_ETAPA_2 = 30   # desde el vencimiento de la etapa 1
-DIAS_ETAPA_3 = 53   # desde el vencimiento de la etapa 2
-DIAS_VENCIMIENTO_TOTAL = 90  # desde FECHA CORTE: vencimiento global del reclamo
-MSG_VENCIDO_90 = "RECLAMO VENCIDO SIN DEFINICIÓN, ENVIAR A DESTRUCCIÓN"
-DIAS_RECOLECCION = 20  # desde que se define la recolección (etapa 4)
-
-# Tipos de respuesta del proveedor (etapa 2)
-RESP_RECOLECCION = "Recolección"
-RESP_DESTRUCCION = "Destrucción"
-RESP_SIN = "Sin respuesta"
-
-# --- Pasos (estatus) de cada etapa, en orden ---
-# Cada paso: (clave, etiqueta, col_fecha, col_usuario)
-PASOS_E1 = [
-    ("recepcion", "Recepción de Folio", "E1 FECHA RECEPCION FOLIO", "E1 USUARIO RECEPCION"),
-    ("revision", "Revisión de folio", "E1 FECHA REVISION FOLIO", "E1 USUARIO REVISION"),
-    ("envio", "Envío a proveedores", "E1 FECHA ENVIO PROVEEDORES", "E1 USUARIO ENVIO"),
-]
-PASOS_E2 = [
-    ("enviado", "Enviado a proveedor", "E2 FECHA ENVIADO PROVEEDOR", "E2 USUARIO ENVIADO"),
-    ("seguimiento", "Seguimiento", "E2 FECHA SEGUIMIENTO", "E2 USUARIO SEGUIMIENTO"),
-    ("respuesta", "Respuesta de proveedor", "E2 FECHA RESPUESTA", "E2 USUARIO RESPUESTA"),
-]
-PASOS_E3 = [
-    ("seguimiento", "Seguimiento", "E3 FECHA SEGUIMIENTO", "E3 USUARIO SEGUIMIENTO"),
-    ("recepcion_nc", "Recepción de nota de crédito", "E3 FECHA RECEPCION NC", "E3 USUARIO RECEPCION NC"),
-    ("aplicacion", "Aplicación de pago", "E3 FECHA APLICACION PAGO", "E3 USUARIO APLICACION"),
-]
-PASOS_E4_DESTRUCCION = [
-    ("reporte_almacen", "Reporte al almacén de devoluciones", "E4 FECHA REPORTE ALMACEN", "E4 USUARIO REPORTE ALMACEN"),
-    ("folio_ajuste", "Recepción de folio de ajuste", "E4 FECHA RECEPCION FOLIO AJUSTE", "E4 USUARIO FOLIO AJUSTE"),
-]
-PASOS_E4_RECOLECCION = [
-    ("programacion", "Programación", "E4 FECHA PROGRAMACION", "E4 USUARIO PROGRAMACION"),
-    ("recoleccion", "Recolección", "E4 FECHA RECOLECCION", "E4 USUARIO RECOLECCION"),
-    ("folio_dev", "Recepción de folio de devolución", "E4 FECHA RECEPCION FOLIO DEV", "E4 USUARIO FOLIO DEV"),
-]
-
-# Columnas de control por etapa
-COL_E1_ESTATUS, COL_E1_OBS = "E1 ESTATUS", "E1 OBSERVACIONES"
-COL_E1_LIMITE, COL_E1_DIAS, COL_E1_TERM = "E1 FECHA LIMITE", "E1 DIAS TARDO", "E1 TERMINADA"
-COL_E2_ESTATUS, COL_E2_OBS = "E2 ESTATUS", "E2 OBSERVACIONES"
-COL_E2_COMPROMISO = "E2 FECHA COMPROMISO RECOLECCION"
-COL_E2_LIMITE, COL_E2_DIAS, COL_E2_TERM = "E2 FECHA LIMITE", "E2 DIAS TARDO", "E2 TERMINADA"
-COL_E3_ESTATUS, COL_E3_OBS = "E3 ESTATUS", "E3 OBSERVACIONES"
-# Tres campos de referencia capturados en Cuentas por pagar
-COL_E3_FOLIO_DEV_NUEVO = "E3 FOLIO DEVOLUCION"
-COL_E3_FOLIO_AJUSTE = "E3 FOLIO AJUSTE"
-COL_E3_NOTA_CREDITO = "E3 NOTA CREDITO"
-# Columna vieja (nombre anterior) — se migra al primer campo si trae valor.
-COL_E3_FOLIO_DEV_VIEJO = "E3 FOLIO DEVOLUCION AJUSTE"
-COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM = "E3 FECHA LIMITE", "E3 DIAS TARDO", "E3 TERMINADA"
-COL_E4_MODALIDAD, COL_E4_ESTATUS, COL_E4_OBS = "E4 MODALIDAD", "E4 ESTATUS", "E4 OBSERVACIONES"
-COL_E4_LIMITE_REC, COL_E4_TERM = "E4 FECHA LIMITE RECOLECCION", "E4 TERMINADA"
-
-# Columnas de cuarentena
-COL_CUAR_EN = "EN CUARENTENA"              # SÍ / NO
-COL_CUAR_FECHA_INICIO = "CUARENTENA FECHA INICIO"
-COL_CUAR_DIAS = "CUARENTENA DIAS"          # duración asignada por el admin
-COL_CUAR_FECHA_FIN = "CUARENTENA FECHA FIN"  # fecha calculada de salida
-COL_CUAR_OBS = "CUARENTENA OBSERVACIONES"
-COL_ETAPA_PREVIA = "ETAPA PREVIA CUARENTENA"  # a dónde regresa al liberarse
-
-# Semáforo
-EN_TIEMPO = "🟢 EN TIEMPO"
-POR_VENCERSE = "🟡 POR VENCERSE"
-VENCIDO = "🔴 VENCIDO"
-TERMINADO = "✅ TERMINADO"
-SIN_DATO = "—"
-
-# Todas las columnas que la app necesita (para crearlas si faltan).
-COLUMNAS_REQUERIDAS = [
-    COL_ETAPA, COL_RESPUESTA_TIPO,
-    COL_E1_ESTATUS, COL_E1_OBS, COL_E1_LIMITE, COL_E1_DIAS, COL_E1_TERM,
-    COL_E2_ESTATUS, COL_E2_OBS, COL_E2_COMPROMISO, COL_E2_LIMITE, COL_E2_DIAS, COL_E2_TERM,
-    COL_E3_ESTATUS, COL_E3_OBS,
-    COL_E3_FOLIO_DEV_NUEVO, COL_E3_FOLIO_AJUSTE, COL_E3_NOTA_CREDITO,
-    COL_E3_LIMITE, COL_E3_DIAS, COL_E3_TERM,
-    COL_E4_MODALIDAD, COL_E4_ESTATUS, COL_E4_OBS, COL_E4_LIMITE_REC, COL_E4_TERM,
-    COL_CUAR_EN, COL_CUAR_FECHA_INICIO, COL_CUAR_DIAS, COL_CUAR_FECHA_FIN,
-    COL_CUAR_OBS, COL_ETAPA_PREVIA,
-    COL_MODIFICADO_POR, COL_FECHA_MODIFICACION,
-]
-for _pasos in (PASOS_E1, PASOS_E2, PASOS_E3, PASOS_E4_DESTRUCCION, PASOS_E4_RECOLECCION):
-    for _clave, _etq, _cf, _cu in _pasos:
-        COLUMNAS_REQUERIDAS.extend([_cf, _cu])
-
+MSG_VENCIDO = "RECLAMO VENCIDO SIN DEFINICIÓN, ENVIAR A DESTRUCCIÓN"
 
 # =============================================================================
-# 2. UTILIDADES DE FECHA Y SEMÁFORO
+# 2. UTILIDADES DE FECHA Y CONVERSIÓN
 # =============================================================================
+
+def hoy_mx() -> date:
+    """Fecha actual en la zona horaria de México (evita el desfase por UTC)."""
+    if ZONA_MX is not None:
+        return datetime.now(ZONA_MX).date()
+    return (datetime.utcnow() - timedelta(hours=6)).date()
+
+
+def ahora_mx() -> datetime:
+    """Fecha y hora actual en la zona horaria de México (sin tzinfo)."""
+    if ZONA_MX is not None:
+        return datetime.now(ZONA_MX).replace(tzinfo=None)
+    return datetime.utcnow() - timedelta(hours=6)
+
 
 def _a_fecha(valor):
-    """Convierte datetime, serial de Excel o texto a date. None si no es válido."""
+    """Convierte cualquier cosa razonable a date, o None si no es válido."""
     if valor is None:
         return None
     try:
@@ -256,443 +116,431 @@ def _a_fecha(valor):
 
 
 def _fmt_fecha(valor) -> str:
-    """Formatea una fecha como DD/MM/AAAA, o '—' si no hay."""
     f = _a_fecha(valor)
-    return f"{f:%d/%m/%Y}" if f else SIN_DATO
+    return f"{f:%d/%m/%Y}" if f else "—"
 
 
-def semaforo_por_limite(fecha_limite, terminada: bool) -> str:
-    """Semáforo de una etapa según su fecha límite.
+def _fmt_mxn(valor) -> str:
+    try:
+        return f"${float(valor):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
 
-    - Si la etapa ya terminó -> TERMINADO
-    - Si no hay fecha límite  -> SIN_DATO
-    - Vencida                 -> VENCIDO
-    - 15 días o menos (incl. hoy) -> POR_VENCERSE
-    - Más de 15 días          -> EN_TIEMPO
-    """
-    if terminada:
-        return TERMINADO
-    f = _a_fecha(fecha_limite)
+
+MESES_ES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+    7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre",
+    12: "Diciembre",
+}
+
+
+def etiqueta_mes(fecha) -> str:
+    """'Marzo 2026' a partir de una fecha o timestamp."""
+    f = _a_fecha(fecha)
     if f is None:
-        return SIN_DATO
-    hoy = hoy_mx()
-    if f < hoy:
-        return VENCIDO
-    if f <= hoy + timedelta(days=15):
-        return POR_VENCERSE
-    return EN_TIEMPO
-
-
-def es_verdadero(valor) -> bool:
-    """Interpreta un valor de celda como booleano (terminada / sí)."""
-    return str(valor).strip().upper() in ("SÍ", "SI", "TRUE", "1", "VERDADERO", "X")
+        return "Sin fecha"
+    return f"{MESES_ES[f.month]} {f.year}"
 
 
 # =============================================================================
-# 3. MÓDULO DE DATOS
+# 3. CARGA Y NORMALIZACIÓN DE DATOS
 # =============================================================================
 
-def _normalizar_encabezado(nombre: str) -> str:
-    return " ".join(str(nombre).split()).upper()
+# --- Columnas de la hoja 1: FOLIOS DE GARANTÍA ---
+COL_G_MES = "MES DE DEVOLUCION"
+COL_G_FOLIO = "FOLIO REPORTE"
+COL_G_ID = "ID"
+COL_G_PROVEEDOR = "PROVEEDOR"
+COL_G_CARTA = "CARTA FIRMADA"
+COL_G_IMPORTE = "IMPORTE (MXN)"
+COL_G_COMPRADOR = "COMPRADOR"
+COL_G_FECHA_CORTE = "FECHA CORTE"
+COL_G_FECHA_RECEPCION = "FECHA RECEPCION REPORTE"  # NUEVA — arranca el reloj
+COL_G_FOLIO_DEV = "FOLIO DEVOLUCION"
+COL_G_FOLIO_AJUSTE = "FOLIO AJUSTE"
+COL_G_NOTA_CREDITO = "NOTA CREDITO"
+COL_G_RESPUESTA = "RESPUESTA PROVEEDOR TIPO"
+COL_G_NOTAS = "ACCIONES / NOTAS"
+# Columnas de control interno
+COL_G_ESTADO = "ESTADO"                     # activo / cuarentena / resuelto / cancelado
+COL_G_CUAR_INICIO = "CUARENTENA INICIO"     # fecha entró
+COL_G_CUAR_FIN = "CUARENTENA FIN"           # fecha calculada de liberación
+COL_G_FECHA_RESUELTO = "FECHA RESUELTO"     # cuándo se capturó la NC
+COL_G_MODIFICADO = "ULTIMA MODIFICACION"
+
+# Estados posibles de un folio de garantía
+ESTADO_ACTIVO = "Activo"
+ESTADO_CUARENTENA = "Cuarentena"
+ESTADO_RESUELTO = "Resuelto"
+ESTADO_CANCELADO = "Cancelado"
+
+# --- Columnas de la hoja 2: FOLIOS DE DEVOLUCIÓN ---
+COL_D_FOLIO = "Folio"
+COL_D_FECHA = "Fecha"
+COL_D_PROVEEDOR = "Proveedor"
+COL_D_TOTAL = "Total"
+COL_D_PENDIENTE = "PENDIENTE POR DESCONTAR"
+COL_D_APLICADO_MXN = "APLICADO"
+COL_D_APLICADO_EST = "Aplicado"
+COL_D_RESOLUCION = "Resolucion"
+COL_D_TIPO_CLIENTE = "Devolucion cliente saldo a favor"
+COL_D_EJECUTIVO = "Ejecutivo"
+COL_D_COMPRADOR = "Comprador"
+COL_D_ESTADO = "ESTADO"  # activo / bloqueado / cancelado
+COL_D_NOTAS = "NOTAS"
+
+# --- Columnas de la hoja 3: NC PENDIENTES ---
+COL_NC_ENTRADA = "FOLIO DE ENTRADA"
+COL_NC_FECHA_FACTURA = "FECHA FACTURA"
+COL_NC_FECHA_REPORTE = "FECHA RECEPCION REPORTE"  # NUEVA — arranca el reloj
+COL_NC_FISCAL = "FOLIO FISCAL"
+COL_NC_PROVEEDOR = "PROVEEDOR"
+COL_NC_NUM_FACTURA = "NUM. FACTURA"
+COL_NC_IMP_FACTURA = "IMPORTE FACTURA"
+COL_NC_IMP_PENDIENTE = "IMPORTE DE LA NC PENDIENTE POR TIMBRAR"
+COL_NC_FECHA_NC = "FECHA DE LA NC"
+COL_NC_FOLIO_NC = "FOLIO"
+COL_NC_OBSERVACIONES = "OBSERVACIONES"
+COL_NC_EJECUTIVA = "EJECUTIVA"
+COL_NC_COMPRADOR = "COMPRADOR"
+COL_NC_ESTADO = "ESTADO"  # pendiente / resuelto / cancelado
 
 
-@st.cache_data(show_spinner="Cargando base de datos…")
-def cargar_datos(ruta: str, _version: int) -> pd.DataFrame:
-    """Carga el Excel, normaliza encabezados y asegura las columnas nuevas."""
-    df = pd.read_excel(ruta, sheet_name=NOMBRE_HOJA)
-    df.columns = [_normalizar_encabezado(c) for c in df.columns]
-
-    # Crear columnas faltantes (vacías)
-    for col in COLUMNAS_REQUERIDAS:
-        if col not in df.columns:
-            df[col] = ""
-
-    # Las columnas de control (estatus, terminada, observaciones, usuarios,
-    # modalidad, etc.) deben ser de tipo texto. Si vienen vacías, pandas las
-    # carga como float64 y rechazaría valores como "SÍ". Se excluyen las de
-    # fecha y las numéricas de días.
-    cols_fecha = set()
-    for _pasos in (PASOS_E1, PASOS_E2, PASOS_E3, PASOS_E4_DESTRUCCION, PASOS_E4_RECOLECCION):
-        for _c, _e, _cf, _cu in _pasos:
-            cols_fecha.add(_cf)
-    cols_fecha |= {COL_E1_LIMITE, COL_E2_LIMITE, COL_E3_LIMITE,
-                   COL_E2_COMPROMISO, COL_E4_LIMITE_REC,
-                   COL_CUAR_FECHA_INICIO, COL_CUAR_FECHA_FIN}
-    cols_numericas = {COL_E1_DIAS, COL_E2_DIAS, COL_E3_DIAS, COL_CUAR_DIAS}
-    for col in COLUMNAS_REQUERIDAS:
-        if col in df.columns and col not in cols_fecha and col not in cols_numericas:
-            df[col] = df[col].fillna("").astype(str).replace("nan", "")
-    # Las columnas de fecha a datetime SIN componente de hora (solo fecha).
-    # .dt.normalize() pone la hora en 00:00 para que no se guarde hora alguna.
-    for col in cols_fecha:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce").dt.normalize()
-    # También normalizar FECHA CORTE (fecha base del proceso).
-    if COL_FECHA_CORTE in df.columns:
-        df[COL_FECHA_CORTE] = pd.to_datetime(df[COL_FECHA_CORTE], errors="coerce").dt.normalize()
-
-    # Etapa inicial por defecto
-    if COL_ETAPA in df.columns:
-        df[COL_ETAPA] = df[COL_ETAPA].replace("", pd.NA).fillna(ETAPA_1)
-        # Migración de nombres antiguos: los registros guardados antes del
-        # cambio de nombre conservan "Destino final" en la base. Se renombran
-        # a la etiqueta vigente para que tablas, filtros y gráficas coincidan.
-        df[COL_ETAPA] = df[COL_ETAPA].astype(str).str.strip().replace(
-            NOMBRES_ETAPA_ANTIGUOS
-        )
-
-    # Texto clave normalizado
-    for col in (COL_PROVEEDOR, COL_COMPRADOR, COL_FOLIO):
-        if col in df.columns:
-            df[col] = df[col].fillna("").astype(str).str.strip()
-
-    # Migración de la columna vieja "E3 FOLIO DEVOLUCION AJUSTE" (un solo campo)
-    # a "E3 FOLIO DEVOLUCION" (uno de los tres campos nuevos): si el nuevo está
-    # vacío y el viejo trae valor, se copia.
-    if COL_E3_FOLIO_DEV_VIEJO in df.columns:
-        vieja = df[COL_E3_FOLIO_DEV_VIEJO].fillna("").astype(str).str.strip()
-        nueva = df[COL_E3_FOLIO_DEV_NUEVO].fillna("").astype(str).str.strip()
-        mig = (nueva == "") & (vieja != "")
-        if mig.any():
-            df.loc[mig, COL_E3_FOLIO_DEV_NUEVO] = vieja[mig]
-        # La columna vieja se conserva en el Excel para no perder el historial,
-        # pero la app ya no la usa.
-
-    # FOLIO REPORTE es el identificador principal y único.
-    df["CLAVE"] = df[COL_FOLIO].astype(str)
-
-    # --- Cuarentena automática por importe bajo ---
-    # Las reclamaciones con importe <= UMBRAL que aún no están finalizadas ni
-    # marcadas en cuarentena entran automáticamente a Cuarentena. Se guarda la
-    # etapa en la que estaban para poder devolverlas al liberarlas.
-    if COL_CUAR_DIAS in df.columns:
-        df[COL_CUAR_DIAS] = pd.to_numeric(df[COL_CUAR_DIAS], errors="coerce")
-    if COL_IMPORTE in df.columns:
-        importe_num = pd.to_numeric(df[COL_IMPORTE], errors="coerce").fillna(0.0)
-        # "SÍ" = está en cuarentena · "LIBERADA" = ya fue liberada por el admin
-        # (no debe volver a entrar aunque su importe siga siendo bajo).
-        estado_cuar = df[COL_CUAR_EN].astype(str).str.strip().str.upper()
-        ya_gestionada = estado_cuar.isin(["SÍ", "SI", "LIBERADA"])
-        no_final = df[COL_ETAPA] != ETAPA_FINAL
-        entran = (importe_num <= UMBRAL_CUARENTENA) & (~ya_gestionada) & no_final
-        if entran.any():
-            df.loc[entran, COL_ETAPA_PREVIA] = df.loc[entran, COL_ETAPA]
-            df.loc[entran, COL_CUAR_EN] = "SÍ"
-            df.loc[entran, COL_ETAPA] = ETAPA_CUARENTENA
-            df.loc[entran, COL_CUAR_FECHA_INICIO] = pd.Timestamp(hoy_mx())
-            # Duración por defecto solo donde no haya un valor previo.
-            dias_actuales = pd.to_numeric(df.loc[entran, COL_CUAR_DIAS], errors="coerce")
-            usa_defecto = dias_actuales.isna() | (dias_actuales <= 0)
-            df.loc[dias_actuales[usa_defecto].index, COL_CUAR_DIAS] = DIAS_CUARENTENA_DEFECTO
-            df.loc[entran, COL_CUAR_FECHA_FIN] = pd.Timestamp(
-                hoy_mx() + timedelta(days=DIAS_CUARENTENA_DEFECTO))
-
-    # Etiqueta legible del mes (para el filtro)
-    if COL_MES in df.columns:
-        meses_es = {
-            1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo",
-            6: "Junio", 7: "Julio", 8: "Agosto", 9: "Septiembre",
-            10: "Octubre", 11: "Noviembre", 12: "Diciembre",
-        }
-        fm = pd.to_datetime(df[COL_MES], errors="coerce")
-        df[COL_MES_ETIQUETA] = fm.apply(
-            lambda d: f"{meses_es[d.month]} {d.year}" if pd.notna(d) else "Sin fecha"
-        )
-    else:
-        df[COL_MES_ETIQUETA] = "Sin fecha"
-
+def _normalizar_encabezados(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [" ".join(str(c).split()).strip() for c in df.columns]
     return df
 
 
-def _columnas_fecha() -> set:
-    """Conjunto de todas las columnas que deben tratarse como fecha."""
-    cols = set()
-    for _pasos in (PASOS_E1, PASOS_E2, PASOS_E3, PASOS_E4_DESTRUCCION, PASOS_E4_RECOLECCION):
-        for _c, _e, _cf, _cu in _pasos:
-            cols.add(_cf)
-    cols |= {COL_E1_LIMITE, COL_E2_LIMITE, COL_E3_LIMITE,
-             COL_E2_COMPROMISO, COL_E4_LIMITE_REC, COL_FECHA_CORTE}
-    return cols
+def _renombrar(df: pd.DataFrame, mapa: dict) -> pd.DataFrame:
+    """Renombra columnas usando el mapa {viejo: nuevo}; ignora las que faltan."""
+    df = df.rename(columns={k: v for k, v in mapa.items() if k in df.columns})
+    return df
 
 
-def _preparar_para_excel(df: pd.DataFrame) -> pd.DataFrame:
-    """Copia sin columnas auxiliares y con fechas como date puro (sin hora)."""
-    salida = df.drop(columns=["CLAVE", COL_MES_ETIQUETA], errors="ignore").copy()
-    for col in _columnas_fecha():
-        if col in salida.columns:
-            salida[col] = pd.to_datetime(salida[col], errors="coerce").dt.date
-    return salida
+@st.cache_data(show_spinner="Cargando datos…")
+def cargar_datos(ruta: str, _version: int) -> dict:
+    """Carga las tres hojas del Excel y devuelve un diccionario.
 
-
-def guardar_excel(df: pd.DataFrame, ruta: str) -> None:
-    """Sobrescribe el Excel quitando columnas auxiliares y sin hora en las fechas."""
-    salida = _preparar_para_excel(df)
-    with pd.ExcelWriter(ruta, engine="openpyxl", datetime_format="DD/MM/YYYY",
-                        date_format="DD/MM/YYYY") as writer:
-        salida.to_excel(writer, sheet_name=NOMBRE_HOJA, index=False)
-
-
-# =============================================================================
-# 4. SINCRONIZACIÓN CON GITHUB
-# =============================================================================
-
-def subir_a_github(mensaje_commit: str) -> tuple[bool, str]:
-    """Hace commit y push del Excel usando GitPython y st.secrets['GITHUB_TOKEN']."""
+    _version se usa solo para invalidar el caché cuando queremos releer.
+    """
+    resultado = {"garantias": None, "devoluciones": None, "nc": None,
+                 "error": None}
+    if not os.path.exists(ruta):
+        resultado["error"] = f"No se encontró el archivo: {ruta}"
+        return resultado
     try:
-        from git import Repo
-    except ImportError:
-        return False, "GitPython no está instalado (revisa requirements.txt)."
-
-    token = st.secrets.get("GITHUB_TOKEN")
-    if not token:
-        return False, (
-            "No se encontró 'GITHUB_TOKEN' en los secretos. El cambio se guardó "
-            "localmente, pero NO se subió a GitHub."
-        )
-
-    try:
-        repo = Repo(RUTA_BASE, search_parent_directories=True)
-        with repo.config_writer() as cw:
-            cw.set_value("user", "name", "Dashboard Reclamaciones")
-            cw.set_value("user", "email", "dashboard@reclamaciones.app")
-
-        repo.index.add([RUTA_EXCEL])
-        if not repo.index.diff("HEAD"):
-            return True, "No había cambios nuevos que subir."
-
-        repo.index.commit(mensaje_commit)
-
-        origen = repo.remote(name="origin")
-        url = origen.url
-        if url.startswith("git@github.com:"):
-            url = url.replace("git@github.com:", "https://github.com/")
-        if not url.endswith(".git"):
-            url = url + ".git"
-        if "@" in url and url.startswith("https://"):
-            url = "https://" + url.split("@", 1)[1]
-        url_token = url.replace("https://", f"https://x-access-token:{token}@")
-
-        entorno = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo",
-                   "GCM_INTERACTIVE": "never"}
-        rama = repo.active_branch.name
-        try:
-            with repo.git.custom_environment(**entorno):
-                repo.git.push(url_token, f"HEAD:{rama}")
-        finally:
-            origen.set_url(url)
-        return True, "Cambios subidos a GitHub correctamente. ✅"
+        xl = pd.ExcelFile(ruta)
     except Exception as e:
-        detalle = str(e)
-        if "403" in detalle or "denied" in detalle.lower():
-            ayuda = " — El token no tiene permiso de escritura (Contents: Read and write)."
-        elif "could not read Password" in detalle or "Authentication" in detalle:
-            ayuda = " — El token es inválido o expiró; genera uno nuevo."
+        resultado["error"] = f"No se pudo abrir el Excel: {e}"
+        return resultado
+
+    # ------ HOJA 1: GARANTÍAS ------
+    if HOJA_GARANTIAS in xl.sheet_names:
+        g = pd.read_excel(xl, sheet_name=HOJA_GARANTIAS)
+        g = _normalizar_encabezados(g)
+        # Añadir columnas nuevas si faltan
+        for col, default in [
+            (COL_G_FECHA_RECEPCION, pd.NaT),
+            (COL_G_ESTADO, ""),
+            (COL_G_CUAR_INICIO, pd.NaT),
+            (COL_G_CUAR_FIN, pd.NaT),
+            (COL_G_FECHA_RESUELTO, pd.NaT),
+            (COL_G_MODIFICADO, ""),
+        ]:
+            if col not in g.columns:
+                g[col] = default
+        # Tipos
+        for col in [COL_G_MES, COL_G_FECHA_CORTE, COL_G_FECHA_RECEPCION,
+                    COL_G_CUAR_INICIO, COL_G_CUAR_FIN, COL_G_FECHA_RESUELTO]:
+            g[col] = pd.to_datetime(g[col], errors="coerce").dt.normalize()
+        g[COL_G_IMPORTE] = pd.to_numeric(g[COL_G_IMPORTE], errors="coerce").fillna(0.0)
+        for col in [COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_COMPRADOR,
+                    COL_G_CARTA, COL_G_NOTAS, COL_G_RESPUESTA]:
+            if col in g.columns:
+                g[col] = g[col].fillna("").astype(str).str.strip()
+
+        # Si no hay fecha de recepción del reporte, usar FECHA CORTE como valor
+        # inicial (los folios viejos ya nacen con el reloj corriendo desde ahí).
+        mask_sin_recep = g[COL_G_FECHA_RECEPCION].isna()
+        g.loc[mask_sin_recep, COL_G_FECHA_RECEPCION] = g.loc[mask_sin_recep, COL_G_FECHA_CORTE]
+
+        # Determinar ESTADO si viene vacío (por migración desde el modelo viejo)
+        g[COL_G_ESTADO] = g[COL_G_ESTADO].fillna("").astype(str).str.strip()
+        vacio = g[COL_G_ESTADO].isin(["", "nan", "None"])
+        # Regla de migración desde el modelo por etapas:
+        #  - ETAPA ACTUAL = "FINALIZADO"           → Resuelto
+        #  - Si tiene NOTA CREDITO capturada       → Resuelto
+        #  - ETAPA ACTUAL = "Cuarentena"           → Cuarentena
+        #  - Si importe ≤ UMBRAL y no cabe arriba  → Cuarentena
+        #  - Resto                                 → Activo
+        etapa_vieja = g.get("ETAPA ACTUAL", pd.Series([""] * len(g))).fillna("").astype(str).str.strip()
+        # Para detectar NC real, usar la columna ORIGINAL con pd.notna, no strings
+        if COL_G_NOTA_CREDITO in g.columns:
+            # Reconstruir booleano desde la fuente original (antes del cast a str)
+            nc_original = pd.read_excel(ruta, sheet_name=HOJA_GARANTIAS,
+                                        usecols=[COL_G_NOTA_CREDITO])[COL_G_NOTA_CREDITO]
+            con_nc = nc_original.notna() & (nc_original.astype(str).str.strip() != "")
+            con_nc = con_nc.reindex(g.index, fill_value=False)
         else:
-            ayuda = ""
-        return False, f"Error al subir a GitHub: {detalle}{ayuda}"
+            con_nc = pd.Series([False] * len(g), index=g.index)
+        bajo = g[COL_G_IMPORTE] <= UMBRAL_CUARENTENA
+        # Aplicar en orden de precedencia
+        g.loc[vacio & (etapa_vieja == "FINALIZADO"), COL_G_ESTADO] = ESTADO_RESUELTO
+        aun_vacio = g[COL_G_ESTADO].isin(["", "nan", "None"])
+        g.loc[aun_vacio & con_nc, COL_G_ESTADO] = ESTADO_RESUELTO
+        aun_vacio = g[COL_G_ESTADO].isin(["", "nan", "None"])
+        g.loc[aun_vacio & (etapa_vieja == "Cuarentena"), COL_G_ESTADO] = ESTADO_CUARENTENA
+        aun_vacio = g[COL_G_ESTADO].isin(["", "nan", "None"])
+        g.loc[aun_vacio & bajo, COL_G_ESTADO] = ESTADO_CUARENTENA
+        aun_vacio = g[COL_G_ESTADO].isin(["", "nan", "None"])
+        g.loc[aun_vacio, COL_G_ESTADO] = ESTADO_ACTIVO
 
+        # Limpiar las cadenas de folios/nc después de la migración
+        for col in [COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE, COL_G_NOTA_CREDITO]:
+            if col in g.columns:
+                # Convertir NaN a "" y limpiar
+                g[col] = g[col].apply(
+                    lambda v: "" if pd.isna(v) or str(v).strip().lower() in ("nan", "none")
+                    else str(v).strip())
+                # Quitar el ".0" que agrega pandas a los enteros de Excel
+                g[col] = g[col].str.replace(r"\.0$", "", regex=True)
 
-# =============================================================================
-# 5. LÓGICA DE LA MÁQUINA DE ESTADOS
-# =============================================================================
+        # Inicio de cuarentena si le falta
+        m_cuar = (g[COL_G_ESTADO] == ESTADO_CUARENTENA) & (g[COL_G_CUAR_INICIO].isna())
+        g.loc[m_cuar, COL_G_CUAR_INICIO] = pd.Timestamp(hoy_mx())
+        g.loc[m_cuar, COL_G_CUAR_FIN] = pd.Timestamp(hoy_mx() + timedelta(days=DIAS_CUARENTENA))
 
-def calcular_fechas_limite(fila: pd.Series) -> dict:
-    """Calcula las fechas límite de cada etapa a partir de FECHA CORTE.
+        # Autoliberar cuarentenas vencidas: pasan a Activo y su reloj de 90d
+        # arranca AHORA (se ajusta FECHA RECEPCION al fin de cuarentena).
+        hoy = pd.Timestamp(hoy_mx())
+        m_venc = (g[COL_G_ESTADO] == ESTADO_CUARENTENA) & \
+                 (g[COL_G_CUAR_FIN].notna()) & (g[COL_G_CUAR_FIN] <= hoy)
+        if m_venc.any():
+            g.loc[m_venc, COL_G_ESTADO] = ESTADO_ACTIVO
+            # Al liberarse, comienza el reloj de 90 días
+            g.loc[m_venc, COL_G_FECHA_RECEPCION] = g.loc[m_venc, COL_G_CUAR_FIN]
 
-    Flujo: Reporte (7d) → Gestión (30d) → Disposición final → Cuentas por pagar.
-    Los plazos suman 90 días en total desde la fecha de corte:
-      E1: FECHA CORTE + 7
-      E2: límite E1 + 30   (día 37)
-      E4: comparte el tramo final con E3 (día 90), pues va después de Gestión
-      E3: límite E2 + 53   (día 90, cierre del proceso)
-    Devuelve un dict con date o None por etapa.
-    """
-    corte = _a_fecha(fila.get(COL_FECHA_CORTE))
-    limites = {"E1": None, "E2": None, "E3": None, "E4": None}
-    if corte:
-        limites["E1"] = corte + timedelta(days=DIAS_ETAPA_1)
-        limites["E2"] = limites["E1"] + timedelta(days=DIAS_ETAPA_2)
-        limites["E3"] = limites["E2"] + timedelta(days=DIAS_ETAPA_3)
-        # Disposición final ocurre entre Gestión y Cuentas por pagar: su fecha
-        # tope es la misma del cierre global (90 días desde el corte).
-        limites["E4"] = limites["E3"]
-    return limites
+        # Etiqueta de mes
+        g["MES ETIQUETA"] = g[COL_G_MES].apply(etiqueta_mes)
 
-
-def fecha_vencimiento_90(fila: pd.Series):
-    """Fecha de vencimiento global del reclamo: FECHA CORTE + 90 días."""
-    corte = _a_fecha(fila.get(COL_FECHA_CORTE))
-    return corte + timedelta(days=DIAS_VENCIMIENTO_TOTAL) if corte else None
-
-
-def vencido_90_sin_definicion(fila: pd.Series) -> bool:
-    """True si pasaron los 90 días desde FECHA CORTE y el reclamo NO está resuelto.
-
-    'Sin definición' significa que el proceso aún no ha llegado a su fin
-    (la etapa no es FINALIZADO), por lo que debe enviarse a destrucción.
-
-    Las reclamaciones en Cuarentena quedan EXCLUIDAS: tienen su propio
-    vencimiento (gestionado en el área de cuarentena) y el conteo de 90 días
-    solo empieza cuando salen de ahí, ya sea por liberación con clave o porque
-    se cumplió su plazo de cuarentena.
-    """
-    etapa = str(fila.get(COL_ETAPA, "")).strip()
-    if etapa in (ETAPA_FINAL, ETAPA_CUARENTENA):
-        return False
-    limite = fecha_vencimiento_90(fila)
-    return limite is not None and hoy_mx() > limite
-
-
-def estado_alarma(fecha_limite, terminada: bool) -> tuple[str, str]:
-    """Devuelve (nivel, mensaje) de alarma para una etapa activa.
-
-    nivel: 'ok' | 'warn' | 'danger' | 'done' | 'none'
-    """
-    if terminada:
-        return "done", "Etapa terminada."
-    f = _a_fecha(fecha_limite)
-    if f is None:
-        return "none", "Sin fecha límite definida."
-    hoy = hoy_mx()
-    dias = (f - hoy).days
-    if dias < 0:
-        return "danger", f"VENCIDA hace {abs(dias)} día(s) (límite {f:%d/%m/%Y})."
-    if dias <= 15:
-        return "warn", f"Por vencerse: faltan {dias} día(s) (límite {f:%d/%m/%Y})."
-    return "ok", f"En tiempo: faltan {dias} día(s) (límite {f:%d/%m/%Y})."
-
-
-def construir_notificaciones(df: pd.DataFrame) -> list[dict]:
-    """Genera la lista de alarmas (a punto de vencer / vencidas) de toda la base.
-
-    La estructura está lista para, en el futuro, enviarse por correo:
-    cada elemento trae folio, proveedor, etapa, nivel, mensaje y destinatario.
-    """
-    avisos = []
-    for _, fila in df.iterrows():
-        etapa = str(fila.get(COL_ETAPA, "")).strip()
-        if etapa in ("", ETAPA_FINAL):
-            continue
-
-        # --- ALARMA CRÍTICA: vencimiento global de 90 días sin definición ---
-        if vencido_90_sin_definicion(fila):
-            lim90 = fecha_vencimiento_90(fila)
-            dias_vencido = (hoy_mx() - lim90).days
-            avisos.append({
-                "folio": fila.get(COL_FOLIO, ""),
-                "proveedor": fila.get(COL_PROVEEDOR, ""),
-                "comprador": fila.get(COL_COMPRADOR, ""),
-                "etapa": etapa,
-                "nivel": "critico",
-                "mensaje": (f"{MSG_VENCIDO_90} · Venció hace {dias_vencido} día(s) "
-                            f"(90 días desde el corte: {lim90:%d/%m/%Y})."),
-                "destinatario": "",
-            })
-            continue  # esta alarma reemplaza a la de etapa (es más grave)
-
-        limites = calcular_fechas_limite(fila)
-        # Determinar la fecha límite y bandera de terminada de la etapa activa
-        if etapa == ETAPA_1:
-            lim, term = limites["E1"], es_verdadero(fila.get(COL_E1_TERM))
-        elif etapa == ETAPA_2:
-            lim, term = limites["E2"], es_verdadero(fila.get(COL_E2_TERM))
-        elif etapa == ETAPA_3:
-            lim, term = limites["E3"], es_verdadero(fila.get(COL_E3_TERM))
-        elif etapa == ETAPA_4:
-            # El plazo de la etapa es el global; el de recolección (20 días) es
-            # un contador aparte que se muestra dentro de la propia etapa.
-            lim, term = limites["E4"], es_verdadero(fila.get(COL_E4_TERM))
-        else:
-            continue
-        nivel, mensaje = estado_alarma(lim, term)
-        if nivel in ("warn", "danger"):
-            avisos.append({
-                "folio": fila.get(COL_FOLIO, ""),
-                "proveedor": fila.get(COL_PROVEEDOR, ""),
-                "comprador": fila.get(COL_COMPRADOR, ""),
-                "etapa": etapa,
-                "nivel": nivel,
-                "mensaje": mensaje,
-                # Campo reservado para el futuro envío por correo:
-                "destinatario": "",
-            })
-    # Orden: críticas (90 días) primero, luego vencidas, luego por vencerse
-    prioridad = {"critico": 0, "danger": 1, "warn": 2}
-    avisos.sort(key=lambda a: prioridad.get(a["nivel"], 3))
-    return avisos
-
-
-def aplicar_guardado(df: pd.DataFrame, clave: str, cambios: dict,
-                     usuario: str, mensaje_log: str) -> str:
-    """Aplica un diccionario de cambios a la fila y registra auditoría.
-
-    Devuelve el mensaje de commit.
-    """
-    mascara = df["CLAVE"] == clave
-    ahora = ahora_mx()
-    for col, valor in cambios.items():
-        df.loc[mascara, col] = valor
-    # Bitácora acumulada en ACCIONES / NOTAS
-    nota_previa = str(df.loc[mascara, COL_NOTAS].iloc[0] or "").strip()
-    if nota_previa.lower() in ("nan", "none"):
-        nota_previa = ""
-    nueva = f"[{ahora:%d/%m/%Y %H:%M} · {usuario}] {mensaje_log}"
-    df.loc[mascara, COL_NOTAS] = f"{nota_previa} | {nueva}" if nota_previa else nueva
-    df.loc[mascara, COL_MODIFICADO_POR] = usuario
-    df.loc[mascara, COL_FECHA_MODIFICACION] = f"{ahora:%d/%m/%Y %H:%M:%S}"
-    folio = df.loc[mascara, COL_FOLIO].iloc[0]
-    return f"Folio {folio}: {mensaje_log} (por {usuario}, {ahora:%d/%m/%Y %H:%M})"
-
-
-def persistir_y_sincronizar(df: pd.DataFrame, mensaje_commit: str,
-                            mensaje_ok: str, celebrar: bool = False) -> None:
-    """Guarda el Excel, sube a GitHub, refresca la sesión y vuelve a renderizar.
-
-    Si celebrar=True, se marca para mostrar los globos UNA sola vez tras el
-    rerun (por ejemplo, al cerrar una etapa).
-    """
-    try:
-        guardar_excel(df, RUTA_EXCEL)
-    except Exception as e:
-        st.error(f"No se pudo escribir el Excel: {e}")
-        return
-    with st.spinner("Subiendo cambios a GitHub…"):
-        exito, mensaje = subir_a_github(mensaje_commit)
-
-    cargar_datos.clear()
-    st.session_state["version_datos"] += 1
-    st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
-
-    if exito:
-        st.session_state["flash"] = ("success", f"✅ {mensaje_ok} {mensaje}")
+        resultado["garantias"] = g
     else:
-        st.session_state["flash"] = ("warning", f"💾 {mensaje_ok} Guardado local, pero: {mensaje}")
-    if celebrar:
-        st.session_state["celebrar"] = True
-    st.rerun()
+        resultado["error"] = f"Falta la hoja '{HOJA_GARANTIAS}' en el Excel."
+
+    # ------ HOJA 2: DEVOLUCIONES ------
+    if HOJA_DEVOLUCIONES in xl.sheet_names:
+        d = pd.read_excel(xl, sheet_name=HOJA_DEVOLUCIONES)
+        d = _normalizar_encabezados(d)
+        for col, default in [(COL_D_ESTADO, "Activo"), (COL_D_NOTAS, "")]:
+            if col not in d.columns:
+                d[col] = default
+        # Tipos
+        d[COL_D_FECHA] = pd.to_datetime(d[COL_D_FECHA], errors="coerce").dt.normalize()
+        for col in [COL_D_TOTAL, COL_D_PENDIENTE, COL_D_APLICADO_MXN]:
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+        for col in [COL_D_PROVEEDOR, COL_D_RESOLUCION, COL_D_TIPO_CLIENTE,
+                    COL_D_EJECUTIVO, COL_D_COMPRADOR, COL_D_NOTAS,
+                    COL_D_APLICADO_EST, COL_D_ESTADO]:
+            if col in d.columns:
+                d[col] = d[col].fillna("").astype(str).str.strip()
+        # Estado por defecto
+        d.loc[d[COL_D_ESTADO] == "", COL_D_ESTADO] = "Activo"
+        # Marcar si es garantía (tipo cliente) o incidente con proveedor
+        d["TIPO"] = d[COL_D_TIPO_CLIENTE].apply(
+            lambda x: "Garantía (cliente)" if str(x).strip().lower() == "clientes"
+            else "Incidente proveedor" if str(x).strip() == ""
+            else "Otro")
+        d["MES ETIQUETA"] = d[COL_D_FECHA].apply(etiqueta_mes)
+        resultado["devoluciones"] = d
+
+    # ------ HOJA 3: NC PENDIENTES ------
+    if HOJA_NC in xl.sheet_names:
+        nc = pd.read_excel(xl, sheet_name=HOJA_NC)
+        nc = _normalizar_encabezados(nc)
+        # Renombrar la columna con nombre largo si existe
+        obs_larga = "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC"
+        if obs_larga in nc.columns:
+            nc = nc.rename(columns={obs_larga: COL_NC_OBSERVACIONES})
+        for col, default in [
+            (COL_NC_FECHA_REPORTE, pd.NaT),
+            (COL_NC_ESTADO, ""),
+        ]:
+            if col not in nc.columns:
+                nc[col] = default
+        # Tipos: FECHA FACTURA puede venir como string por celdas mezcladas
+        nc[COL_NC_FECHA_FACTURA] = pd.to_datetime(nc[COL_NC_FECHA_FACTURA],
+                                                   errors="coerce").dt.normalize()
+        nc[COL_NC_FECHA_REPORTE] = pd.to_datetime(nc[COL_NC_FECHA_REPORTE],
+                                                   errors="coerce").dt.normalize()
+        nc[COL_NC_FECHA_NC] = pd.to_datetime(nc[COL_NC_FECHA_NC],
+                                              errors="coerce").dt.normalize()
+        for col in [COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE]:
+            if col in nc.columns:
+                nc[col] = pd.to_numeric(nc[col], errors="coerce").fillna(0.0)
+        for col in [COL_NC_PROVEEDOR, COL_NC_OBSERVACIONES, COL_NC_EJECUTIVA,
+                    COL_NC_COMPRADOR, COL_NC_ESTADO]:
+            if col in nc.columns:
+                nc[col] = nc[col].fillna("").astype(str).str.strip()
+        # Si no hay fecha de recepción del reporte, usar la fecha de la factura
+        # como aproximación inicial.
+        m_sin_rep = nc[COL_NC_FECHA_REPORTE].isna()
+        nc.loc[m_sin_rep, COL_NC_FECHA_REPORTE] = nc.loc[m_sin_rep, COL_NC_FECHA_FACTURA]
+        # Estado por defecto: si tiene FECHA DE LA NC → Resuelto, si no → Pendiente
+        vacio_e = nc[COL_NC_ESTADO] == ""
+        con_nc_e = nc[COL_NC_FECHA_NC].notna()
+        nc.loc[vacio_e & con_nc_e, COL_NC_ESTADO] = "Resuelto"
+        nc.loc[vacio_e & ~con_nc_e, COL_NC_ESTADO] = "Pendiente"
+        nc["MES ETIQUETA"] = nc[COL_NC_FECHA_REPORTE].apply(etiqueta_mes)
+        resultado["nc"] = nc
+
+    return resultado
+
+
+def guardar_excel(datos: dict, ruta: str) -> None:
+    """Sobrescribe el Excel con las tres hojas."""
+    with pd.ExcelWriter(ruta, engine="openpyxl",
+                        datetime_format="DD/MM/YYYY",
+                        date_format="DD/MM/YYYY") as writer:
+        if datos.get("garantias") is not None:
+            g = datos["garantias"].copy()
+            g = g.drop(columns=["MES ETIQUETA"], errors="ignore")
+            g.to_excel(writer, sheet_name=HOJA_GARANTIAS, index=False)
+        if datos.get("devoluciones") is not None:
+            d = datos["devoluciones"].copy()
+            d = d.drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
+            d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
+        if datos.get("nc") is not None:
+            nc = datos["nc"].copy()
+            nc = nc.drop(columns=["MES ETIQUETA"], errors="ignore")
+            # Restaurar el nombre largo de la observación
+            nc = nc.rename(columns={
+                COL_NC_OBSERVACIONES:
+                "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC"})
+            nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
 
 
 # =============================================================================
-# 6. AUTENTICACIÓN
+# 4. LÓGICA DE ESTADO Y SEMÁFOROS
+# =============================================================================
+
+def dias_transcurridos_garantia(fila: pd.Series) -> int | None:
+    """Días transcurridos desde la fecha de recepción del reporte."""
+    inicio = _a_fecha(fila.get(COL_G_FECHA_RECEPCION))
+    if inicio is None:
+        return None
+    return (hoy_mx() - inicio).days
+
+
+def dias_restantes_garantia(fila: pd.Series) -> int | None:
+    """Días que faltan para vencer el plazo de 90 días."""
+    d = dias_transcurridos_garantia(fila)
+    if d is None:
+        return None
+    return DIAS_PLAZO_TOTAL - d
+
+
+def fecha_vencimiento_garantia(fila: pd.Series):
+    inicio = _a_fecha(fila.get(COL_G_FECHA_RECEPCION))
+    if inicio is None:
+        return None
+    return inicio + timedelta(days=DIAS_PLAZO_TOTAL)
+
+
+def semaforo_garantia(fila: pd.Series) -> tuple[str, str]:
+    """Devuelve (icono, texto) del semáforo de un folio de garantía.
+
+    - Resuelto/Cancelado tienen su propio icono.
+    - En cuarentena: azul con días para salir.
+    - Activo: 🟢 en tiempo · 🟡 por vencerse (≤15d) · 🔴 vencido.
+    """
+    estado = str(fila.get(COL_G_ESTADO, "")).strip()
+    if estado == ESTADO_RESUELTO:
+        return "✅", "Resuelto"
+    if estado == ESTADO_CANCELADO:
+        return "⚫", "Cancelado"
+    if estado == ESTADO_CUARENTENA:
+        fin = _a_fecha(fila.get(COL_G_CUAR_FIN))
+        if fin:
+            faltan = (fin - hoy_mx()).days
+            return "🧊", f"En cuarentena · sale en {faltan} día(s)"
+        return "🧊", "En cuarentena"
+    # Activo
+    restantes = dias_restantes_garantia(fila)
+    if restantes is None:
+        return "—", "Sin fecha de recepción"
+    if restantes < 0:
+        return "🔴", f"VENCIDO hace {abs(restantes)} día(s)"
+    if restantes <= DIAS_POR_VENCER:
+        return "🟡", f"Por vencerse: {restantes} día(s)"
+    return "🟢", f"En tiempo: {restantes} día(s)"
+
+
+def esta_vencido_garantia(fila: pd.Series) -> bool:
+    """True si el folio está activo y pasó los 90 días sin resolverse."""
+    if str(fila.get(COL_G_ESTADO, "")).strip() != ESTADO_ACTIVO:
+        return False
+    r = dias_restantes_garantia(fila)
+    return r is not None and r < 0
+
+
+def dias_transcurridos_nc(fila: pd.Series) -> int | None:
+    inicio = _a_fecha(fila.get(COL_NC_FECHA_REPORTE))
+    if inicio is None:
+        return None
+    return (hoy_mx() - inicio).days
+
+
+def dias_restantes_nc(fila: pd.Series) -> int | None:
+    d = dias_transcurridos_nc(fila)
+    if d is None:
+        return None
+    return DIAS_PLAZO_NC - d
+
+
+def semaforo_nc(fila: pd.Series) -> tuple[str, str]:
+    estado = str(fila.get(COL_NC_ESTADO, "")).strip()
+    if estado == "Resuelto":
+        return "✅", "Resuelto"
+    if estado == "Cancelado":
+        return "⚫", "Cancelado"
+    restantes = dias_restantes_nc(fila)
+    if restantes is None:
+        return "—", "Sin fecha"
+    if restantes < 0:
+        return "🔴", f"VENCIDA hace {abs(restantes)} día(s)"
+    if restantes <= DIAS_POR_VENCER_NC:
+        return "🟡", f"Por vencerse: {restantes} día(s)"
+    return "🟢", f"En tiempo: {restantes} día(s)"
+
+
+def esta_vencida_nc(fila: pd.Series) -> bool:
+    if str(fila.get(COL_NC_ESTADO, "")).strip() != "Pendiente":
+        return False
+    r = dias_restantes_nc(fila)
+    return r is not None and r < 0
+
+
+# =============================================================================
+# 5. AUTENTICACIÓN
 # =============================================================================
 
 def verificar_acceso() -> bool:
-    """Pantalla de inicio de sesión con contraseña maestra (DASHBOARD_PASSWORD)."""
     if st.session_state.get("autenticado", False):
         return True
-
     st.markdown("<br><br>", unsafe_allow_html=True)
     _, centro, _ = st.columns([1, 1.2, 1])
     with centro:
         st.markdown("## 🔐 Seguimiento a devoluciones")
         st.caption("Acceso restringido. Ingresa la contraseña para continuar.")
         with st.form("form_login"):
-            password = st.text_input("Contraseña", type="password", placeholder="••••••••")
+            password = st.text_input("Contraseña", type="password",
+                                     placeholder="••••••••")
             enviar = st.form_submit_button("Ingresar", use_container_width=True)
         if enviar:
             correcta = st.secrets.get("DASHBOARD_PASSWORD")
             if correcta is None:
-                st.error("⚠️ No se encontró 'DASHBOARD_PASSWORD' en los secretos.")
+                st.error("⚠️ Falta 'DASHBOARD_PASSWORD' en los secretos de la app.")
             elif password == correcta:
                 st.session_state["autenticado"] = True
                 st.rerun()
@@ -702,1982 +550,1029 @@ def verificar_acceso() -> bool:
 
 
 # =============================================================================
-# 7. COMPONENTES DE UI COMPARTIDOS
+# 6. GUARDADO + SINCRONIZACIÓN CON GITHUB
 # =============================================================================
 
-def _mostrar_alarma(lim, terminada: bool) -> None:
-    """Muestra el banner de alarma de la etapa activa."""
-    nivel, mensaje = estado_alarma(lim, terminada)
-    if nivel == "danger":
-        st.error(f"🔴 {mensaje}")
-    elif nivel == "warn":
-        st.warning(f"🟡 {mensaje}")
-    elif nivel == "ok":
-        st.success(f"🟢 {mensaje}")
-    elif nivel == "done":
-        st.success(f"✅ {mensaje}")
-    else:
-        st.info(f"ℹ️ {mensaje}")
-
-
-def _resumen_pasos(fila: pd.Series, pasos: list) -> None:
-    """Muestra una línea por paso con su fecha y usuario registrados."""
-    for _clave, etiqueta, cf, cu in pasos:
-        fecha = _fmt_fecha(fila.get(cf))
-        usuario = str(fila.get(cu, "") or "").strip() or "—"
-        icono = "✅" if _a_fecha(fila.get(cf)) else "⬜"
-        st.markdown(f"{icono} **{etiqueta}** — {fecha} · {usuario}")
-
-
-def _boton_reactivar(etapa_cod: str, clave_registro: str) -> None:
-    """Botón protegido por clave para reabrir una etapa terminada.
-
-    Al reactivar una etapa, se limpia su marca de terminada y la de las etapas
-    posteriores, para que el flujo se recorra de nuevo de forma limpia.
-    """
-    with st.expander("🔓 Reactivar esta etapa (requiere clave)"):
-        st.caption(
-            "Solo personal autorizado. Reactivar reabre la etapa para corregir "
-            "información; las etapas posteriores se reinician y deberán completarse "
-            "de nuevo."
-        )
-        c1, c2 = st.columns([2, 1])
-        clave_in = c1.text_input(
-            "Clave de reactivación", type="password",
-            key=f"react_{etapa_cod}_{clave_registro}",
-        )
-        if c2.button("Reactivar", key=f"btn_react_{etapa_cod}_{clave_registro}",
-                     use_container_width=True):
-            if clave_in != clave_autorizacion():
-                st.error("Clave incorrecta.")
-                return
-            df = st.session_state["df"]
-            cambios = {COL_ETAPA: ETAPA_NOMBRE_POR_COD[etapa_cod]}
-            # Reabrir esta etapa y todas las posteriores (limpiar terminada
-            # y las fechas/usuarios de sus pasos, para recorrerlas de nuevo).
-            orden = ["E1", "E2", "E4", "E3"]  # orden real del flujo
-            pasos_por_cod = {
-                "E1": PASOS_E1, "E2": PASOS_E2, "E3": PASOS_E3,
-                "E4": PASOS_E4_DESTRUCCION + PASOS_E4_RECOLECCION,
-            }
-            desde = orden.index(etapa_cod)
-            for cod in orden[desde:]:
-                cambios[COL_TERM_POR_COD[cod]] = "NO"
-                for _c, _e, cf, cu in pasos_por_cod[cod]:
-                    cambios[cf] = pd.NaT
-                    cambios[cu] = ""
-            mensaje = aplicar_guardado(
-                df, clave_registro, cambios, "Reactivación",
-                f"Etapa '{ETAPA_NOMBRE_POR_COD[etapa_cod]}' reactivada",
-            )
-            persistir_y_sincronizar(df, mensaje, "Etapa reactivada.")
-
-
-# Mapas auxiliares para reactivación
-ETAPA_NOMBRE_POR_COD = {"E1": ETAPA_1, "E2": ETAPA_2, "E3": ETAPA_3, "E4": ETAPA_4}
-COL_TERM_POR_COD = {"E1": COL_E1_TERM, "E2": COL_E2_TERM, "E3": COL_E3_TERM, "E4": COL_E4_TERM}
-COL_DIAS_POR_COD = {"E1": COL_E1_DIAS, "E2": COL_E2_DIAS, "E3": COL_E3_DIAS}
-
-
-def modalidad_destino_final(fila: pd.Series) -> str:
-    """Determina la modalidad de la etapa 4 (Recolección o Destrucción).
-
-    Prioridad:
-      1. La columna E4 MODALIDAD, si está definida.
-      2. Si no, se deriva de la respuesta del proveedor: solo 'Recolección'
-         lleva a recolección; destrucción o sin respuesta llevan a destrucción.
-
-    Esto evita que un registro con respuesta 'Recolección' aparezca como
-    destrucción cuando la modalidad no quedó grabada.
-    """
-    modalidad = str(fila.get(COL_E4_MODALIDAD, "")).strip()
-    if modalidad in (RESP_RECOLECCION, RESP_DESTRUCCION):
-        return modalidad
-    respuesta = str(fila.get(COL_RESPUESTA_TIPO, "")).strip()
-    return RESP_RECOLECCION if respuesta == RESP_RECOLECCION else RESP_DESTRUCCION
-
-
-def _pasos_de_etapa(cod: str, fila: pd.Series) -> list:
-    """Devuelve la lista de pasos de una etapa. Para E4 depende de la modalidad."""
-    if cod == "E1":
-        return PASOS_E1
-    if cod == "E2":
-        return PASOS_E2
-    if cod == "E3":
-        return PASOS_E3
-    modalidad = modalidad_destino_final(fila)
-    return PASOS_E4_RECOLECCION if modalidad == RESP_RECOLECCION else PASOS_E4_DESTRUCCION
-
-
-def _panel_ajuste_manual(etapa_cod: str, fila: pd.Series) -> None:
-    """Panel protegido con clave para capturar/corregir fechas de pasos ya realizados.
-
-    Sirve para registros que se completaron antes de usar la app: permite poner
-    la fecha real de cada paso (retroactiva), quién lo hizo, y cerrar la etapa
-    con esa fecha para que los días transcurridos se calculen correctamente.
-    """
-    clave = fila["CLAVE"]
-    pasos = _pasos_de_etapa(etapa_cod, fila)
-    nombre_etapa = ETAPA_NOMBRE_POR_COD[etapa_cod]
-
-    with st.expander("🗓️ Ajuste manual de fechas (requiere clave)"):
-        st.caption(
-            "Usa esta opción cuando la etapa se realizó **antes** de usar la app y "
-            "necesitas capturar las fechas reales. Puedes dejar en blanco los pasos "
-            "que no apliquen."
-        )
-        clave_in = st.text_input(
-            "Clave de autorización", type="password",
-            key=f"aj_clave_{etapa_cod}_{clave}",
-        )
-
-        with st.form(f"form_ajuste_{etapa_cod}_{clave}"):
-            st.markdown("##### Fecha y responsable de cada paso")
-            valores = {}
-            for pkey, etiqueta, cf, cu in pasos:
-                c1, c2, c3 = st.columns([2, 2, 2])
-                fecha_actual = _a_fecha(fila.get(cf))
-                usar = c1.checkbox(
-                    etiqueta, value=fecha_actual is not None,
-                    key=f"aj_use_{etapa_cod}_{pkey}_{clave}",
-                )
-                fecha_in = c2.date_input(
-                    "Fecha", value=fecha_actual or hoy_mx(), format="DD/MM/YYYY",
-                    key=f"aj_fecha_{etapa_cod}_{pkey}_{clave}",
-                    label_visibility="collapsed",
-                )
-                usuario_in = c3.text_input(
-                    "Responsable",
-                    value=str(fila.get(cu, "") or ""),
-                    placeholder="Responsable",
-                    key=f"aj_user_{etapa_cod}_{pkey}_{clave}",
-                    label_visibility="collapsed",
-                )
-                valores[pkey] = (usar, fecha_in, usuario_in, cf, cu)
-
-            st.divider()
-            cerrar_etapa = st.checkbox(
-                f"Marcar la etapa '{nombre_etapa}' como TERMINADA con estas fechas",
-                value=es_verdadero(fila.get(COL_TERM_POR_COD[etapa_cod])),
-                key=f"aj_cerrar_{etapa_cod}_{clave}",
-                help="Al cerrarla se activa la siguiente etapa y se calculan los días "
-                     "transcurridos con la fecha del último paso.",
-            )
-
-            # En la etapa 2, la respuesta del proveedor define hacia dónde avanza.
-            respuesta_aj = None
-            if etapa_cod == "E2":
-                actual = str(fila.get(COL_RESPUESTA_TIPO, "")).strip()
-                opciones = [RESP_RECOLECCION, RESP_DESTRUCCION, RESP_SIN]
-                idx = opciones.index(actual) if actual in opciones else 0
-                respuesta_aj = st.radio(
-                    "Respuesta del proveedor (define la siguiente etapa)",
-                    options=opciones, index=idx, horizontal=True,
-                    key=f"aj_resp_{clave}",
-                )
-
-            firma = st.text_input(
-                "Tu nombre / usuario (quien hace el ajuste)",
-                key=f"aj_firma_{etapa_cod}_{clave}",
-            )
-            aplicar = st.form_submit_button(
-                "💾 Aplicar ajuste manual", use_container_width=True
-            )
-
-        if not aplicar:
-            return
-        if clave_in != clave_autorizacion():
-            st.error("🔒 Clave de autorización incorrecta.")
-            return
-        if not firma.strip():
-            st.error("✍️ Firma con tu nombre antes de aplicar el ajuste.")
-            return
-
-        df = st.session_state["df"]
-        cambios = {}
-        fechas_marcadas = []
-        for pkey, (usar, fecha_in, usuario_in, cf, cu) in valores.items():
-            if usar:
-                cambios[cf] = pd.Timestamp(fecha_in)
-                cambios[cu] = usuario_in.strip() or firma.strip()
-                fechas_marcadas.append(fecha_in)
-            else:
-                cambios[cf] = pd.NaT
-                cambios[cu] = ""
-
-        if etapa_cod == "E2" and respuesta_aj:
-            cambios[COL_RESPUESTA_TIPO] = respuesta_aj
-
-        mensaje_log = f"Ajuste manual de fechas en '{nombre_etapa}'"
-
-        if cerrar_etapa:
-            if not fechas_marcadas:
-                st.error("Marca al menos un paso con su fecha antes de cerrar la etapa.")
-                return
-            cambios[COL_TERM_POR_COD[etapa_cod]] = "SÍ"
-            fecha_cierre = max(fechas_marcadas)  # la fecha del último paso realizado
-
-            # Días transcurridos, calculados con la fecha real de cierre.
-            limites = calcular_fechas_limite(fila)
-            if etapa_cod == "E1":
-                corte = _a_fecha(fila.get(COL_FECHA_CORTE))
-                if corte:
-                    cambios[COL_E1_DIAS] = (fecha_cierre - corte).days
-                cambios[COL_ETAPA] = ETAPA_2
-                cambios[COL_E1_LIMITE] = (pd.Timestamp(limites["E1"])
-                                          if limites["E1"] else pd.NaT)
-            elif etapa_cod == "E2":
-                if limites["E2"]:
-                    cambios[COL_E2_DIAS] = (fecha_cierre - limites["E2"]).days + DIAS_ETAPA_2
-                    cambios[COL_E2_LIMITE] = pd.Timestamp(limites["E2"])
-                # Gestión SIEMPRE pasa a Disposición final.
-                cambios[COL_ETAPA] = ETAPA_4
-                if respuesta_aj == RESP_RECOLECCION:
-                    cambios[COL_E4_MODALIDAD] = RESP_RECOLECCION
-                    cambios[COL_E4_LIMITE_REC] = pd.Timestamp(
-                        fecha_cierre + timedelta(days=DIAS_RECOLECCION)
-                    )
-                else:
-                    cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
-            elif etapa_cod == "E4":
-                # Disposición final SIEMPRE pasa a Cuentas por pagar.
-                cambios[COL_ETAPA] = ETAPA_3
-            else:  # E3 — última etapa: cierra el proceso
-                if limites["E3"]:
-                    cambios[COL_E3_DIAS] = (fecha_cierre - limites["E3"]).days + DIAS_ETAPA_3
-                    cambios[COL_E3_LIMITE] = pd.Timestamp(limites["E3"])
-                cambios[COL_ETAPA] = ETAPA_FINAL
-
-            mensaje_log += f" · etapa TERMINADA con fecha {fecha_cierre:%d/%m/%Y}"
-        else:
-            # Si se desmarca el cierre, la etapa vuelve a quedar abierta.
-            cambios[COL_TERM_POR_COD[etapa_cod]] = "NO"
-            cambios[COL_ETAPA] = nombre_etapa
-
-        mensaje = aplicar_guardado(df, clave, cambios, firma.strip(), mensaje_log)
-        persistir_y_sincronizar(df, mensaje, "Ajuste manual aplicado.")
-
-
-def _etapa_bloqueada(fila: pd.Series, etapa_cod: str) -> bool:
-    """Una etapa está bloqueada para edición si ya fue terminada."""
-    return es_verdadero(fila.get(COL_TERM_POR_COD[etapa_cod]))
-
-
-def _paso_quedo_hecho(col_fecha: str, cambios: dict, fila: pd.Series) -> bool:
-    """True si el paso (su fecha) quedó registrado: nuevo en cambios o ya en la fila."""
-    if col_fecha in cambios:
-        val = cambios[col_fecha]
-        # Si se acaba de limpiar (NaT/""), no está hecho
-        if val in ("", None) or (isinstance(val, float) and pd.isna(val)):
-            return False
+def subir_a_github(mensaje_commit: str) -> tuple[bool, str]:
+    """Hace commit y push del Excel usando GitPython y st.secrets['GITHUB_TOKEN']."""
+    try:
+        from git import Repo
+    except ImportError:
+        return False, "GitPython no está instalado (revisa requirements.txt)."
+    token = st.secrets.get("GITHUB_TOKEN")
+    if not token:
+        return False, ("Falta 'GITHUB_TOKEN' en los secretos. Los cambios se "
+                       "guardaron localmente pero no se subieron al repositorio.")
+    try:
+        repo = Repo(RUTA_BASE, search_parent_directories=True)
+        with repo.config_writer() as cw:
+            cw.set_value("user", "name", "Dashboard Devoluciones")
+            cw.set_value("user", "email", "dashboard@devoluciones.app")
+        repo.index.add([RUTA_EXCEL])
+        if not repo.index.diff("HEAD"):
+            return True, "No había cambios nuevos que subir."
+        repo.index.commit(mensaje_commit)
+        origen = repo.remote(name="origin")
+        url = origen.url
+        if url.startswith("git@github.com:"):
+            url = url.replace("git@github.com:", "https://github.com/")
+        if not url.endswith(".git"):
+            url = url + ".git"
+        if "@" in url and url.startswith("https://"):
+            url = "https://" + url.split("@", 1)[1]
+        url_token = url.replace("https://", f"https://x-access-token:{token}@")
+        entorno = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo",
+                   "GCM_INTERACTIVE": "never"}
+        rama = repo.active_branch.name
         try:
-            if pd.isna(val):
-                return False
-        except (TypeError, ValueError):
-            pass
-        return True
-    return _a_fecha(fila.get(col_fecha)) is not None
+            with repo.git.custom_environment(**entorno):
+                repo.git.push(url_token, f"HEAD:{rama}")
+        finally:
+            origen.set_url(url)
+        return True, "Cambios subidos al repositorio ✅"
+    except Exception as e:
+        detalle = str(e)
+        if "403" in detalle or "denied" in detalle.lower():
+            ayuda = " — El token no tiene permiso de escritura."
+        elif "could not read Password" in detalle or "Authentication" in detalle:
+            ayuda = " — El token es inválido o expiró; genera uno nuevo."
+        else:
+            ayuda = ""
+        return False, f"Error al subir a GitHub: {detalle}{ayuda}"
 
 
-def _registrar_pasos_form(fila, pasos, prefijo, solo_lectura):
-    """Renderiza un checkbox por paso. Devuelve (cambios, cols_usuario_nuevas).
+def persistir(datos: dict, mensaje_commit: str, mensaje_ok: str) -> None:
+    """Guarda a Excel, sube a GitHub, recarga en el ORDEN correcto y re-renderiza."""
+    try:
+        guardar_excel(datos, RUTA_EXCEL)
+    except Exception as e:
+        st.error(f"No se pudo escribir el Excel: {e}")
+        return
+    with st.spinner("Guardando y sincronizando…"):
+        exito, msg = subir_a_github(mensaje_commit)
+    cargar_datos.clear()
+    st.session_state["version_datos"] += 1
+    st.session_state["datos"] = cargar_datos(RUTA_EXCEL,
+                                              st.session_state["version_datos"])
+    if exito:
+        st.session_state["flash"] = ("success", f"✅ {mensaje_ok} · {msg}")
+    else:
+        st.session_state["flash"] = ("warning",
+                                     f"💾 {mensaje_ok} · Guardado local, pero: {msg}")
+    st.rerun()
 
-    cambios: dict columna->valor a aplicar.
-    cols_usuario_nuevas: lista de columnas de usuario a llenar con la firma.
-    """
-    cambios = {}
-    cols_usuario_nuevas = []
+
+# =============================================================================
+# 7. TABLERO DIRECTIVO
+# =============================================================================
+
+def _filtro_periodo(df_g: pd.DataFrame, df_nc: pd.DataFrame,
+                     prefijo: str = "dir") -> tuple:
+    """Filtro por rango de fechas o por mes. Aplica a ambos DataFrames."""
+    c1, c2, c3 = st.columns([1, 1.5, 1.5])
+    modo = c1.radio("Filtrar por", ["Mes", "Rango de fechas"],
+                     horizontal=True, key=f"{prefijo}_modo")
+
     hoy = hoy_mx()
-    for clave, etiqueta, cf, cu in pasos:
-        ya_hecho = _a_fecha(fila.get(cf)) is not None
-        col1, col2 = st.columns([3, 2])
-        marcado = col1.checkbox(
-            etiqueta, value=ya_hecho, disabled=solo_lectura,
-            key=f"{prefijo}_{clave}_{fila['CLAVE']}",
-        )
-        if ya_hecho:
-            col2.caption(f"{_fmt_fecha(fila.get(cf))} · {fila.get(cu, '') or '—'}")
-        if marcado and not ya_hecho:
-            cambios[cf] = pd.Timestamp(hoy)
-            cols_usuario_nuevas.append(cu)
-        elif not marcado and ya_hecho and not solo_lectura:
-            cambios[cf] = pd.NaT
-            cambios[cu] = ""
-    return cambios, cols_usuario_nuevas
-
-
-# =============================================================================
-# 8. PESTAÑAS DE ETAPAS
-# =============================================================================
-
-def pestania_etapa1(fila: pd.Series) -> None:
-    """Etapa 1 — Reporte de reclamo (7 días desde FECHA CORTE)."""
-    clave = fila["CLAVE"]
-    terminada = _etapa_bloqueada(fila, "E1")
-    limites = calcular_fechas_limite(fila)
-
-    st.markdown(f"#### 1️⃣ {ETAPA_1}")
-    st.caption("Pasos: Recepción de Folio → Revisión de folio → Envío a proveedores. "
-               "Plazo de 7 días desde la fecha de corte.")
-    _mostrar_alarma(limites["E1"], terminada)
-
-    if terminada:
-        st.success("Etapa terminada y bloqueada. Continúa en la pestaña **Gestión**.")
-        _resumen_pasos(fila, PASOS_E1)
-        dias = fila.get(COL_E1_DIAS)
-        if str(dias).strip():
-            st.metric("Días que tardó la etapa", f"{float(dias):.0f}"
-                      if str(dias).replace('.', '').replace('-', '').isdigit() else dias)
-        if str(fila.get(COL_E1_OBS, "")).strip():
-            st.info(f"📝 Observaciones: {fila.get(COL_E1_OBS)}")
-        _boton_reactivar("E1", clave)
-        _panel_ajuste_manual("E1", fila)
-        return
-
-    with st.form(f"form_e1_{clave}"):
-        cambios, cols_usuario = _registrar_pasos_form(fila, PASOS_E1, "e1", solo_lectura=False)
-        obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E1_OBS, "") or ""),
-                           placeholder="Notas sobre la recepción/revisión/envío…")
-        usuario = st.text_input("Tu nombre / usuario", key=f"u_e1_{clave}")
-        guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
-
-    # Ajuste manual disponible también con la etapa abierta
-    _panel_ajuste_manual("E1", fila)
-
-    if not guardar:
-        return
-    if not usuario.strip():
-        st.error("✍️ Firma con tu nombre antes de guardar.")
-        return
-
-    df = st.session_state["df"]
-    for cu in cols_usuario:
-        cambios[cu] = usuario.strip()
-    cambios[COL_E1_OBS] = obs.strip()
-    if limites["E1"]:
-        cambios[COL_E1_LIMITE] = pd.Timestamp(limites["E1"])
-
-    # ¿Se completó el último paso (Envío a proveedores)?
-    envio_hecho = _paso_quedo_hecho(PASOS_E1[-1][2], cambios, fila)
-    mensaje_log = "Avance en Reporte de reclamo"
-    if envio_hecho:
-        # Cerrar etapa 1: contar días desde FECHA CORTE y activar etapa 2
-        corte = _a_fecha(fila.get(COL_FECHA_CORTE))
-        if corte:
-            cambios[COL_E1_DIAS] = (hoy_mx() - corte).days
-        cambios[COL_E1_TERM] = "SÍ"
-        cambios[COL_ETAPA] = ETAPA_2
-        mensaje_log = "Etapa 1 (Reporte de reclamo) TERMINADA → pasa a Gestión"
-
-    mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=envio_hecho)
-
-
-def pestania_etapa2(fila: pd.Series) -> None:
-    """Etapa 2 — Gestión (30 días desde el vencimiento de la etapa 1)."""
-    clave = fila["CLAVE"]
-    etapa_actual = str(fila.get(COL_ETAPA, "")).strip()
-    disponible = etapa_actual in (ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL) or _etapa_bloqueada(fila, "E1")
-    terminada = _etapa_bloqueada(fila, "E2")
-    limites = calcular_fechas_limite(fila)
-
-    st.markdown(f"#### 2️⃣ {ETAPA_2}")
-    st.caption("Pasos: Enviado a proveedor → Seguimiento → Respuesta de proveedor. "
-               "Plazo de 30 días desde el vencimiento de la etapa anterior.")
-
-    if not disponible:
-        st.warning("🔒 Esta etapa se activa cuando termines la etapa **Reporte de reclamo**.")
-        return
-
-    _mostrar_alarma(limites["E2"], terminada)
-
-    if terminada:
-        st.success(f"Etapa terminada. Respuesta del proveedor: "
-                   f"**{fila.get(COL_RESPUESTA_TIPO, '—')}**.")
-        _resumen_pasos(fila, PASOS_E2)
-        if str(fila.get(COL_E2_COMPROMISO, "")).strip():
-            st.info(f"📅 Fecha compromiso de recolección: {_fmt_fecha(fila.get(COL_E2_COMPROMISO))}")
-        if str(fila.get(COL_E2_OBS, "")).strip():
-            st.info(f"📝 Observaciones: {fila.get(COL_E2_OBS)}")
-        _boton_reactivar("E2", clave)
-        _panel_ajuste_manual("E2", fila)
-        return
-
-    with st.form(f"form_e2_{clave}"):
-        cambios, cols_usuario = _registrar_pasos_form(fila, PASOS_E2, "e2", solo_lectura=False)
-
-        st.markdown("##### Respuesta del proveedor")
-        respuesta = st.radio(
-            "¿Cuál fue la respuesta?",
-            options=[RESP_RECOLECCION, RESP_DESTRUCCION, RESP_SIN],
-            horizontal=True, key=f"resp_{clave}",
-        )
-        fecha_compromiso = None
-        if respuesta == RESP_RECOLECCION:
-            fecha_compromiso = st.date_input(
-                "Fecha compromiso de recolección", value=hoy_mx(),
-                format="DD/MM/YYYY", key=f"comp_{clave}",
-            )
-            st.info(f"Al cerrar, se activará **{ETAPA_4}** en modalidad recolección, "
-                    f"con un contador de {DIAS_RECOLECCION} días para recoger.")
-        elif respuesta == RESP_DESTRUCCION:
-            st.warning("Destrucción: se reportará a Devoluciones y se informará a CxP de la "
-                       "nota de crédito. Al cerrar se activará **Cuentas por pagar**.")
-        else:
-            st.warning("Sin respuesta: al vencer el plazo se notifica a CxP para negociación. "
-                       "Al cerrar se activará **Cuentas por pagar**.")
-
-        obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E2_OBS, "") or ""))
-        st.caption("Al marcar 'Respuesta de proveedor' se cierra la etapa y se activa la "
-                   "siguiente según la respuesta seleccionada.")
-        usuario = st.text_input("Tu nombre / usuario", key=f"u_e2_{clave}")
-        guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
-
-    # Ajuste manual disponible también con la etapa abierta
-    _panel_ajuste_manual("E2", fila)
-
-    if not guardar:
-        return
-    if not usuario.strip():
-        st.error("✍️ Firma con tu nombre antes de guardar.")
-        return
-
-    df = st.session_state["df"]
-    for cu in cols_usuario:
-        cambios[cu] = usuario.strip()
-    cambios[COL_E2_OBS] = obs.strip()
-    cambios[COL_RESPUESTA_TIPO] = respuesta
-    if limites["E2"]:
-        cambios[COL_E2_LIMITE] = pd.Timestamp(limites["E2"])
-    if respuesta == RESP_RECOLECCION and fecha_compromiso:
-        cambios[COL_E2_COMPROMISO] = pd.Timestamp(fecha_compromiso)
-
-    # La etapa cierra cuando el último paso (Respuesta de proveedor) queda marcado.
-    cerrar = _paso_quedo_hecho(PASOS_E2[-1][2], cambios, fila)
-    mensaje_log = "Avance en Gestión"
-    if cerrar:
-        # Cerrar etapa 2: SIEMPRE pasa a Disposición final (flujo lineal).
-        # La respuesta del proveedor ya no decide la etapa siguiente, solo
-        # define los pasos que se mostrarán en Disposición final.
-        for cu in [p[3] for p in PASOS_E2]:
-            if not str(fila.get(cu, "")).strip() and cu not in cambios:
-                cambios[cu] = usuario.strip()
-        lim_e2 = limites["E2"]
-        if lim_e2:
-            cambios[COL_E2_DIAS] = (hoy_mx() - lim_e2).days + DIAS_ETAPA_2
-        cambios[COL_E2_TERM] = "SÍ"
-        cambios[COL_ETAPA] = ETAPA_4
-        if respuesta == RESP_RECOLECCION:
-            cambios[COL_E4_MODALIDAD] = RESP_RECOLECCION
-            # Contador independiente: 20 días para recoger desde que se define.
-            cambios[COL_E4_LIMITE_REC] = pd.Timestamp(hoy_mx() + timedelta(days=DIAS_RECOLECCION))
-        else:
-            cambios[COL_E4_MODALIDAD] = RESP_DESTRUCCION
-        mensaje_log = (f"Etapa 2 TERMINADA · {respuesta} → pasa a {ETAPA_4}")
-
-    mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=bool(cerrar))
-
-
-def pestania_etapa3(fila: pd.Series) -> None:
-    """Cuentas por pagar — última etapa del flujo, tras Disposición final."""
-    clave = fila["CLAVE"]
-    etapa_actual = str(fila.get(COL_ETAPA, "")).strip()
-    # Se activa al cerrar Disposición final (todas las reclamaciones pasan por aquí).
-    disponible = etapa_actual in (ETAPA_3, ETAPA_FINAL) or _etapa_bloqueada(fila, "E4")
-    terminada = _etapa_bloqueada(fila, "E3")
-    limites = calcular_fechas_limite(fila)
-
-    st.markdown(f"#### 4️⃣ {ETAPA_3}")
-    st.caption("Pasos: Seguimiento → Recepción de nota de crédito → Aplicación de pago. "
-               "Es la última etapa: al cerrarla se da por terminado todo el proceso "
-               f"(plazo total de {DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte).")
-
-    if not disponible:
-        st.warning(f"🔒 Esta etapa se activa cuando cierres **{ETAPA_4}**.")
-        return
-
-    _mostrar_alarma(limites["E3"], terminada)
-
-    # Aviso por vencimiento: si venció sin avanzar, alarma de destrucción por vencimiento
-    nivel, _ = estado_alarma(limites["E3"], terminada)
-    if nivel == "danger" and not terminada:
-        st.error("⚠️ Vencido sin respuesta del proveedor: informar al proveedor de la "
-                 "**destrucción por vencimiento**. Estatus sugerido: 'Aplicación a factura'. "
-                 "Notificar a Devoluciones para proceder con la destrucción.")
-
-    if terminada:
-        st.success("🎉 Proceso TERMINADO. Todas las etapas y fechas quedaron registradas.")
-        _resumen_pasos(fila, PASOS_E3)
-        campos_lectura = [
-            ("📄 Folio de devolución", COL_E3_FOLIO_DEV_NUEVO),
-            ("📝 Folio de ajuste", COL_E3_FOLIO_AJUSTE),
-            ("💳 Nota de crédito", COL_E3_NOTA_CREDITO),
-        ]
-        for etiqueta, col in campos_lectura:
-            valor = str(fila.get(col, "") or "").strip()
-            if valor:
-                st.info(f"{etiqueta}: {valor}")
-        if str(fila.get(COL_E3_OBS, "")).strip():
-            st.info(f"📝 Observaciones: {fila.get(COL_E3_OBS)}")
-        _boton_reactivar("E3", clave)
-        _panel_ajuste_manual("E3", fila)
-        return
-
-    with st.form(f"form_e3_{clave}"):
-        cambios, cols_usuario = _registrar_pasos_form(fila, PASOS_E3, "e3", solo_lectura=False)
-        st.markdown("##### Referencias del pago")
-        c_f1, c_f2, c_f3 = st.columns(3)
-        folio_dev = c_f1.text_input(
-            "Folio de devolución",
-            value=str(fila.get(COL_E3_FOLIO_DEV_NUEVO, "") or ""),
-            placeholder="Ej. FD-2026-0451",
-        )
-        folio_aj = c_f2.text_input(
-            "Folio de ajuste",
-            value=str(fila.get(COL_E3_FOLIO_AJUSTE, "") or ""),
-            placeholder="Ej. FA-2026-0088",
-        )
-        nota_cred = c_f3.text_input(
-            "Nota de crédito",
-            value=str(fila.get(COL_E3_NOTA_CREDITO, "") or ""),
-            placeholder="Ej. NC-2026-0123",
-        )
-        obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E3_OBS, "") or ""))
-        st.caption("Al registrar 'Aplicación de pago' se da por terminado TODO el "
-                   "proceso de la reclamación.")
-        usuario = st.text_input("Tu nombre / usuario", key=f"u_e3_{clave}")
-        guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
-
-    # Ajuste manual disponible también con la etapa abierta
-    _panel_ajuste_manual("E3", fila)
-
-    if not guardar:
-        return
-    if not usuario.strip():
-        st.error("✍️ Firma con tu nombre antes de guardar.")
-        return
-
-    df = st.session_state["df"]
-    for cu in cols_usuario:
-        cambios[cu] = usuario.strip()
-    cambios[COL_E3_OBS] = obs.strip()
-    cambios[COL_E3_FOLIO_DEV_NUEVO] = folio_dev.strip()
-    cambios[COL_E3_FOLIO_AJUSTE] = folio_aj.strip()
-    cambios[COL_E3_NOTA_CREDITO] = nota_cred.strip()
-    if limites["E3"]:
-        cambios[COL_E3_LIMITE] = pd.Timestamp(limites["E3"])
-
-    # ¿Se completó el último paso (Aplicación de pago)?
-    aplicacion_hecha = _paso_quedo_hecho(PASOS_E3[-1][2], cambios, fila)
-    mensaje_log = "Avance en Cuentas por pagar"
-    if aplicacion_hecha:
-        lim_e3 = limites["E3"]
-        if lim_e3:
-            cambios[COL_E3_DIAS] = (hoy_mx() - lim_e3).days + DIAS_ETAPA_3
-        cambios[COL_E3_TERM] = "SÍ"
-        # Cuentas por pagar es la ÚLTIMA etapa del flujo: cierra el proceso.
-        cambios[COL_ETAPA] = ETAPA_FINAL
-        mensaje_log = "Etapa Cuentas por pagar TERMINADA · PROCESO FINALIZADO"
-
-    mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=aplicacion_hecha)
-
-
-def pestania_etapa4(fila: pd.Series) -> None:
-    """Disposición final — va después de Gestión y antes de Cuentas por pagar."""
-    clave = fila["CLAVE"]
-    etapa_actual = str(fila.get(COL_ETAPA, "")).strip()
-    modalidad = modalidad_destino_final(fila)
-    # Se activa al cerrar Gestión; sigue visible en las etapas posteriores.
-    disponible = (etapa_actual in (ETAPA_4, ETAPA_3, ETAPA_FINAL)
-                  or _etapa_bloqueada(fila, "E2"))
-    terminada = _etapa_bloqueada(fila, "E4")
-
-    st.markdown(f"#### 3️⃣ {ETAPA_4}")
-    st.caption("Define el destino del producto. Los pasos dependen de la respuesta "
-               f"del proveedor. Al cerrarla se activa **{ETAPA_3}**.")
-
-    if not disponible:
-        st.warning(f"🔒 Esta etapa se activa al cerrar **{ETAPA_2}**.")
-        return
-
-    st.info(f"Modalidad: **{modalidad}**")
-
-    # Corrector de modalidad (por si quedó mal grabada en un registro).
-    with st.expander("🔀 Corregir modalidad (requiere clave)"):
-        st.caption("La modalidad debe coincidir con la respuesta del proveedor "
-                   f"registrada en Gestión: **{fila.get(COL_RESPUESTA_TIPO, '') or '—'}**. "
-                   "Usa esto solo si quedó grabada de forma incorrecta.")
-        cm1, cm2, cm3 = st.columns([2, 2, 1])
-        clave_mod = cm1.text_input("Clave", type="password", key=f"clave_mod_{clave}")
-        nueva_mod = cm2.selectbox(
-            "Modalidad correcta", options=[RESP_RECOLECCION, RESP_DESTRUCCION],
-            index=0 if modalidad == RESP_RECOLECCION else 1,
-            key=f"sel_mod_{clave}",
-        )
-        if cm3.button("Aplicar", key=f"btn_mod_{clave}", use_container_width=True):
-            if clave_mod != clave_autorizacion():
-                st.error("Clave incorrecta.")
-            elif nueva_mod == modalidad:
-                st.info("La modalidad ya es esa; no hay cambios.")
-            else:
-                df = st.session_state["df"]
-                cambios = {COL_E4_MODALIDAD: nueva_mod}
-                # Si pasa a recolección, fijar el límite de 20 días si no existe.
-                if nueva_mod == RESP_RECOLECCION and _a_fecha(fila.get(COL_E4_LIMITE_REC)) is None:
-                    cambios[COL_E4_LIMITE_REC] = pd.Timestamp(
-                        hoy_mx() + timedelta(days=DIAS_RECOLECCION))
-                mensaje = aplicar_guardado(
-                    df, clave, cambios, "Corrección",
-                    f"Modalidad de {ETAPA_4} corregida a '{nueva_mod}'",
-                )
-                persistir_y_sincronizar(df, mensaje, "Modalidad corregida.")
-
-    # Alarma del plazo de la etapa (parte de los 90 días globales)
-    limites = calcular_fechas_limite(fila)
-    _mostrar_alarma(limites["E4"], terminada)
-
-    # ----- RECOLECCIÓN -----
-    if modalidad == RESP_RECOLECCION:
-        # Contador INDEPENDIENTE: 20 días para que recojan el producto, contados
-        # desde que se definió la recolección al cerrar Gestión.
-        lim_rec = _a_fecha(fila.get(COL_E4_LIMITE_REC))
-        if lim_rec:
-            dias_rest = (lim_rec - hoy_mx()).days
-            if terminada:
-                st.info(f"📦 Recolección · fecha límite: {lim_rec:%d/%m/%Y}")
-            elif dias_rest < 0:
-                st.error(f"📦 **Recolección vencida** hace {abs(dias_rest)} día(s) "
-                         f"(límite {lim_rec:%d/%m/%Y}). Procede a enviarlo a destrucción.")
-                if st.button("➡️ Cambiar a destrucción por vencimiento",
-                             key=f"to_destr_{clave}"):
-                    df = st.session_state["df"]
-                    cambios = {COL_E4_MODALIDAD: RESP_DESTRUCCION}
-                    mensaje = aplicar_guardado(
-                        df, clave, cambios, "Sistema",
-                        f"Recolección vencida ({DIAS_RECOLECCION} días) → cambia a destrucción")
-                    persistir_y_sincronizar(df, mensaje, "Cambiado a destrucción.")
-            elif dias_rest <= 5:
-                st.warning(f"📦 Recolección: quedan {dias_rest} día(s) "
-                           f"(límite {lim_rec:%d/%m/%Y}).")
-            else:
-                st.info(f"📦 Recolección: quedan {dias_rest} día(s) de los "
-                        f"{DIAS_RECOLECCION} (límite {lim_rec:%d/%m/%Y}).")
-
-        st.caption("Recolección: Programación → Recolección → Recepción de folio "
-                   "de devolución.")
-        pasos = PASOS_E4_RECOLECCION
-        ultimo_etiqueta = "Recepción de folio de devolución"
-    # ----- DESTRUCCIÓN -----
-    else:
-        st.caption("Destrucción: Reporte al almacén de devoluciones → Recepción de "
-                   "folio de ajuste.")
-        pasos = PASOS_E4_DESTRUCCION
-        ultimo_etiqueta = "Recepción de folio de ajuste"
-
-    if terminada:
-        st.success(f"Etapa terminada. Continúa en **{ETAPA_3}**.")
-        _resumen_pasos(fila, pasos)
-        if str(fila.get(COL_E4_OBS, "")).strip():
-            st.info(f"📝 Observaciones: {fila.get(COL_E4_OBS)}")
-        _boton_reactivar("E4", clave)
-        _panel_ajuste_manual("E4", fila)
-        return
-
-    with st.form(f"form_e4_{clave}"):
-        cambios, cols_usuario = _registrar_pasos_form(fila, pasos, "e4", solo_lectura=False)
-        obs = st.text_area("Observaciones de la etapa", value=str(fila.get(COL_E4_OBS, "") or ""))
-        st.caption(f"Al registrar '{ultimo_etiqueta}' se cierra esta etapa y se "
-                   f"activa **{ETAPA_3}**.")
-        usuario = st.text_input("Tu nombre / usuario", key=f"u_e4_{clave}")
-        guardar = st.form_submit_button("💾 Guardar avance", use_container_width=True)
-
-    # Ajuste manual disponible también con la etapa abierta
-    _panel_ajuste_manual("E4", fila)
-
-    if not guardar:
-        return
-    if not usuario.strip():
-        st.error("✍️ Firma con tu nombre antes de guardar.")
-        return
-
-    df = st.session_state["df"]
-    for cu in cols_usuario:
-        cambios[cu] = usuario.strip()
-    cambios[COL_E4_OBS] = obs.strip()
-
-    ultimo_hecho = _paso_quedo_hecho(pasos[-1][2], cambios, fila)
-    mensaje_log = f"Avance en {ETAPA_4}"
-    if ultimo_hecho:
-        cambios[COL_E4_TERM] = "SÍ"
-        # Disposición final SIEMPRE pasa a Cuentas por pagar (flujo lineal).
-        cambios[COL_ETAPA] = ETAPA_3
-        mensaje_log = f"Etapa {ETAPA_4} TERMINADA → pasa a {ETAPA_3}"
-
-    mensaje = aplicar_guardado(df, clave, cambios, usuario.strip(), mensaje_log)
-    persistir_y_sincronizar(df, mensaje, "Avance guardado.", celebrar=ultimo_hecho)
-
-
-# =============================================================================
-# 9. VISTA DE EDICIÓN (las 4 etapas en pestañas)
-# =============================================================================
-
-def vista_editar(df: pd.DataFrame) -> None:
-    st.subheader("✏️ Editar reclamación")
-    if "flash" in st.session_state:
-        tipo, texto = st.session_state.pop("flash")
-        (st.success if tipo == "success" else st.warning)(texto)
-    # Globos SOLO al terminar una etapa (bandera de un solo uso).
-    if st.session_state.pop("celebrar", False):
-        st.balloons()
-
-    if df.empty:
-        st.info("No hay registros con los filtros actuales.")
-        return
-
-    df_sel = df.copy()
-    df_sel["ETIQUETA"] = ("Folio " + df_sel[COL_FOLIO].astype(str)
-                          + " · " + df_sel[COL_PROVEEDOR].str.slice(0, 40)
-                          + " · [" + df_sel[COL_ETAPA].astype(str) + "]")
-    etiqueta = st.selectbox("Selecciona la reclamación (por Folio)",
-                            options=df_sel["ETIQUETA"].tolist())
-    fila = df_sel[df_sel["ETIQUETA"] == etiqueta].iloc[0]
-
-    # Ficha compacta del registro (una sola línea, no ocupa espacio)
-    imp = pd.to_numeric(pd.Series([fila.get(COL_IMPORTE)]), errors="coerce").iloc[0]
-    imp_txt = f"${imp:,.2f}" if pd.notna(imp) else "—"
-    lim90 = fecha_vencimiento_90(fila)
-    st.markdown(
-        f"""<div style='display:flex;gap:1.2rem;flex-wrap:wrap;
-                        padding:0.4rem 0.7rem;margin:0.2rem 0 0.5rem 0;
-                        border:1px solid #e6e6e6;border-radius:8px;font-size:0.82rem'>
-          <span><b>Folio:</b> {fila[COL_FOLIO]}</span>
-          <span><b>Proveedor:</b> {fila[COL_PROVEEDOR]}</span>
-          <span><b>Importe:</b> {imp_txt}</span>
-          <span><b>Comprador:</b> {fila[COL_COMPRADOR] or '—'}</span>
-          <span><b>Corte:</b> {_fmt_fecha(fila.get(COL_FECHA_CORTE))}</span>
-          <span><b>Vence 90d:</b> {lim90:%d/%m/%Y}</span>
-          <span><b>Etapa:</b> <code>{fila.get(COL_ETAPA, '—')}</code></span>
-          <span><b>Respuesta:</b> {fila.get(COL_RESPUESTA_TIPO, '') or '—'}</span>
-          <span><b>Carta:</b> {fila.get(COL_CARTA_FIRMADA, '—')}</span>
-        </div>""" if lim90 else
-        f"""<div style='display:flex;gap:1.2rem;flex-wrap:wrap;
-                        padding:0.4rem 0.7rem;margin:0.2rem 0 0.5rem 0;
-                        border:1px solid #e6e6e6;border-radius:8px;font-size:0.82rem'>
-          <span><b>Folio:</b> {fila[COL_FOLIO]}</span>
-          <span><b>Proveedor:</b> {fila[COL_PROVEEDOR]}</span>
-          <span><b>Importe:</b> {imp_txt}</span>
-          <span><b>Etapa:</b> <code>{fila.get(COL_ETAPA, '—')}</code></span>
-        </div>""",
-        unsafe_allow_html=True,
+    meses_disp = sorted(
+        set(df_g["MES ETIQUETA"].dropna().unique()) |
+        set(df_nc["MES ETIQUETA"].dropna().unique()) - {"Sin fecha"},
+        key=lambda x: pd.to_datetime(
+            f"{x.split()[1]}-{list(MESES_ES).__getitem__(list(MESES_ES.values()).index(x.split()[0]))}-01"
+            if x != "Sin fecha" else "1900-01-01"),
     )
 
-    # Alarma crítica de 90 días para ESTE registro
-    if vencido_90_sin_definicion(fila):
-        dias_v = (hoy_mx() - lim90).days
-        st.error(f"🚨 **{MSG_VENCIDO_90}** — Venció hace {dias_v} día(s) "
-                 f"(límite: {lim90:%d/%m/%Y}).")
+    if modo == "Mes":
+        opciones = meses_disp if meses_disp else ["Sin fecha"]
+        # Preseleccionar el mes más reciente
+        sel = c2.multiselect("Mes(es)", options=opciones,
+                              default=[opciones[-1]] if opciones else [],
+                              key=f"{prefijo}_meses")
+        c3.empty()
+        if sel:
+            g_filt = df_g[df_g["MES ETIQUETA"].isin(sel)]
+            nc_filt = df_nc[df_nc["MES ETIQUETA"].isin(sel)]
+        else:
+            g_filt, nc_filt = df_g, df_nc
+        etiqueta = ", ".join(sel) if sel else "Todo el periodo"
+    else:
+        # Rango
+        fmin_g = df_g[COL_G_FECHA_RECEPCION].min()
+        fmin_nc = df_nc[COL_NC_FECHA_REPORTE].min()
+        fmin = min([f for f in [fmin_g, fmin_nc] if pd.notna(f)],
+                   default=pd.Timestamp(hoy - timedelta(days=180)))
+        rango = c2.date_input(
+            "Rango de fechas", value=(fmin.date(), hoy),
+            format="DD/MM/YYYY", key=f"{prefijo}_rango")
+        c3.empty()
+        if isinstance(rango, tuple) and len(rango) == 2:
+            desde, hasta = rango
+            g_filt = df_g[
+                (df_g[COL_G_FECHA_RECEPCION].dt.date >= desde) &
+                (df_g[COL_G_FECHA_RECEPCION].dt.date <= hasta)]
+            nc_filt = df_nc[
+                (df_nc[COL_NC_FECHA_REPORTE].dt.date >= desde) &
+                (df_nc[COL_NC_FECHA_REPORTE].dt.date <= hasta)]
+            etiqueta = f"{desde:%d/%m/%Y} — {hasta:%d/%m/%Y}"
+        else:
+            g_filt, nc_filt = df_g, df_nc
+            etiqueta = "Todo el periodo"
 
-    # Orden del flujo: Reporte → Gestión → Disposición final → Cuentas por pagar
-    t1, t2, t3, t4 = st.tabs([
-        f"1️⃣ {ETAPA_1}", f"2️⃣ {ETAPA_2}", f"3️⃣ {ETAPA_4}", f"4️⃣ {ETAPA_3}",
-    ])
-    with t1:
-        pestania_etapa1(fila)
-    with t2:
-        pestania_etapa2(fila)
-    with t3:
-        pestania_etapa4(fila)
-    with t4:
-        pestania_etapa3(fila)
-
-
-# =============================================================================
-# 10. TABLA, FILTROS, KPIs Y NOTIFICACIONES
-# =============================================================================
-
-def _aplicar_filtros(df: pd.DataFrame, seleccion: dict, excluir: str = None) -> pd.DataFrame:
-    """Aplica todos los filtros de `seleccion`, opcionalmente omitiendo uno.
-
-    Omitir un filtro permite calcular sus opciones disponibles según el resto
-    de selecciones (cascada bidireccional): así cada lista muestra solo valores
-    que existen en combinación con lo ya elegido en los demás filtros.
-    """
-    d = df
-    if excluir != "folio" and seleccion.get("folio"):
-        d = d[d[COL_FOLIO].str.contains(seleccion["folio"], case=False, na=False)]
-    if excluir != "mes" and seleccion.get("mes"):
-        d = d[d[COL_MES_ETIQUETA].isin(seleccion["mes"])]
-    if excluir != "proveedor" and seleccion.get("proveedor"):
-        d = d[d[COL_PROVEEDOR].isin(seleccion["proveedor"])]
-    if excluir != "comprador" and seleccion.get("comprador"):
-        d = d[d[COL_COMPRADOR].isin(seleccion["comprador"])]
-    if excluir != "etapa" and seleccion.get("etapa"):
-        d = d[d[COL_ETAPA].isin(seleccion["etapa"])]
-    if excluir != "criticos" and seleccion.get("criticos") and not d.empty:
-        d = d[d.apply(vencido_90_sin_definicion, axis=1)]
-    return d
+    return g_filt, nc_filt, etiqueta
 
 
-def construir_filtros(df: pd.DataFrame) -> pd.DataFrame:
-    """Filtros en cascada bidireccional con selección múltiple.
-
-    Cada filtro muestra únicamente las opciones que siguen siendo posibles según
-    lo elegido en TODOS los demás filtros, en cualquier orden.
-
-    Las claves de los widgets llevan un sufijo de versión (`_v{n}`). Para limpiar
-    los filtros se incrementa esa versión: Streamlit ve widgets nuevos y los crea
-    vacíos. Esto es necesario porque borrar la clave del session_state no basta
-    —el widget se vuelve a dibujar con su valor anterior— y reasignarla lanzaría
-    StreamlitAPIException.
-    """
-    st.sidebar.markdown("### 🔎 Filtros")
-
-    v = st.session_state.get("filtros_version", 0)
-    k_folio, k_mes = f"f_folio_v{v}", f"f_mes_v{v}"
-    k_prov, k_comp = f"f_proveedor_v{v}", f"f_comprador_v{v}"
-    k_etapa, k_crit = f"f_etapa_v{v}", f"f_criticos_v{v}"
-
-    # Estado previo de las selecciones (lo que el usuario ya eligió)
-    sel = {
-        "folio": st.session_state.get(k_folio, "").strip(),
-        "mes": st.session_state.get(k_mes, []),
-        "proveedor": st.session_state.get(k_prov, []),
-        "comprador": st.session_state.get(k_comp, []),
-        "etapa": st.session_state.get(k_etapa, []),
-        "criticos": st.session_state.get(k_crit, False),
-    }
-
-    # --- Búsqueda por folio ---
-    st.sidebar.text_input("Buscar folio", placeholder="Ej. DC-MZ017", key=k_folio)
-
-    # --- Mes: opciones según los demás filtros ---
-    base_mes = _aplicar_filtros(df, sel, excluir="mes")
-    opciones_mes = (base_mes[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
-                    .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
-    # Conservar valores ya elegidos aunque el resto los excluya (evita perder la selección)
-    opciones_mes += [m for m in sel["mes"] if m not in opciones_mes]
-    st.sidebar.multiselect("Mes", options=opciones_mes, placeholder="Todos", key=k_mes)
-
-    # --- Proveedor ---
-    base_prov = _aplicar_filtros(df, sel, excluir="proveedor")
-    opciones_prov = sorted(x for x in base_prov[COL_PROVEEDOR].unique() if x)
-    opciones_prov += [p for p in sel["proveedor"] if p not in opciones_prov]
-    st.sidebar.multiselect("Proveedor", options=opciones_prov, placeholder="Todos",
-                           key=k_prov)
-
-    # --- Comprador ---
-    base_comp = _aplicar_filtros(df, sel, excluir="comprador")
-    opciones_comp = sorted(x for x in base_comp[COL_COMPRADOR].unique() if x)
-    opciones_comp += [c for c in sel["comprador"] if c not in opciones_comp]
-    st.sidebar.multiselect("Comprador", options=opciones_comp, placeholder="Todos",
-                           key=k_comp)
-
-    # --- Etapa ---
-    base_etapa = _aplicar_filtros(df, sel, excluir="etapa")
-    presentes = set(base_etapa[COL_ETAPA])
-    opciones_etapa = [e for e in (ETAPA_1, ETAPA_2, ETAPA_3, ETAPA_4, ETAPA_FINAL)
-                      if e in presentes]
-    opciones_etapa += [e for e in sel["etapa"] if e not in opciones_etapa]
-    st.sidebar.multiselect("Etapa", options=opciones_etapa, placeholder="Todas",
-                           key=k_etapa)
-
-    # --- Solo vencidos a 90 días ---
-    st.sidebar.checkbox(f"🚨 Solo vencidos ({DIAS_VENCIMIENTO_TOTAL} días)",
-                        help=MSG_VENCIDO_90, key=k_crit)
-
-    # --- Resultado con TODAS las selecciones aplicadas ---
-    seleccion_actual = {
-        "folio": st.session_state.get(k_folio, "").strip(),
-        "mes": st.session_state.get(k_mes, []),
-        "proveedor": st.session_state.get(k_prov, []),
-        "comprador": st.session_state.get(k_comp, []),
-        "etapa": st.session_state.get(k_etapa, []),
-        "criticos": st.session_state.get(k_crit, False),
-    }
-    dff = _aplicar_filtros(df, seleccion_actual)
-
-    activos = sum([
-        bool(seleccion_actual["folio"]), bool(seleccion_actual["mes"]),
-        bool(seleccion_actual["proveedor"]), bool(seleccion_actual["comprador"]),
-        bool(seleccion_actual["etapa"]), bool(seleccion_actual["criticos"]),
-    ])
-
-    # --- Limpiar (solo se ofrece si hay algo que limpiar) ---
-    if st.sidebar.button("🧹 Limpiar filtros", use_container_width=True,
-                         disabled=activos == 0):
-        # Borrar los valores actuales y estrenar versión de claves.
-        for k in (k_folio, k_mes, k_prov, k_comp, k_etapa, k_crit):
-            st.session_state.pop(k, None)
-        st.session_state["filtros_version"] = v + 1
-        st.rerun()
-
-    resumen = f"**{len(dff)}** de **{len(df)}** registros"
-    if activos:
-        resumen += f" · {activos} filtro(s) activo(s)"
-    st.sidebar.caption(resumen)
-    return dff
-
-
-def mostrar_kpis(df: pd.DataFrame) -> None:
-    """KPIs compactos en una sola línea."""
-    total = len(df)
-    importe = pd.to_numeric(df.get(COL_IMPORTE), errors="coerce").fillna(0).sum()
-    finalizados = int((df[COL_ETAPA] == ETAPA_FINAL).sum())
-    en_cuarentena = int((df[COL_ETAPA] == ETAPA_CUARENTENA).sum())
-    # En proceso = ni finalizadas ni en cuarentena (la cuarentena es un limbo aparte)
-    en_proceso = total - finalizados - en_cuarentena
-    # Las vencidas a 90 días ya excluyen la cuarentena (ver vencido_90_sin_definicion)
-    vencidos_90 = int(df.apply(vencido_90_sin_definicion, axis=1).sum()) if total else 0
-
-    st.markdown(
-        f"""<div style='display:flex;gap:1.4rem;flex-wrap:wrap;
-                        padding:0.35rem 0.7rem;margin-bottom:0.4rem;
-                        border:1px solid #e6e6e6;border-radius:8px;
-                        font-size:0.85rem;align-items:center'>
-          <span>📦 <b>{total:,}</b> reclamaciones</span>
-          <span>💰 <b>${importe:,.2f}</b></span>
-          <span>⏳ <b>{en_proceso}</b> en proceso</span>
-          <span>✅ <b>{finalizados}</b> finalizadas</span>
-          <span style='color:#2980b9'>🧊 <b>{en_cuarentena}</b> en cuarentena</span>
-          <span style='color:#c0392b'>🚨 <b>{vencidos_90}</b> vencidas
-            ({DIAS_VENCIMIENTO_TOTAL} días)</span>
-        </div>""",
+def _tarjeta_kpi(col, icono: str, titulo: str, valor: str,
+                  subtitulo: str = "", color: str = "#1f4e79") -> None:
+    """Tarjeta grande de KPI para el tablero directivo."""
+    col.markdown(
+        f"""<div style='padding:1rem 1.2rem;border-left:5px solid {color};
+                       background:#f8f9fa;border-radius:6px;
+                       box-shadow:0 1px 3px rgba(0,0,0,0.08);height:100%;'>
+              <div style='color:#666;font-size:0.85rem;
+                          text-transform:uppercase;letter-spacing:0.5px'>
+                {icono} {titulo}
+              </div>
+              <div style='font-size:1.9rem;font-weight:700;color:{color};
+                          margin-top:0.35rem;line-height:1.1'>
+                {valor}
+              </div>
+              <div style='color:#888;font-size:0.82rem;margin-top:0.15rem'>
+                {subtitulo}
+              </div>
+            </div>""",
         unsafe_allow_html=True,
     )
 
 
-def mostrar_notificaciones(df: pd.DataFrame) -> None:
-    avisos = construir_notificaciones(df)
-    if not avisos:
-        st.success("✅ No hay reclamaciones por vencerse o vencidas con los filtros actuales.")
+def vista_tablero(datos: dict) -> None:
+    """Pestaña 1: Tablero Directivo — visión general para juntas."""
+    st.markdown("### 📊 Tablero Directivo")
+    st.caption("Panorama general para presentación en juntas. "
+               "Filtra por mes o rango de fechas.")
+
+    df_g = datos["garantias"]
+    df_nc = datos["nc"]
+    if df_g is None or df_nc is None:
+        st.error("No se pudieron cargar los datos.")
         return
 
-    criticos = [a for a in avisos if a["nivel"] == "critico"]
-    vencidas = [a for a in avisos if a["nivel"] == "danger"]
-    por_vencer = [a for a in avisos if a["nivel"] == "warn"]
+    g_filt, nc_filt, etiqueta_periodo = _filtro_periodo(df_g, df_nc, "dir")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric(f"🚨 Vencidas {DIAS_VENCIMIENTO_TOTAL} días", len(criticos))
-    c2.metric("🔴 Etapa vencida", len(vencidas))
-    c3.metric("🟡 Por vencerse", len(por_vencer))
+    st.markdown(f"<div style='color:#666;font-size:0.85rem;margin-bottom:0.8rem'>"
+                f"📅 Periodo: <b>{etiqueta_periodo}</b></div>",
+                unsafe_allow_html=True)
 
-    if criticos:
-        st.error(f"🚨 **{MSG_VENCIDO_90}** — {len(criticos)} reclamo(s).")
+    # ================ TARJETAS KPI ================
+    total_folios = len(g_filt)
+    monto_total = g_filt[COL_G_IMPORTE].sum()
 
-    # Etiqueta legible por nivel de alarma
-    etiqueta_nivel = {
-        "critico": f"🚨 Vencida {DIAS_VENCIMIENTO_TOTAL} días",
-        "danger": "🔴 Etapa vencida",
-        "warn": "🟡 Por vencerse",
-    }
-    filas = [{
-        "Nivel": etiqueta_nivel.get(a["nivel"], a["nivel"]),
-        "Folio": a["folio"],
-        "Proveedor": a["proveedor"],
-        "Comprador": a["comprador"],
-        "Etapa": a["etapa"],
-        "Detalle": a["mensaje"],
-    } for a in avisos]
-    tabla = pd.DataFrame(filas)
+    activos_mask = g_filt[COL_G_ESTADO] == ESTADO_ACTIVO
+    cuar_mask = g_filt[COL_G_ESTADO] == ESTADO_CUARENTENA
+    resueltos_mask = g_filt[COL_G_ESTADO] == ESTADO_RESUELTO
+    cancelados_mask = g_filt[COL_G_ESTADO] == ESTADO_CANCELADO
 
-    st.caption("Haz clic en el encabezado de cualquier columna para ordenar. "
-               "Usa el botón para descargar la información.")
-    st.dataframe(
-        tabla, use_container_width=True, hide_index=True,
-        column_config={
-            "Nivel": st.column_config.TextColumn("Nivel", width="medium"),
-            "Folio": st.column_config.TextColumn("Folio", width="small"),
-            "Detalle": st.column_config.TextColumn("Detalle", width="large"),
-        },
-    )
-    st.download_button(
-        "⬇️ Descargar alarmas (Excel)",
-        data=_tabla_a_excel(tabla.set_index("Folio")),
-        file_name="alarmas.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    n_activos = activos_mask.sum()
+    n_cuar = cuar_mask.sum()
+    n_resueltos = resueltos_mask.sum()
+    n_cancelados = cancelados_mask.sum()
 
+    # % resueltos = resueltos / (total - cancelados)
+    total_valido = total_folios - n_cancelados
+    pct_resueltos = (n_resueltos / total_valido * 100) if total_valido > 0 else 0.0
 
-def mostrar_tabla(df: pd.DataFrame) -> None:
-    vista = df.copy()
-    # Columna de alerta: reclamos vencidos a 90 días sin definición
-    COL_ALERTA = "⚠️ ALERTA"
-    if not vista.empty:
-        vista[COL_ALERTA] = vista.apply(
-            lambda f: MSG_VENCIDO_90 if vencido_90_sin_definicion(f) else "", axis=1
-        )
-        vista["VENCE 90D"] = vista.apply(fecha_vencimiento_90, axis=1)
+    # Vencidos (activos con >90 días)
+    if activos_mask.any():
+        n_vencidos = int(g_filt[activos_mask].apply(esta_vencido_garantia,
+                                                     axis=1).sum())
     else:
-        vista[COL_ALERTA] = ""
-        vista["VENCE 90D"] = pd.NaT
+        n_vencidos = 0
 
-    columnas = [COL_FOLIO, COL_PROVEEDOR, COL_COMPRADOR, COL_IMPORTE, COL_FECHA_CORTE,
-                "VENCE 90D", COL_ALERTA,
-                COL_ETAPA,
-                COL_E3_FOLIO_DEV_NUEVO, COL_E3_FOLIO_AJUSTE, COL_E3_NOTA_CREDITO,
-                COL_RESPUESTA_TIPO, COL_E1_TERM, COL_E2_TERM, COL_E3_TERM,
-                COL_E4_TERM, COL_E1_DIAS, COL_E2_DIAS, COL_E3_DIAS,
-                COL_MODIFICADO_POR, COL_FECHA_MODIFICACION]
-    columnas = [c for c in columnas if c in vista.columns]
-    st.dataframe(
-        vista[columnas], use_container_width=True, hide_index=True,
-        column_config={
-            # Importes en formato moneda; días como número entero.
-            COL_IMPORTE: st.column_config.NumberColumn("Importe (MXN)", format="$%.2f"),
-            COL_FECHA_CORTE: st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "VENCE 90D": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            COL_E3_FOLIO_DEV_NUEVO: st.column_config.TextColumn("Folio devolución"),
-            COL_E3_FOLIO_AJUSTE: st.column_config.TextColumn("Folio ajuste"),
-            COL_E3_NOTA_CREDITO: st.column_config.TextColumn("Nota de crédito"),
-            COL_E1_DIAS: st.column_config.NumberColumn("Días E1", format="%d"),
-            COL_E2_DIAS: st.column_config.NumberColumn("Días E2", format="%d"),
-            COL_E3_DIAS: st.column_config.NumberColumn("Días E3", format="%d"),
-        },
-    )
+    # Notas de crédito conseguidas (folios resueltos)
+    monto_resuelto = g_filt.loc[resueltos_mask, COL_G_IMPORTE].sum()
+    n_nc_conseguidas = n_resueltos
 
+    # NC pendientes
+    nc_pend = nc_filt[nc_filt[COL_NC_ESTADO] == "Pendiente"]
+    n_nc_pend = len(nc_pend)
+    monto_nc_pend = nc_pend[COL_NC_IMP_PENDIENTE].sum()
 
-# =============================================================================
-# 11. PESTAÑA DE GUÍA DEL PROCESO
-# =============================================================================
+    # --- FILA 1: 4 KPIs principales ---
+    c1, c2, c3, c4 = st.columns(4)
+    _tarjeta_kpi(c1, "📁", "Folios totales",
+                 f"{total_folios:,}",
+                 f"{n_activos} activos · {n_cuar} en cuarentena",
+                 color="#1f4e79")
+    _tarjeta_kpi(c2, "💰", "Monto total",
+                 _fmt_mxn(monto_total),
+                 f"{_fmt_mxn(monto_resuelto)} ya resueltos",
+                 color="#0f766e")
+    _tarjeta_kpi(c3, "✅", "% Resuelto",
+                 f"{pct_resueltos:.1f}%",
+                 f"{n_resueltos:,} de {total_valido:,} folios (sin cancelados)",
+                 color="#059669")
+    _tarjeta_kpi(c4, "📝", "NC conseguidas",
+                 f"{n_nc_conseguidas:,}",
+                 f"{_fmt_mxn(monto_resuelto)} en notas de crédito",
+                 color="#7c3aed")
 
-def _dias_restantes_cuarentena(fila: pd.Series):
-    """Días que faltan para que salga de cuarentena. None si no aplica."""
-    fin = _a_fecha(fila.get(COL_CUAR_FECHA_FIN))
-    if fin is None:
-        return None
-    return (fin - hoy_mx()).days
-
-
-def vista_cuarentena(df: pd.DataFrame) -> None:
-    """Gestión de reclamaciones en cuarentena, agrupadas por proveedor."""
-    st.subheader("🧊 Cuarentena")
-    st.caption(f"Reclamaciones con importe menor o igual a "
-               f"${UMBRAL_CUARENTENA:,.2f} en espera de acumular monto por "
-               "proveedor antes de reclamar formalmente.")
-
-    if "flash_cuar" in st.session_state:
-        tipo, texto = st.session_state.pop("flash_cuar")
-        (st.success if tipo == "success" else st.warning)(texto)
-
-    en_cuar = df[df[COL_ETAPA] == ETAPA_CUARENTENA].copy()
-    if en_cuar.empty:
-        st.info("No hay reclamaciones en cuarentena con los filtros actuales.")
-        return
-
-    importe = pd.to_numeric(en_cuar[COL_IMPORTE], errors="coerce").fillna(0.0)
-    en_cuar["_importe"] = importe
-
-    # Resumen por proveedor: cuánto se ha acumulado y si ya supera el umbral
-    resumen = (en_cuar.groupby(COL_PROVEEDOR)
-               .agg(Reclamaciones=("_importe", "size"),
-                    Acumulado=("_importe", "sum"))
-               .sort_values("Acumulado", ascending=False))
-    listos = resumen[resumen["Acumulado"] > UMBRAL_CUARENTENA]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("En cuarentena", len(en_cuar))
-    c2.metric("Monto acumulado", f"${importe.sum():,.2f}")
-    c3.metric("Proveedores listos", len(listos),
-              help=f"Proveedores cuyo acumulado ya supera ${UMBRAL_CUARENTENA:,.2f}")
-
-    if len(listos) > 0:
-        st.success(f"✅ {len(listos)} proveedor(es) ya superan el umbral y pueden "
-                   "liberarse para reclamar en conjunto: "
-                   + ", ".join(listos.index.tolist()))
-
-    st.markdown("##### Acumulado por proveedor")
-    tabla_prov = resumen.copy()
-    tabla_prov["¿Supera umbral?"] = tabla_prov["Acumulado"].apply(
-        lambda v: "✅ Sí" if v > UMBRAL_CUARENTENA else "—")
-    st.dataframe(
-        tabla_prov, use_container_width=True,
-        column_config={
-            "Reclamaciones": st.column_config.NumberColumn(format="%d"),
-            "Acumulado": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
+    # --- FILA 2: Alertas ---
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    _tarjeta_kpi(c1, "🚨", "Folios vencidos (90 días)",
+                 f"{n_vencidos:,}",
+                 f"{MSG_VENCIDO}" if n_vencidos > 0 else "Sin vencimientos",
+                 color="#dc2626" if n_vencidos > 0 else "#94a3b8")
+    _tarjeta_kpi(c2, "⏳", "NC pendientes (concepto varios)",
+                 f"{n_nc_pend:,}",
+                 f"{_fmt_mxn(monto_nc_pend)} por conseguir",
+                 color="#ea580c" if n_nc_pend > 0 else "#94a3b8")
 
     st.divider()
-    st.markdown("##### Administrar cuarentena")
-    st.caption("Selecciona un proveedor para ajustar la duración de sus "
-               "reclamaciones en cuarentena o liberarlas al flujo normal. "
-               "Requiere clave de autorización.")
 
-    prov_sel = st.selectbox("Proveedor", options=resumen.index.tolist())
-    grupo = en_cuar[en_cuar[COL_PROVEEDOR] == prov_sel]
+    # ================ GRÁFICAS ================
+    st.markdown("#### 📈 Análisis por proveedor")
 
-    # Detalle del proveedor seleccionado
-    detalle = grupo[[COL_FOLIO, COL_IMPORTE, COL_CUAR_FECHA_INICIO,
-                     COL_CUAR_DIAS, COL_CUAR_FECHA_FIN]].copy()
-    detalle["Días restantes"] = grupo.apply(_dias_restantes_cuarentena, axis=1)
-    st.dataframe(
-        detalle, use_container_width=True, hide_index=True,
-        column_config={
-            COL_IMPORTE: st.column_config.NumberColumn("Importe", format="$%.2f"),
-            COL_CUAR_FECHA_INICIO: st.column_config.DateColumn("Inicio", format="DD/MM/YYYY"),
-            COL_CUAR_DIAS: st.column_config.NumberColumn("Días asignados", format="%d"),
-            COL_CUAR_FECHA_FIN: st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
-            "Días restantes": st.column_config.NumberColumn(format="%d"),
-        },
-    )
-
-    clave_in = st.text_input("Clave de autorización", type="password",
-                             key=f"cuar_clave_{prov_sel}")
-
-    ca, cb = st.columns(2)
-
-    # --- Ajustar duración ---
-    with ca:
-        st.markdown("**Ajustar duración**")
-        with st.form(f"form_cuar_dias_{prov_sel}"):
-            nuevos_dias = st.number_input(
-                "Días de cuarentena", min_value=1, max_value=365,
-                value=int(DIAS_CUARENTENA_DEFECTO), step=1)
-            obs_dias = st.text_input("Observación (opcional)")
-            aplicar_dias = st.form_submit_button("Actualizar duración",
-                                                 use_container_width=True)
-        if aplicar_dias:
-            if clave_in != clave_autorizacion():
-                st.error("🔒 Clave incorrecta.")
-            else:
-                dfc = st.session_state["df"]
-                m = (dfc[COL_ETAPA] == ETAPA_CUARENTENA) & (dfc[COL_PROVEEDOR] == prov_sel)
-                for idx in dfc[m].index:
-                    inicio = _a_fecha(dfc.at[idx, COL_CUAR_FECHA_INICIO]) or hoy_mx()
-                    dfc.at[idx, COL_CUAR_DIAS] = int(nuevos_dias)
-                    dfc.at[idx, COL_CUAR_FECHA_FIN] = pd.Timestamp(
-                        inicio + timedelta(days=int(nuevos_dias)))
-                    if obs_dias.strip():
-                        dfc.at[idx, COL_CUAR_OBS] = obs_dias.strip()
-                folio_ej = dfc.loc[m, COL_FOLIO].iloc[0]
-                mensaje = aplicar_guardado(
-                    dfc, folio_ej, {}, "Admin cuarentena",
-                    f"Duración de cuarentena de {prov_sel} ajustada a {int(nuevos_dias)} días")
-                # Guarda a Excel, sube a GitHub y recarga en el ORDEN correcto.
-                persistir_y_sincronizar(dfc, mensaje, "Duración actualizada.")
-
-    # --- Liberar / finalizar ---
-    with cb:
-        st.markdown("**Liberar del cuarentena**")
-        st.caption("Devuelve las reclamaciones del proveedor al inicio del flujo "
-                   "(Reporte de reclamo) para reclamar en conjunto.")
-        obs_lib = st.text_input("Observación de liberación (opcional)",
-                                key=f"obs_lib_{prov_sel}")
-        if st.button("🚀 Liberar todas al flujo normal", use_container_width=True,
-                     type="primary", key=f"btn_lib_{prov_sel}"):
-            if clave_in != clave_autorizacion():
-                st.error("🔒 Clave incorrecta.")
-            else:
-                dfc = st.session_state["df"]
-                m = (dfc[COL_ETAPA] == ETAPA_CUARENTENA) & (dfc[COL_PROVEEDOR] == prov_sel)
-                n = int(m.sum())
-                dfc.loc[m, COL_ETAPA] = ETAPA_1  # vuelve al inicio del flujo
-                dfc.loc[m, COL_CUAR_EN] = "LIBERADA"
-                if obs_lib.strip():
-                    dfc.loc[m, COL_CUAR_OBS] = obs_lib.strip()
-                folio_ej = dfc.loc[m, COL_FOLIO].iloc[0]
-                mensaje = aplicar_guardado(
-                    dfc, folio_ej, {}, "Admin cuarentena",
-                    f"{n} reclamación(es) de {prov_sel} liberadas de cuarentena → "
-                    f"{ETAPA_1}")
-                # Guarda a Excel, sube a GitHub y recarga en el ORDEN correcto.
-                # (Antes se recargaba ANTES de guardar y los cambios se perdían.)
-                persistir_y_sincronizar(dfc, mensaje,
-                                        f"{n} reclamación(es) liberadas.")
-
-
-def vista_guia() -> None:
-    st.subheader("📖 Guía del proceso")
-    st.markdown(
-        f"""
-Esta aplicación da seguimiento a las reclamaciones a proveedores a lo largo de
-**cuatro etapas encadenadas**. Cada reclamación se identifica por su **Folio de
-reporte**. Al terminar la última fase de una etapa, esa etapa se **bloquea** y se
-**activa** la siguiente automáticamente.
-
-### 1️⃣ {ETAPA_1} · plazo {DIAS_ETAPA_1} días
-Pasos: **Recepción de Folio → Revisión de folio → Envío a proveedores**.
-El plazo se cuenta desde la **fecha de corte**. Al registrar *Envío a proveedores*
-se cierra la etapa, se cuentan los días que tardó y se activa **Gestión**.
-
-### 2️⃣ {ETAPA_2} · plazo {DIAS_ETAPA_2} días
-Pasos: **Enviado a proveedor → Seguimiento → Respuesta de proveedor**.
-Aquí se captura la **respuesta del proveedor** (recolección, destrucción o sin
-respuesta). Al cerrar la etapa **siempre** se pasa a **{ETAPA_4}**; la respuesta
-solo define qué pasos se mostrarán ahí.
-
-### 3️⃣ {ETAPA_4}
-Define el destino del producto, según la respuesta capturada en Gestión:
-- **Recolección**: **Programación → Recolección → Recepción de folio de devolución**.
-  Lleva un contador **independiente de {DIAS_RECOLECCION} días** para que el
-  proveedor recoja, contados desde que se definió la recolección al cerrar
-  Gestión. Si vence, se puede cambiar a destrucción con un botón.
-- **Destrucción**: **Reporte al almacén de devoluciones → Recepción de folio de ajuste**.
-
-Al registrar el último paso se cierra la etapa y **siempre** se activa **{ETAPA_3}**.
-
-### 4️⃣ {ETAPA_3} · plazo {DIAS_ETAPA_3} días
-Pasos: **Seguimiento → Recepción de nota de crédito → Aplicación de pago**.
-Es la **última etapa**: al registrar *Aplicación de pago* se da por terminado
-todo el proceso. Si vence sin respuesta del proveedor, se lanza la alarma de
-destrucción por vencimiento y se notifica a Devoluciones.
-
-> **Plazos:** 7 + 30 + 53 = **{DIAS_VENCIMIENTO_TOTAL} días** en total desde la
-> fecha de corte. El contador de recolección corre por separado.
-
-### 🧊 Cuarentena (importes bajos)
-Las reclamaciones con importe **menor o igual a ${UMBRAL_CUARENTENA:,.0f}** entran
-automáticamente a **Cuarentena** al cargar la base. La idea es acumularlas por
-proveedor hasta superar ese monto y reclamar en conjunto. En la pestaña
-**Cuarentena** se ve el monto acumulado por proveedor y se marca cuáles ya
-superan el umbral. El administrador (con la clave de autorización) puede ajustar
-los **días de duración** de la cuarentena o **liberar** todas las reclamaciones
-de un proveedor, que regresan al inicio del flujo (**{ETAPA_1}**) para reclamarse
-formalmente. Una vez liberada, una reclamación no vuelve a entrar a cuarentena
-aunque su importe siga siendo bajo.
-
-### 🔓 Reactivar etapas
-Cada etapa cerrada tiene un botón **Reactivar** protegido con clave. Solo el
-personal autorizado puede reabrir una etapa para corregir información.
-
-### 🗓️ Ajuste manual de fechas (retroactivo)
-En cada etapa hay un panel **Ajuste manual de fechas**, también protegido con la
-misma clave. Sirve para los registros que se **completaron antes de usar la app**:
-permite capturar la fecha real y el responsable de cada paso, y cerrar la etapa
-con esa fecha. Los días transcurridos se calculan con la fecha real capturada,
-no con la de hoy, para que las métricas del proceso sean correctas.
-
-### 📈 Avance por comprador
-La primera pestaña muestra tres gráficas: **distribución por etapa** (en qué fase
-está el trabajo de cada comprador), **porcentaje finalizado** (qué proporción ya
-cerró todo el proceso) y **estado de vencimiento** (vencidas, por vencerse o en
-tiempo). Tiene su propio selector de mes y un interruptor para medir por
-**cantidad de reclamaciones** o por **importe en pesos**. Respeta además los
-filtros generales de la barra lateral.
-
-### 🚨 Alarma de vencimiento total ({DIAS_VENCIMIENTO_TOTAL} días)
-Si pasan **{DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte** y el reclamo
-todavía no está finalizado, se dispara la alarma:
-**{MSG_VENCIDO_90}**. Aparece en el encabezado, en la ficha del registro, en la
-tabla y en la pestaña *Resumen y alarmas*. En la barra lateral hay un filtro para
-ver solo estos reclamos.
-
-### 🔔 Alarmas por etapa
-En la pestaña **Resumen** se listan las reclamaciones *por vencerse* (≤ 15 días) y
-*vencidas*. La estructura de avisos está preparada para enviarse por correo en el
-futuro.
-
-### ✍️ Registro
-Cada paso guarda **fecha y usuario**; las observaciones quedan en la base de datos
-y la bitácora completa se acumula en *Acciones / Notas* para su posterior análisis.
-        """
-    )
-
-
-# =============================================================================
-# 11a. GRÁFICAS DE AVANCE POR COMPRADOR
-# =============================================================================
-
-# Orden real del flujo: Reporte → Gestión → Disposición final → Cuentas por pagar
-ORDEN_ETAPAS = [ETAPA_1, ETAPA_2, ETAPA_4, ETAPA_3, ETAPA_FINAL]
-
-
-def _clasificar_urgencia(fila: pd.Series) -> str:
-    """Clasifica una reclamación para la gráfica de vencimientos."""
-    etapa = str(fila.get(COL_ETAPA, "")).strip()
-    if etapa == ETAPA_FINAL:
-        return "Finalizada"
-    if vencido_90_sin_definicion(fila):
-        return f"Vencida {DIAS_VENCIMIENTO_TOTAL} días"
-
-    limites = calcular_fechas_limite(fila)
-    if etapa == ETAPA_1:
-        lim, term = limites["E1"], es_verdadero(fila.get(COL_E1_TERM))
-    elif etapa == ETAPA_2:
-        lim, term = limites["E2"], es_verdadero(fila.get(COL_E2_TERM))
-    elif etapa == ETAPA_3:
-        lim, term = limites["E3"], es_verdadero(fila.get(COL_E3_TERM))
-    elif etapa == ETAPA_4:
-        lim, term = _a_fecha(fila.get(COL_E4_LIMITE_REC)), es_verdadero(fila.get(COL_E4_TERM))
+    # Top 10 proveedores por importe (activos + cuarentena, sin cancelados)
+    g_vig = g_filt[g_filt[COL_G_ESTADO].isin([ESTADO_ACTIVO, ESTADO_CUARENTENA])]
+    if not g_vig.empty:
+        top = (g_vig.groupby(COL_G_PROVEEDOR)
+               .agg(Monto=(COL_G_IMPORTE, "sum"),
+                    Folios=(COL_G_FOLIO, "count"))
+               .sort_values("Monto", ascending=False).head(10))
+        _grafica_top_proveedores(top)
     else:
-        return "En tiempo"
+        st.info("No hay folios vigentes para graficar.")
 
-    nivel, _ = estado_alarma(lim, term)
-    if nivel == "danger":
-        return "Etapa vencida"
-    if nivel == "warn":
-        return "Por vencerse"
-    return "En tiempo"
+    st.divider()
+    st.markdown("#### 📅 Evolución mensual")
+    _grafica_evolucion_mensual(df_g)
 
 
-def _fmt_valor(v, es_dinero: bool) -> str:
-    """Formatea un número: moneda con pesos o entero, ambos con miles."""
-    if es_dinero:
-        return f"${v:,.2f}"
-    return f"{int(round(v)):,}"
-
-
-def _grafica_barras(tabla: pd.DataFrame, etiqueta_valor: str, es_dinero: bool,
-                    orden_series: list = None, altura: int = 340) -> None:
-    """Dibuja barras horizontales apiladas con formato numérico legible.
-
-    Los números llevan separador de miles y, si son importes, símbolo de pesos.
-    Cada segmento muestra su valor y al final de la barra aparece el total.
-    """
-    if tabla.empty:
-        st.info("Sin datos para graficar.")
+def _grafica_top_proveedores(top: pd.DataFrame) -> None:
+    """Barras horizontales de Top 10 proveedores por monto."""
+    if not ALTAIR_OK or top.empty:
+        st.dataframe(top, use_container_width=True)
         return
-
-    if not ALTAIR_OK:
-        st.bar_chart(tabla, height=altura, stack=True, horizontal=True,
-                     x_label=etiqueta_valor, y_label=None)
-        return
-
-    # Formatos estilo D3: '$,.2f' → $1,234.56 · ',d' → 1,234
-    fmt = "$,.2f" if es_dinero else ",d"
-    nombre_valor = "Importe" if es_dinero else "Cantidad"
-    col_cat = tabla.index.name or "index"
-
-    largo = (tabla.reset_index()
-             .melt(id_vars=col_cat, var_name="Serie", value_name="Valor"))
-    largo = largo.rename(columns={col_cat: "Categoria"})
-    largo = largo[largo["Valor"] != 0]
-
-    orden = orden_series or list(tabla.columns)
-    base = alt.Chart(largo)
-    barras = (
-        base.mark_bar()
-        .encode(
-            y=alt.Y("Categoria:N", title=None, sort=list(tabla.index)),
-            x=alt.X("Valor:Q", title=etiqueta_valor, stack=True,
-                    axis=alt.Axis(format=fmt)),
-            color=alt.Color("Serie:N", title="", sort=orden,
-                            legend=alt.Legend(orient="bottom", columns=3)),
-            order=alt.Order("Serie:N"),
-            tooltip=[
-                alt.Tooltip("Categoria:N", title=col_cat.replace("_", " ").title()),
-                alt.Tooltip("Serie:N", title="Etapa"),
-                alt.Tooltip("Valor:Q", title=nombre_valor, format=fmt),
-            ],
-        )
-    )
-    # Número dentro de cada segmento
-    etiquetas = (
-        base.mark_text(color="white", fontSize=11, fontWeight="bold")
-        .encode(
-            y=alt.Y("Categoria:N", sort=list(tabla.index)),
-            x=alt.X("Valor:Q", stack="center"),
-            detail="Serie:N",
-            text=alt.Text("Valor:Q", format=fmt),
-        )
-        .transform_filter("datum.Valor > 0")
-    )
-    # Total al final de la barra
-    totales = tabla.sum(axis=1).reset_index()
-    totales.columns = ["Categoria", "Total"]
-    capa_total = (
-        alt.Chart(totales)
-        .mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
-                   color="#333")
-        .encode(
-            y=alt.Y("Categoria:N", sort=list(tabla.index)),
-            x=alt.X("Total:Q"),
-            text=alt.Text("Total:Q", format=fmt),
-        )
-    )
-    grafica = (barras + etiquetas + capa_total).properties(height=altura)
-    st.altair_chart(grafica, use_container_width=True)
-
-
-def _grafica_barra_simple(serie: pd.Series, etiqueta_valor: str, es_dinero: bool,
-                          altura: int = 340, color: str = "#4C78A8",
-                          conteo: pd.Series = None) -> None:
-    """Barras horizontales de una sola serie con el valor al final de cada barra.
-
-    Si se pasa `conteo` (reclamaciones por categoría), la etiqueta muestra el
-    importe y, entre paréntesis, el número de reclamaciones. Ej.: $12,345.00 (7).
-    """
-    if serie.empty or serie.sum() == 0:
-        st.info("Sin datos para graficar.")
-        return
-
-    col_cat = serie.index.name or "Categoria"
-    datos = serie.reset_index()
-    datos.columns = ["Categoria", "Valor"]
-    if conteo is not None:
-        datos["Conteo"] = datos["Categoria"].map(conteo).fillna(0).astype(int)
-    else:
-        datos["Conteo"] = 0
-    datos = datos[datos["Valor"] != 0]
-
-    if not ALTAIR_OK:
-        st.bar_chart(datos.set_index("Categoria")[["Valor"]], height=altura,
-                     horizontal=True, x_label=etiqueta_valor, y_label=None)
-        return
-
-    fmt = "$,.2f" if es_dinero else ",d"
-    # Texto de la etiqueta: importe y, si hay conteo, "(n)" al lado
-    if conteo is not None:
-        datos["_txt"] = datos.apply(
-            lambda r: (f"${r['Valor']:,.2f}" if es_dinero else f"{int(r['Valor']):,}")
-            + f"  ({int(r['Conteo'])})", axis=1)
-    else:
-        datos["_txt"] = datos["Valor"].map(
-            lambda v: f"${v:,.2f}" if es_dinero else f"{int(v):,}")
-
+    datos = top.reset_index().rename(columns={COL_G_PROVEEDOR: "Proveedor"})
+    datos["_txt"] = datos.apply(
+        lambda r: f"${r['Monto']:,.2f} ({int(r['Folios'])})", axis=1)
     base = alt.Chart(datos)
-    barras = (
-        base.mark_bar(color=color)
-        .encode(
-            y=alt.Y("Categoria:N", title=None, sort="-x"),
-            x=alt.X("Valor:Q", title=etiqueta_valor, axis=alt.Axis(format=fmt)),
-            tooltip=[
-                alt.Tooltip("Categoria:N", title=col_cat.replace("_", " ").title()),
-                alt.Tooltip("Valor:Q", title="Importe", format=fmt),
-                alt.Tooltip("Conteo:Q", title="Reclamaciones", format=",d"),
-            ],
-        )
+    barras = base.mark_bar(color="#1f4e79").encode(
+        y=alt.Y("Proveedor:N", title=None, sort="-x"),
+        x=alt.X("Monto:Q", title="Monto (MXN)",
+                axis=alt.Axis(format="$,.0f")),
+        tooltip=[
+            alt.Tooltip("Proveedor:N"),
+            alt.Tooltip("Monto:Q", title="Monto", format="$,.2f"),
+            alt.Tooltip("Folios:Q", title="Folios", format=",d"),
+        ],
     )
-    etiquetas = (
-        base.mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
-                       color="#333")
-        .encode(
-            y=alt.Y("Categoria:N", sort="-x"),
-            x=alt.X("Valor:Q"),
-            text=alt.Text("_txt:N"),
-        )
+    etiquetas = base.mark_text(align="left", dx=4, fontSize=11,
+                                 fontWeight="bold", color="#333").encode(
+        y=alt.Y("Proveedor:N", sort="-x"),
+        x=alt.X("Monto:Q"),
+        text=alt.Text("_txt:N"),
     )
-    st.altair_chart((barras + etiquetas).properties(height=altura),
-                    use_container_width=True)
+    st.altair_chart(
+        (barras + etiquetas).properties(
+            height=max(280, 30 * len(datos)),
+            title="Top 10 proveedores por monto (folios vigentes)"),
+        use_container_width=True)
 
 
-def _grafica_porcentaje(resumen: pd.DataFrame, altura: int = 320) -> None:
-    """Barras del porcentaje finalizado por comprador, con formato '00.0 %'."""
-    if resumen.empty:
+def _grafica_evolucion_mensual(df_g: pd.DataFrame) -> None:
+    """Barras apiladas por mes: folios activos, resueltos, cancelados."""
+    if df_g.empty:
         st.info("Sin datos para graficar.")
         return
-    if not ALTAIR_OK:
-        st.bar_chart(resumen[["% finalizado"]], height=altura, horizontal=True,
-                     x_label="% finalizado", y_label="Comprador")
+    d = df_g.copy()
+    # Solo meses con datos válidos
+    d = d[d["MES ETIQUETA"] != "Sin fecha"]
+    if d.empty:
+        st.info("Sin datos por mes.")
         return
-
-    datos = resumen.reset_index().rename(columns={"_comprador": "Comprador"})
-    # Barras HORIZONTALES
-    grafica = (
-        alt.Chart(datos)
-        .mark_bar()
-        .encode(
-            y=alt.Y("Comprador:N", title=None, sort=list(resumen.index)),
-            x=alt.X("% finalizado:Q", title="% finalizado",
-                    scale=alt.Scale(domain=[0, 100]),
-                    axis=alt.Axis(format=".0f")),
-            tooltip=[
-                alt.Tooltip("Comprador:N", title="Comprador"),
-                alt.Tooltip("% finalizado:Q", title="Finalizado", format=".1f"),
-            ],
-        )
-        .properties(height=altura)
-    )
-    st.altair_chart(grafica, use_container_width=True)
-
-
-def _dias_por_etapa(fila: pd.Series) -> dict:
-    """Días que tardó cada etapa en una reclamación.
-
-    E1, E2 y E3 tienen su columna de días registrada. Disposición final (E4) no
-    la tiene, así que se calcula desde el cierre de Gestión hasta la fecha del
-    último paso realizado en esa etapa.
-    Devuelve solo las etapas terminadas con un valor válido.
-    """
-    dias = {}
-
-    def _num(valor):
+    tabla = (d.groupby(["MES ETIQUETA", COL_G_ESTADO])[COL_G_FOLIO]
+             .count().unstack(fill_value=0))
+    # Orden cronológico
+    def _mes_key(x):
         try:
-            v = float(valor)
-            return v if v == v else None  # descarta NaN
-        except (TypeError, ValueError):
-            return None
-
-    if es_verdadero(fila.get(COL_E1_TERM)):
-        v = _num(fila.get(COL_E1_DIAS))
-        if v is not None:
-            dias[ETAPA_1] = v
-    if es_verdadero(fila.get(COL_E2_TERM)):
-        v = _num(fila.get(COL_E2_DIAS))
-        if v is not None:
-            dias[ETAPA_2] = v
-    if es_verdadero(fila.get(COL_E3_TERM)):
-        v = _num(fila.get(COL_E3_DIAS))
-        if v is not None:
-            dias[ETAPA_3] = v
-
-    # Disposición final: desde la respuesta del proveedor (cierre de Gestión)
-    # hasta el último paso registrado en la etapa.
-    if es_verdadero(fila.get(COL_E4_TERM)):
-        inicio = _a_fecha(fila.get("E2 FECHA RESPUESTA"))
-        pasos_e4 = (PASOS_E4_RECOLECCION
-                    if modalidad_destino_final(fila) == RESP_RECOLECCION
-                    else PASOS_E4_DESTRUCCION)
-        fechas = [_a_fecha(fila.get(cf)) for _c, _e, cf, _cu in pasos_e4]
-        fechas = [f for f in fechas if f]
-        if inicio and fechas:
-            d = (max(fechas) - inicio).days
-            if d >= 0:
-                dias[ETAPA_4] = float(d)
-    return dias
-
-
-def _grafica_dias_promedio(df: pd.DataFrame, altura: int = 360) -> None:
-    """Días promedio por etapa y mes (barras horizontales agrupadas)."""
-    filas = []
-    for _, fila in df.iterrows():
-        mes = fila.get(COL_MES_ETIQUETA, "Sin fecha")
-        orden_mes = _a_fecha(fila.get(COL_MES))
-        for etapa, dias in _dias_por_etapa(fila).items():
-            filas.append({"Mes": mes, "_orden": orden_mes or date.min,
-                          "Etapa": etapa, "Días": dias})
-
-    if not filas:
-        st.info("Todavía no hay etapas terminadas con días registrados. "
-                "Este dato aparece conforme se vayan cerrando etapas.")
-        return
-
-    detalle = pd.DataFrame(filas)
-    resumen = (detalle.groupby(["Mes", "_orden", "Etapa"], as_index=False)
-               .agg(Promedio=("Días", "mean"), Casos=("Días", "size")))
-    resumen["Promedio"] = resumen["Promedio"].round(1)
-    resumen = resumen.sort_values("_orden")
-    orden_meses = resumen.drop_duplicates("Mes")["Mes"].tolist()
-    orden_etapas = [e for e in (ETAPA_1, ETAPA_2, ETAPA_4, ETAPA_3)
-                    if e in set(resumen["Etapa"])]
-
+            nombre, año = x.split()
+            m = list(MESES_ES.values()).index(nombre) + 1
+            return f"{año}-{m:02d}"
+        except Exception:
+            return "0000-00"
+    tabla = tabla.reindex(sorted(tabla.index, key=_mes_key))
     if not ALTAIR_OK:
-        st.dataframe(
-            resumen.pivot(index="Mes", columns="Etapa", values="Promedio"),
-            use_container_width=True,
-        )
+        st.bar_chart(tabla, height=320)
         return
-
-    base = alt.Chart(resumen)
-    barras = (
-        base.mark_bar()
-        .encode(
-            y=alt.Y("Etapa:N", title=None, sort=orden_etapas),
-            x=alt.X("Promedio:Q", title="Días promedio",
-                    axis=alt.Axis(format=".1f")),
-            color=alt.Color("Etapa:N", title="", sort=orden_etapas,
-                            legend=alt.Legend(orient="bottom", columns=2)),
-            tooltip=[
-                alt.Tooltip("Mes:N", title="Mes"),
-                alt.Tooltip("Etapa:N", title="Etapa"),
-                alt.Tooltip("Promedio:Q", title="Días promedio", format=".1f"),
-                alt.Tooltip("Casos:Q", title="Reclamaciones", format=",d"),
-            ],
-        )
-    )
-    etiquetas = (
-        base.mark_text(align="left", dx=4, fontSize=10, fontWeight="bold",
-                       color="#333")
-        .encode(
-            y=alt.Y("Etapa:N", sort=orden_etapas),
-            x=alt.X("Promedio:Q"),
-            text=alt.Text("Promedio:Q", format=".1f"),
-        )
-    )
-    # El facetado (row) debe aplicarse a la CAPA combinada con alt.layer().facet(),
-    # no con .encode(row=...) sobre la suma de capas (eso rompe el esquema).
-    grafica = (
-        alt.layer(barras, etiquetas)
-        .facet(row=alt.Row("Mes:N", title=None, sort=orden_meses,
-                           header=alt.Header(labelAngle=0, labelAlign="left")))
-        .properties(title="")
-    )
+    largo = tabla.reset_index().melt(id_vars="MES ETIQUETA",
+                                      var_name="Estado", value_name="Folios")
+    largo = largo[largo["Folios"] > 0]
+    orden_estados = [ESTADO_ACTIVO, ESTADO_CUARENTENA, ESTADO_RESUELTO,
+                     ESTADO_CANCELADO]
+    colores = ["#f59e0b", "#3b82f6", "#10b981", "#94a3b8"]
+    grafica = alt.Chart(largo).mark_bar().encode(
+        x=alt.X("MES ETIQUETA:N", title="Mes", sort=list(tabla.index),
+                axis=alt.Axis(labelAngle=-30)),
+        y=alt.Y("Folios:Q", title="Cantidad de folios"),
+        color=alt.Color("Estado:N", sort=orden_estados,
+                         scale=alt.Scale(domain=orden_estados, range=colores),
+                         legend=alt.Legend(orient="bottom")),
+        tooltip=["MES ETIQUETA", "Estado", "Folios"],
+    ).properties(height=320,
+                 title="Folios de garantía por mes y estado")
     st.altair_chart(grafica, use_container_width=True)
 
-    with st.expander("📋 Ver detalle de días promedio"):
-        tabla = resumen.pivot(index="Mes", columns="Etapa", values="Promedio")
-        tabla = tabla.reindex(orden_meses)
-        cols = [c for c in orden_etapas if c in tabla.columns]
-        st.dataframe(
-            tabla[cols], use_container_width=True,
-            column_config={c: st.column_config.NumberColumn(format="%.1f")
-                           for c in cols},
-        )
 
+# =============================================================================
+# 8. FOLIOS DE GARANTÍA (Pestaña 2)
+# =============================================================================
 
-def _grafica_dias_comprador(prom: pd.DataFrame, altura: int = 320) -> None:
-    """Barras horizontales del tiempo promedio en Gestión por comprador."""
-    if prom.empty:
-        st.info("Sin datos para graficar.")
+def vista_garantias(datos: dict) -> None:
+    st.markdown("### 📋 Folios de Garantía")
+    st.caption("Lista completa de folios. Selecciona uno para editarlo. "
+               "Plazo total: **90 días** desde la fecha de recepción.")
+
+    df = datos["garantias"]
+    if df is None:
+        st.error("No hay datos de garantías.")
         return
-    if not ALTAIR_OK:
-        st.bar_chart(prom[["Promedio"]], height=altura, horizontal=True,
-                     x_label="Días promedio", y_label="Comprador")
+
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
+
+    # ---- Filtros ----
+    c1, c2, c3, c4 = st.columns(4)
+    estados_disp = ["Todos", ESTADO_ACTIVO, ESTADO_CUARENTENA, ESTADO_RESUELTO,
+                    ESTADO_CANCELADO]
+    f_estado = c1.selectbox("Estado", estados_disp, key="g_f_estado")
+    proveedores = sorted(df[COL_G_PROVEEDOR].dropna().unique().tolist())
+    f_prov = c2.multiselect("Proveedor", proveedores, placeholder="Todos",
+                             key="g_f_prov")
+    compradores = sorted(df[COL_G_COMPRADOR].dropna().unique().tolist())
+    f_comp = c3.multiselect("Comprador", compradores, placeholder="Todos",
+                             key="g_f_comp")
+    f_folio = c4.text_input("Buscar folio", placeholder="Ej. DC-MZ017",
+                             key="g_f_folio")
+
+    d = df.copy()
+    if f_estado != "Todos":
+        d = d[d[COL_G_ESTADO] == f_estado]
+    if f_prov:
+        d = d[d[COL_G_PROVEEDOR].isin(f_prov)]
+    if f_comp:
+        d = d[d[COL_G_COMPRADOR].isin(f_comp)]
+    if f_folio.strip():
+        d = d[d[COL_G_FOLIO].str.contains(f_folio.strip(), case=False, na=False)]
+
+    st.caption(f"**{len(d)}** de **{len(df)}** folios")
+
+    # Alerta al inicio
+    vencidos = d[d.apply(esta_vencido_garantia, axis=1)]
+    if not vencidos.empty:
+        st.error(f"🚨 **{len(vencidos)}** folio(s) vencido(s) sin resolverse "
+                 f"({MSG_VENCIDO}).")
+
+    # ---- Tabla resumen ----
+    if d.empty:
+        st.info("No hay folios con los filtros actuales.")
         return
-    datos = prom.reset_index()
-    base = alt.Chart(datos)
-    barras = (
-        base.mark_bar(color="#72B7B2")
-        .encode(
-            y=alt.Y("_comprador:N", title=None, sort=list(prom.index)),
-            x=alt.X("Promedio:Q", title="Días promedio en Gestión",
-                    axis=alt.Axis(format=".1f")),
-            tooltip=[
-                alt.Tooltip("_comprador:N", title="Comprador"),
-                alt.Tooltip("Promedio:Q", title="Días promedio", format=".1f"),
-                alt.Tooltip("Casos:Q", title="Reclamaciones", format=",d"),
-            ],
-        )
+
+    vista = d.copy()
+    vista["🚦"] = vista.apply(lambda f: semaforo_garantia(f)[0], axis=1)
+    vista["Días transcurridos"] = vista.apply(dias_transcurridos_garantia, axis=1)
+    vista["Días restantes"] = vista.apply(dias_restantes_garantia, axis=1)
+    vista["Vence"] = vista.apply(fecha_vencimiento_garantia, axis=1)
+
+    cols_vista = ["🚦", COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_COMPRADOR,
+                  COL_G_IMPORTE, COL_G_FECHA_RECEPCION, "Vence",
+                  "Días transcurridos", "Días restantes", COL_G_ESTADO,
+                  COL_G_FOLIO_DEV, COL_G_FOLIO_AJUSTE, COL_G_NOTA_CREDITO]
+    st.dataframe(
+        vista[cols_vista], use_container_width=True, hide_index=True,
+        column_config={
+            COL_G_IMPORTE: st.column_config.NumberColumn("Importe",
+                                                          format="$%.2f"),
+            COL_G_FECHA_RECEPCION: st.column_config.DateColumn(
+                "Recepción", format="DD/MM/YYYY"),
+            "Vence": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            COL_G_FOLIO_DEV: "F. Devolución",
+            COL_G_FOLIO_AJUSTE: "F. Ajuste",
+            COL_G_NOTA_CREDITO: "Nota Crédito",
+        },
     )
-    # Etiqueta: días promedio y, entre paréntesis, cuántas reclamaciones lo componen
-    datos["_txt"] = (datos["Promedio"].map(lambda v: f"{v:.1f}")
-                     + " (" + datos["Casos"].map(lambda n: f"{int(n)}") + ")")
-    etiquetas = (
-        base.mark_text(align="left", dx=4, fontSize=11, fontWeight="bold",
-                       color="#333")
-        .encode(
-            y=alt.Y("_comprador:N", sort=list(prom.index)),
-            x=alt.X("Promedio:Q"),
-            text=alt.Text("_txt:N"),
-        )
-    )
-    st.altair_chart((barras + etiquetas).properties(height=altura),
-                    use_container_width=True)
+
+    st.divider()
+
+    # ---- Editor de folio individual ----
+    st.markdown("#### ✏️ Editar folio")
+    d_sel = d.copy()
+    d_sel["etiqueta"] = (d_sel[COL_G_FOLIO] + " · "
+                          + d_sel[COL_G_PROVEEDOR].str.slice(0, 40)
+                          + " · [" + d_sel[COL_G_ESTADO] + "]")
+    etiqueta_sel = st.selectbox("Selecciona un folio",
+                                 options=d_sel["etiqueta"].tolist())
+    fila = d_sel[d_sel["etiqueta"] == etiqueta_sel].iloc[0]
+    _editor_garantia(fila, datos)
 
 
-def _tabla_a_excel(tabla: pd.DataFrame) -> bytes:
-    """Convierte una tabla (con índice) a un archivo Excel en memoria."""
-    import io
+def _editor_garantia(fila: pd.Series, datos: dict) -> None:
+    icono, texto_sem = semaforo_garantia(fila)
+    st.markdown(
+        f"""<div style='display:flex;gap:1.2rem;flex-wrap:wrap;
+                        padding:0.5rem 0.8rem;margin:0.3rem 0 0.8rem 0;
+                        border:1px solid #e6e6e6;border-radius:6px;
+                        font-size:0.85rem;background:#fafafa'>
+          <span><b>Folio:</b> {fila[COL_G_FOLIO]}</span>
+          <span><b>Proveedor:</b> {fila[COL_G_PROVEEDOR]}</span>
+          <span><b>Importe:</b> {_fmt_mxn(fila[COL_G_IMPORTE])}</span>
+          <span><b>Comprador:</b> {fila[COL_G_COMPRADOR] or '—'}</span>
+          <span><b>Recepción:</b> {_fmt_fecha(fila[COL_G_FECHA_RECEPCION])}</span>
+          <span><b>Estado:</b> {icono} {texto_sem}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    if esta_vencido_garantia(fila):
+        st.error(f"🚨 **{MSG_VENCIDO}**")
+
+    estado = str(fila[COL_G_ESTADO]).strip()
+
+    if estado == ESTADO_CUARENTENA:
+        _panel_cuarentena(fila, datos)
+        return
+
+    if estado == ESTADO_CANCELADO:
+        st.warning("Este folio fue cancelado y no se contabiliza en indicadores.")
+        if st.button("↩️ Reactivar folio", key=f"react_{fila[COL_G_FOLIO]}"):
+            _actualizar_garantia(fila[COL_G_FOLIO], datos,
+                                  {COL_G_ESTADO: ESTADO_ACTIVO},
+                                  "Folio reactivado")
+        return
+
+    with st.form(f"form_g_{fila[COL_G_FOLIO]}"):
+        c1, c2, c3 = st.columns(3)
+        folio_dev = c1.text_input(
+            "Folio de devolución",
+            value=str(fila.get(COL_G_FOLIO_DEV, "") or ""))
+        folio_aj = c2.text_input(
+            "Folio de ajuste",
+            value=str(fila.get(COL_G_FOLIO_AJUSTE, "") or ""))
+        nota_cred = c3.text_input(
+            "Nota de crédito",
+            value=str(fila.get(COL_G_NOTA_CREDITO, "") or ""),
+            help="Al capturar la nota de crédito, el folio queda RESUELTO.")
+
+        respuesta = st.selectbox(
+            "Respuesta del proveedor",
+            options=["", "Recolección", "Destrucción", "Sin respuesta"],
+            index=(["", "Recolección", "Destrucción", "Sin respuesta"]
+                   .index(str(fila.get(COL_G_RESPUESTA, "") or ""))
+                   if str(fila.get(COL_G_RESPUESTA, "") or "")
+                   in ["", "Recolección", "Destrucción", "Sin respuesta"]
+                   else 0),
+        )
+
+        notas = st.text_area("Notas / acciones",
+                              value=str(fila.get(COL_G_NOTAS, "") or ""),
+                              height=100)
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        guardar = c1.form_submit_button("💾 Guardar cambios",
+                                          use_container_width=True,
+                                          type="primary")
+        cancelar = c2.form_submit_button("⛔ Cancelar folio",
+                                           use_container_width=True)
+        recibir = c3.form_submit_button(
+            "✅ Marcar como resuelto",
+            use_container_width=True,
+            help="Solo si ya se capturó la nota de crédito.")
+
+    if guardar:
+        cambios = {
+            COL_G_FOLIO_DEV: folio_dev.strip(),
+            COL_G_FOLIO_AJUSTE: folio_aj.strip(),
+            COL_G_NOTA_CREDITO: nota_cred.strip(),
+            COL_G_RESPUESTA: respuesta,
+            COL_G_NOTAS: notas.strip(),
+        }
+        # Si tiene NC → automáticamente Resuelto
+        if nota_cred.strip():
+            cambios[COL_G_ESTADO] = ESTADO_RESUELTO
+            cambios[COL_G_FECHA_RESUELTO] = pd.Timestamp(hoy_mx())
+            msg = "Folio marcado como RESUELTO (con NC capturada)"
+        else:
+            msg = "Cambios guardados"
+        _actualizar_garantia(fila[COL_G_FOLIO], datos, cambios, msg)
+
+    if cancelar:
+        _actualizar_garantia(fila[COL_G_FOLIO], datos,
+                              {COL_G_ESTADO: ESTADO_CANCELADO},
+                              "Folio cancelado")
+
+    if recibir:
+        if not nota_cred.strip():
+            st.warning("⚠️ Captura primero el número de nota de crédito.")
+        else:
+            _actualizar_garantia(fila[COL_G_FOLIO], datos, {
+                COL_G_NOTA_CREDITO: nota_cred.strip(),
+                COL_G_ESTADO: ESTADO_RESUELTO,
+                COL_G_FECHA_RESUELTO: pd.Timestamp(hoy_mx()),
+            }, "Folio marcado como RESUELTO")
+
+
+def _panel_cuarentena(fila: pd.Series, datos: dict) -> None:
+    """Panel especial para folios en cuarentena."""
+    inicio = _a_fecha(fila.get(COL_G_CUAR_INICIO))
+    fin = _a_fecha(fila.get(COL_G_CUAR_FIN))
+    if fin:
+        faltan = (fin - hoy_mx()).days
+        if faltan > 0:
+            st.info(f"🧊 En cuarentena desde {inicio:%d/%m/%Y} — sale en "
+                     f"**{faltan} día(s)** ({fin:%d/%m/%Y}).")
+        else:
+            st.warning(f"🧊 Cuarentena vencida el {fin:%d/%m/%Y}. Al recargar "
+                        "se activará automáticamente.")
+    st.caption(f"Los folios con importe ≤ ${UMBRAL_CUARENTENA:,.0f} entran a "
+                "cuarentena para acumular monto por proveedor. Se liberan solos "
+                "al vencer el plazo.")
+    c1, c2 = st.columns(2)
+    if c1.button("🚀 Liberar ahora", key=f"lib_{fila[COL_G_FOLIO]}",
+                  use_container_width=True, type="primary"):
+        _actualizar_garantia(fila[COL_G_FOLIO], datos, {
+            COL_G_ESTADO: ESTADO_ACTIVO,
+            COL_G_FECHA_RECEPCION: pd.Timestamp(hoy_mx()),
+        }, "Folio liberado de cuarentena")
+    if c2.button("⛔ Cancelar folio", key=f"can_{fila[COL_G_FOLIO]}",
+                  use_container_width=True):
+        _actualizar_garantia(fila[COL_G_FOLIO], datos,
+                              {COL_G_ESTADO: ESTADO_CANCELADO},
+                              "Folio cancelado desde cuarentena")
+
+
+def _actualizar_garantia(folio: str, datos: dict, cambios: dict,
+                          mensaje: str) -> None:
+    df = datos["garantias"]
+    m = df[COL_G_FOLIO] == folio
+    for col, val in cambios.items():
+        df.loc[m, col] = val
+    df.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+    persistir(datos, f"Garantía {folio}: {mensaje}", mensaje)
+
+
+# =============================================================================
+# 9. NOTAS DE CRÉDITO PENDIENTES (Pestaña 3)
+# =============================================================================
+
+def vista_nc_pendientes(datos: dict) -> None:
+    st.markdown("### 💳 Notas de Crédito Pendientes")
+    st.caption(f"Notas por conceptos varios que aún no llegan a administración. "
+               f"Plazo de **{DIAS_PLAZO_NC} días** desde la fecha de recepción "
+               "del reporte.")
+
+    df = datos["nc"]
+    if df is None:
+        st.error("No hay datos de notas de crédito.")
+        return
+
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
+
+    # Solo pendientes por defecto
+    df_pend = df[df[COL_NC_ESTADO] == "Pendiente"]
+    df_resueltas = df[df[COL_NC_ESTADO] == "Resuelto"]
+
+    # Alerta al inicio
+    if not df_pend.empty:
+        vencidas = df_pend[df_pend.apply(esta_vencida_nc, axis=1)]
+        if not vencidas.empty:
+            st.error(f"🚨 **{len(vencidas)}** nota(s) de crédito VENCIDA(S) "
+                     f"(más de {DIAS_PLAZO_NC} días sin resolver).")
+
+    c1, c2, c3, c4 = st.columns(4)
+    _tarjeta_kpi(c1, "⏳", "NC pendientes",
+                 f"{len(df_pend):,}",
+                 f"{_fmt_mxn(df_pend[COL_NC_IMP_PENDIENTE].sum())} por conseguir",
+                 color="#ea580c")
+    _tarjeta_kpi(c2, "✅", "NC resueltas",
+                 f"{len(df_resueltas):,}",
+                 f"{_fmt_mxn(df_resueltas[COL_NC_IMP_PENDIENTE].sum())} entregadas",
+                 color="#059669")
+    n_venc = int(df_pend.apply(esta_vencida_nc, axis=1).sum()) if not df_pend.empty else 0
+    _tarjeta_kpi(c3, "🚨", "Vencidas (>20 días)",
+                 f"{n_venc:,}",
+                 "Requieren atención inmediata" if n_venc > 0 else "Sin vencidas",
+                 color="#dc2626" if n_venc > 0 else "#94a3b8")
+    proveedores_pend = df_pend[COL_NC_PROVEEDOR].nunique()
+    _tarjeta_kpi(c4, "🏭", "Proveedores",
+                 f"{proveedores_pend:,}",
+                 "con NC pendientes",
+                 color="#1f4e79")
+
+    st.divider()
+
+    # Filtros
+    c1, c2, c3 = st.columns(3)
+    ver_resueltas = c1.checkbox("Mostrar también resueltas", value=False,
+                                 key="nc_ver_res")
+    proveedores = sorted(df[COL_NC_PROVEEDOR].dropna().unique().tolist())
+    f_prov = c2.multiselect("Proveedor", proveedores, placeholder="Todos",
+                             key="nc_f_prov")
+    f_folio = c3.text_input("Buscar folio de entrada",
+                             placeholder="Ej. 176054", key="nc_f_folio")
+
+    d = df.copy()
+    if not ver_resueltas:
+        d = d[d[COL_NC_ESTADO] != "Resuelto"]
+    d = d[d[COL_NC_ESTADO] != "Cancelado"]
+    if f_prov:
+        d = d[d[COL_NC_PROVEEDOR].isin(f_prov)]
+    if f_folio.strip():
+        d = d[d[COL_NC_ENTRADA].astype(str).str.contains(
+            f_folio.strip(), case=False, na=False)]
+
+    if d.empty:
+        st.info("No hay notas de crédito con los filtros actuales.")
+        return
+
+    # Tabla
+    vista = d.copy()
+    vista["🚦"] = vista.apply(lambda f: semaforo_nc(f)[0], axis=1)
+    vista["Días transcurridos"] = vista.apply(dias_transcurridos_nc, axis=1)
+    vista["Días restantes"] = vista.apply(dias_restantes_nc, axis=1)
+
+    cols_vista = ["🚦", COL_NC_ENTRADA, COL_NC_PROVEEDOR, COL_NC_NUM_FACTURA,
+                  COL_NC_IMP_FACTURA, COL_NC_IMP_PENDIENTE,
+                  COL_NC_FECHA_REPORTE, "Días transcurridos", "Días restantes",
+                  COL_NC_FECHA_NC, COL_NC_FOLIO_NC, COL_NC_ESTADO,
+                  COL_NC_COMPRADOR, COL_NC_OBSERVACIONES]
+    cols_vista = [c for c in cols_vista if c in vista.columns]
+    st.dataframe(
+        vista[cols_vista], use_container_width=True, hide_index=True,
+        column_config={
+            COL_NC_IMP_FACTURA: st.column_config.NumberColumn(
+                "Importe factura", format="$%.2f"),
+            COL_NC_IMP_PENDIENTE: st.column_config.NumberColumn(
+                "Importe NC pendiente", format="$%.2f"),
+            COL_NC_FECHA_REPORTE: st.column_config.DateColumn(
+                "Fecha recepción", format="DD/MM/YYYY"),
+            COL_NC_FECHA_NC: st.column_config.DateColumn(
+                "Fecha NC", format="DD/MM/YYYY"),
+            COL_NC_FOLIO_NC: "Folio NC",
+        },
+    )
+
+    st.divider()
+
+    # Editor de NC individual
+    st.markdown("#### ✏️ Actualizar nota de crédito")
+    d_sel = d.copy()
+    d_sel["etiqueta"] = (d_sel[COL_NC_ENTRADA].astype(str) + " · "
+                          + d_sel[COL_NC_PROVEEDOR].str.slice(0, 40)
+                          + " · " + d_sel[COL_NC_IMP_PENDIENTE].apply(_fmt_mxn))
+    etiqueta_sel = st.selectbox("Selecciona una nota",
+                                 options=d_sel["etiqueta"].tolist(),
+                                 key="nc_edit_sel")
+    fila = d_sel[d_sel["etiqueta"] == etiqueta_sel].iloc[0]
+    _editor_nc(fila, datos)
+
+
+def _editor_nc(fila: pd.Series, datos: dict) -> None:
+    icono, texto = semaforo_nc(fila)
+    st.markdown(
+        f"""<div style='display:flex;gap:1.2rem;flex-wrap:wrap;
+                        padding:0.5rem 0.8rem;margin:0.3rem 0 0.8rem 0;
+                        border:1px solid #e6e6e6;border-radius:6px;
+                        font-size:0.85rem;background:#fafafa'>
+          <span><b>Folio entrada:</b> {fila[COL_NC_ENTRADA]}</span>
+          <span><b>Proveedor:</b> {fila[COL_NC_PROVEEDOR]}</span>
+          <span><b>Importe pendiente:</b> {_fmt_mxn(fila[COL_NC_IMP_PENDIENTE])}</span>
+          <span><b>Recepción reporte:</b> {_fmt_fecha(fila[COL_NC_FECHA_REPORTE])}</span>
+          <span><b>Estado:</b> {icono} {texto}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    with st.form(f"form_nc_{fila[COL_NC_ENTRADA]}"):
+        c1, c2 = st.columns(2)
+        fecha_rep_val = _a_fecha(fila.get(COL_NC_FECHA_REPORTE)) or hoy_mx()
+        fecha_recep = c1.date_input(
+            "Fecha de recepción del reporte",
+            value=fecha_rep_val, format="DD/MM/YYYY",
+            help="Desde esta fecha corren los 20 días.")
+
+        fecha_nc_actual = _a_fecha(fila.get(COL_NC_FECHA_NC))
+        fecha_nc = c2.date_input(
+            "Fecha de la nota de crédito (si ya llegó)",
+            value=fecha_nc_actual or hoy_mx(), format="DD/MM/YYYY")
+        capturar_nc = st.checkbox(
+            "Marcar que la NC ya se envió a administración",
+            value=fecha_nc_actual is not None,
+            key=f"cap_nc_{fila[COL_NC_ENTRADA]}")
+
+        folio_nc = st.text_input(
+            "Folio de la nota de crédito",
+            value=str(fila.get(COL_NC_FOLIO_NC, "") or ""))
+
+        observ = st.text_area(
+            "Observaciones (qué se está haciendo para conseguirla)",
+            value=str(fila.get(COL_NC_OBSERVACIONES, "") or ""),
+            height=100)
+
+        c1, c2 = st.columns([2, 1])
+        guardar = c1.form_submit_button("💾 Guardar cambios",
+                                          use_container_width=True,
+                                          type="primary")
+        cancelar = c2.form_submit_button("⛔ Cancelar seguimiento",
+                                           use_container_width=True)
+
+    if guardar:
+        cambios = {
+            COL_NC_FECHA_REPORTE: pd.Timestamp(fecha_recep),
+            COL_NC_FOLIO_NC: folio_nc.strip(),
+            COL_NC_OBSERVACIONES: observ.strip(),
+        }
+        if capturar_nc:
+            cambios[COL_NC_FECHA_NC] = pd.Timestamp(fecha_nc)
+            cambios[COL_NC_ESTADO] = "Resuelto"
+            msg = "NC marcada como RESUELTA (enviada a administración)"
+        else:
+            cambios[COL_NC_FECHA_NC] = pd.NaT
+            cambios[COL_NC_ESTADO] = "Pendiente"
+            msg = "NC actualizada"
+        _actualizar_nc(fila[COL_NC_ENTRADA], datos, cambios, msg)
+
+    if cancelar:
+        _actualizar_nc(fila[COL_NC_ENTRADA], datos,
+                        {COL_NC_ESTADO: "Cancelado"},
+                        "Seguimiento de NC cancelado")
+
+
+def _actualizar_nc(folio_entrada, datos: dict, cambios: dict,
+                    mensaje: str) -> None:
+    df = datos["nc"]
+    m = df[COL_NC_ENTRADA] == folio_entrada
+    for col, val in cambios.items():
+        df.loc[m, col] = val
+    persistir(datos, f"NC {folio_entrada}: {mensaje}", mensaje)
+
+
+# =============================================================================
+# 10. FOLIOS DE DEVOLUCIÓN SUELTOS (dentro de garantías, vista aparte)
+# =============================================================================
+
+def vista_devoluciones_sueltas(datos: dict) -> None:
+    st.markdown("### 📦 Folios de devolución históricos")
+    st.caption("Folios de devolución que no se ligan a un folio reporte actual "
+               "(en su mayoría de 2023-2024). Aquí puedes revisarlos, "
+               "cancelarlos o bloquearlos cuando ya no procedan.")
+
+    df = datos["devoluciones"]
+    if df is None or df.empty:
+        st.info("No hay folios de devolución cargados.")
+        return
+
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
+
+    # Filtros
+    c1, c2, c3 = st.columns(3)
+    f_estado = c1.selectbox("Estado", ["Todos", "Activo", "Bloqueado", "Cancelado"],
+                             key="d_f_estado")
+    f_tipo = c2.selectbox("Tipo",
+                           ["Todos", "Garantía (cliente)",
+                            "Incidente proveedor", "Otro"], key="d_f_tipo")
+    f_prov = c3.text_input("Buscar proveedor", key="d_f_prov")
+
+    d = df.copy()
+    if f_estado != "Todos":
+        d = d[d[COL_D_ESTADO] == f_estado]
+    if f_tipo != "Todos":
+        d = d[d["TIPO"] == f_tipo]
+    if f_prov.strip():
+        d = d[d[COL_D_PROVEEDOR].str.contains(f_prov.strip(), case=False, na=False)]
+
+    st.caption(f"**{len(d)}** de **{len(df)}** folios · "
+                f"Total pendiente: **{_fmt_mxn(d[COL_D_PENDIENTE].sum())}**")
+
+    if d.empty:
+        st.info("No hay folios con los filtros actuales.")
+        return
+
+    cols = [COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR, COL_D_TOTAL,
+            COL_D_PENDIENTE, COL_D_APLICADO_MXN, "TIPO", COL_D_RESOLUCION,
+            COL_D_COMPRADOR, COL_D_ESTADO]
+    cols = [c for c in cols if c in d.columns]
+    st.dataframe(
+        d[cols], use_container_width=True, hide_index=True,
+        column_config={
+            COL_D_TOTAL: st.column_config.NumberColumn("Total", format="$%.2f"),
+            COL_D_PENDIENTE: st.column_config.NumberColumn("Pendiente",
+                                                            format="$%.2f"),
+            COL_D_APLICADO_MXN: st.column_config.NumberColumn("Aplicado",
+                                                               format="$%.2f"),
+            COL_D_FECHA: st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+    )
+
+    st.divider()
+
+    # Editor
+    st.markdown("#### ✏️ Actualizar folio")
+    d_sel = d.copy()
+    d_sel["etiqueta"] = (d_sel[COL_D_FOLIO].astype(str) + " · "
+                          + d_sel[COL_D_PROVEEDOR].str.slice(0, 40)
+                          + " · " + d_sel[COL_D_PENDIENTE].apply(_fmt_mxn))
+    sel = st.selectbox("Selecciona un folio", options=d_sel["etiqueta"].tolist())
+    fila = d_sel[d_sel["etiqueta"] == sel].iloc[0]
+
+    st.markdown(
+        f"""<div style='padding:0.5rem 0.8rem;margin:0.3rem 0 0.8rem 0;
+                        border:1px solid #e6e6e6;border-radius:6px;
+                        font-size:0.85rem;background:#fafafa'>
+          <b>Folio:</b> {fila[COL_D_FOLIO]} · <b>{fila[COL_D_PROVEEDOR]}</b> · 
+          Total: {_fmt_mxn(fila[COL_D_TOTAL])} · 
+          Pendiente: {_fmt_mxn(fila[COL_D_PENDIENTE])} · 
+          Estado: <b>{fila[COL_D_ESTADO]}</b>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    with st.form(f"form_d_{fila[COL_D_FOLIO]}"):
+        notas = st.text_area("Notas",
+                              value=str(fila.get(COL_D_NOTAS, "") or ""))
+        c1, c2, c3 = st.columns(3)
+        act = c1.form_submit_button("↩️ Activar", use_container_width=True)
+        blq = c2.form_submit_button("🔒 Bloquear", use_container_width=True)
+        can = c3.form_submit_button("⛔ Cancelar", use_container_width=True)
+
+    def _act_dev(nuevo_estado, msg):
+        df2 = datos["devoluciones"]
+        m = df2[COL_D_FOLIO] == fila[COL_D_FOLIO]
+        df2.loc[m, COL_D_ESTADO] = nuevo_estado
+        df2.loc[m, COL_D_NOTAS] = notas.strip()
+        persistir(datos, f"Devolución {fila[COL_D_FOLIO]}: {msg}", msg)
+
+    if act:
+        _act_dev("Activo", "Folio activado")
+    if blq:
+        _act_dev("Bloqueado", "Folio bloqueado")
+    if can:
+        _act_dev("Cancelado", "Folio cancelado")
+
+
+# =============================================================================
+# 11. CARGA / DESCARGA DE BASE DE DATOS
+# =============================================================================
+
+def _excel_en_memoria(datos: dict) -> bytes:
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        tabla.to_excel(writer, sheet_name="Avance", index=True)
+    guardar_excel(datos, "/tmp/_desc.xlsx")
+    with open("/tmp/_desc.xlsx", "rb") as fh:
+        buffer.write(fh.read())
     return buffer.getvalue()
 
 
-def vista_graficas(df: pd.DataFrame) -> None:
-    """Gráficas de avance por comprador, con filtro de mes y medida propios."""
-    st.subheader("📈 Avance por comprador")
+def vista_base_datos(datos: dict) -> None:
+    st.markdown("### 🗄️ Base de datos")
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
 
-    if df.empty:
-        st.info("No hay registros con los filtros actuales.")
-        return
-
-    # --- Control propio: solo filtro de mes (las gráficas van siempre en importe) ---
-    meses_disp = (df[[COL_MES_ETIQUETA, COL_MES]].drop_duplicates()
-                  .sort_values(COL_MES)[COL_MES_ETIQUETA].tolist())
-    sel_meses = st.multiselect(
-        "Mes de reclamación", options=meses_disp,
-        placeholder="Todos los meses", key="graf_meses",
-    )
-
-    dfg = df[df[COL_MES_ETIQUETA].isin(sel_meses)] if sel_meses else df.copy()
-
-    # Descartar folios FINALIZADOS de todas las gráficas: solo folios activos.
-    dfg = dfg[dfg[COL_ETAPA] != ETAPA_FINAL]
-
-    if dfg.empty:
-        st.info("No hay folios activos con los filtros actuales.")
-        return
-
-    # Las gráficas se miden por IMPORTE (en pesos). La cantidad de reclamaciones
-    # se lleva en paralelo (_conteo) para mostrarla como dato informativo.
-    es_dinero = True
-    etiqueta_valor = "Importe (MXN)"
-    fmt_columna = st.column_config.NumberColumn(format="$%.2f")
-    dfg = dfg.assign(
-        _valor=pd.to_numeric(dfg[COL_IMPORTE], errors="coerce").fillna(0.0),
-        _conteo=1,
-    )
-    st.caption("💡 Las gráficas muestran solo **folios activos** (excluyen "
-               "finalizados) medidos por **importe en pesos**. La cantidad de "
-               "reclamaciones aparece a un lado como dato informativo.")
-
-    dfg["_comprador"] = dfg[COL_COMPRADOR].replace("", "SIN COMPRADOR")
-    dfg["_proveedor"] = dfg[COL_PROVEEDOR].replace("", "SIN PROVEEDOR")
-
-    # =====================================================================
-    #  SECCIÓN A — JEFATURA DE INCIDENCIAS
-    #  Administra: Reporte de reclamo, Disposición final, Cuentas por pagar
-    # =====================================================================
-    st.markdown("### 🏛️ Jefatura de incidencias")
-    st.caption("Etapas a cargo de la Jefatura: Reporte de reclamo, "
-               "Disposición final y Cuentas por pagar.")
-
-    # Reclamos por proveedor: TODAS las etapas activas (incluye Gestión), sin cuarentena.
-    # Antes solo consideraba las etapas de la Jefatura, lo que no cuadraba con el
-    # total real por proveedor.
-    dfg_activos = dfg[dfg[COL_ETAPA] != ETAPA_CUARENTENA]
-
-    if dfg_activos.empty:
-        st.info("No hay reclamaciones activas con los filtros actuales.")
-    else:
-        st.markdown("##### 1. Reclamos por proveedor · Top 10")
-        st.caption("Importe total por proveedor considerando **todas las etapas "
-                   "activas** (incluye Gestión, excluye cuarentena y finalizadas). "
-                   "Entre paréntesis, la cantidad de reclamaciones. Solo se muestran "
-                   "los 10 proveedores con mayor importe.")
-        serie_prov = (dfg_activos.groupby("_proveedor")["_valor"].sum()
-                      .sort_values(ascending=False))
-        conteo_prov = dfg_activos.groupby("_proveedor")["_conteo"].sum()
-        total_prov = len(serie_prov)
-        # Top 10
-        serie_top = serie_prov.head(10)
-        serie_top.index.name = "Proveedor"
-        conteo_top = conteo_prov.reindex(serie_top.index)
-        if total_prov > 10:
-            st.caption(f"Mostrando **10 de {total_prov}** proveedores con reclamos "
-                       "activos, ordenados por importe.")
-        _grafica_barra_simple(serie_top, etiqueta_valor, es_dinero,
-                              altura=max(320, 32 * len(serie_top)),
-                              conteo=conteo_top)
-
-    # A3) Reclamaciones en Cuarentena por proveedor (se tratan aparte)
-    st.markdown("##### 2. Reclamaciones en cuarentena por proveedor")
-    st.caption(f"Reclamaciones con importe ≤ ${UMBRAL_CUARENTENA:,.0f} en espera "
-               "de acumular monto. No cuentan en las gráficas anteriores ni en el "
-               "vencimiento de 90 días.")
-    dfg_cuar = dfg[dfg[COL_ETAPA] == ETAPA_CUARENTENA]
-    if dfg_cuar.empty:
-        st.info("No hay reclamaciones en cuarentena con los filtros actuales.")
-    else:
-        serie_cuar = (dfg_cuar.groupby("_proveedor")["_valor"].sum()
-                      .sort_values(ascending=False))
-        serie_cuar.index.name = "Proveedor"
-        conteo_cuar = dfg_cuar.groupby("_proveedor")["_conteo"].sum()
-        total_cuar = serie_cuar.sum()
-        st.caption(f"Total en cuarentena: **${total_cuar:,.2f}** "
-                   f"({int(conteo_cuar.sum())} reclamaciones) en "
-                   f"{len(serie_cuar)} proveedor(es).")
-        _grafica_barra_simple(serie_cuar, etiqueta_valor, es_dinero,
-                              altura=max(280, 22 * len(serie_cuar)), color="#2980b9",
-                              conteo=conteo_cuar)
-
-    st.divider()
-
-    # =====================================================================
-    #  SECCIÓN B — COMPRADORES (Gestión)
-    #  Solo lo que está actualmente en Gestión.
-    # =====================================================================
-    st.markdown("### 🧑‍💼 Compradores · Gestión")
-    st.caption("Reclamaciones que están actualmente en la etapa de Gestión, "
-               "a cargo de cada comprador.")
-
-    dfg_gest = dfg[dfg[COL_ETAPA] == ETAPA_COMPRADORES]
-
-    # B1) Cuántas reclamaciones tiene cada comprador EN Gestión (+ total)
-    st.markdown("##### 3. Reclamaciones en Gestión por comprador")
-    if dfg_gest.empty:
-        st.info("No hay reclamaciones actualmente en Gestión con los filtros actuales.")
-    else:
-        serie_gest = (dfg_gest.groupby("_comprador")["_valor"].sum()
-                      .sort_values(ascending=False))
-        serie_gest.index.name = "Comprador"
-        conteo_gest = dfg_gest.groupby("_comprador")["_conteo"].sum()
-        total_gest = serie_gest.sum()
-        st.caption(f"Total en Gestión: **${total_gest:,.2f}** "
-                   f"({int(conteo_gest.sum())} reclamaciones) en "
-                   f"{len(serie_gest)} comprador(es).")
-        _grafica_barra_simple(serie_gest, etiqueta_valor, es_dinero,
-                              altura=max(280, 26 * len(serie_gest)), color="#F58518",
-                              conteo=conteo_gest)
-
-    # B2) Tiempo promedio que tardan en Gestión
-    st.markdown("##### 4. Tiempo promedio en Gestión por comprador")
-    st.caption("Días promedio que cada comprador tardó en cerrar la etapa de "
-               "Gestión (solo reclamaciones con Gestión terminada). Entre "
-               "paréntesis, el número de reclamaciones promediadas.")
-
-    filas_dias = []
-    for _, fila in dfg.iterrows():
-        if es_verdadero(fila.get(COL_E2_TERM)):
-            try:
-                d = float(fila.get(COL_E2_DIAS))
-                if d == d:  # no NaN
-                    filas_dias.append({"_comprador": fila[COL_COMPRADOR] or "SIN COMPRADOR",
-                                       "Días": d})
-            except (TypeError, ValueError):
-                pass
-    if not filas_dias:
-        st.info("Todavía no hay reclamaciones con Gestión terminada para promediar.")
-    else:
-        prom = (pd.DataFrame(filas_dias).groupby("_comprador")
-                .agg(Promedio=("Días", "mean"), Casos=("Días", "size")))
-        prom["Promedio"] = prom["Promedio"].round(1)
-        prom = prom.sort_values("Promedio", ascending=False)
-        _grafica_dias_comprador(prom, altura=max(280, 26 * len(prom)))
-
-    st.divider()
-
-    # =====================================================================
-    #  Tabla de reclamaciones por comprador y su avance (descargable)
-    # =====================================================================
-    st.markdown("### 📋 Detalle por comprador")
-    st.caption("Importe por etapa de cada comprador y su total, considerando solo "
-               "folios activos (excluye finalizados). La cantidad de reclamos "
-               "vigentes no incluye las que están en cuarentena. Ordena por "
-               "cualquier encabezado. Se puede descargar.")
-
-    # Importe por etapa activa (finalizados ya fueron descartados de dfg)
-    tabla_det = (dfg.pivot_table(index="_comprador", columns=COL_ETAPA,
-                                 values="_valor", aggfunc="sum", fill_value=0))
-    orden_cols = [e for e in ORDEN_ETAPAS if e in tabla_det.columns]
-    orden_cols += [c for c in tabla_det.columns if c not in orden_cols]
-    tabla_det = tabla_det[orden_cols]
-
-    # Importe y cantidad de reclamaciones VIGENTES (excluyen también cuarentena)
-    dfg_vig = dfg[dfg[COL_ETAPA] != ETAPA_CUARENTENA]
-    importe_vig = dfg_vig.groupby("_comprador")["_valor"].sum()
-    conteo_vig = dfg_vig.groupby("_comprador")["_conteo"].sum()
-    tabla_det["Importe vigente"] = importe_vig.reindex(tabla_det.index).fillna(0)
-    tabla_det["Reclamos vigentes"] = (conteo_vig.reindex(tabla_det.index)
-                                      .fillna(0).astype(int))
-    tabla_det = tabla_det.sort_values("Importe vigente", ascending=False)
-    tabla_det.index.name = "Comprador"
-
-    # Formato: importes con moneda, reclamos como entero
-    cfg = {c: st.column_config.NumberColumn(format="$%.2f") for c in orden_cols}
-    cfg["Importe vigente"] = st.column_config.NumberColumn(format="$%.2f")
-    cfg["Reclamos vigentes"] = st.column_config.NumberColumn(format="%d")
-    st.dataframe(tabla_det, use_container_width=True, column_config=cfg)
-
+    st.markdown("#### ⬇️ Descargar base actual")
+    st.caption("Descarga el Excel con las tres hojas tal como están hoy. "
+                "Puedes editarlo, agregar nuevas filas y volver a cargarlo.")
+    hoy_str = ahora_mx().strftime("%Y%m%d_%H%M")
     st.download_button(
-        "⬇️ Descargar tabla (Excel)",
-        data=_tabla_a_excel(tabla_det),
-        file_name="avance_por_comprador.xlsx",
+        "⬇️ Descargar datos.xlsx",
+        data=_excel_en_memoria(datos),
+        file_name=f"datos_{hoy_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
     st.divider()
 
-    # =====================================================================
-    #  Días promedio por etapa y mes (visión global del proceso)
-    # =====================================================================
-    st.markdown("### ⏱️ Días promedio por etapa y mes")
-    st.caption("Visión global: cuánto tardó en promedio cada etapa, agrupado por "
-               "mes de reclamación. Solo considera etapas ya terminadas.")
-    _grafica_dias_promedio(dfg, altura=360)
-
-
-# =============================================================================
-# 11b. GESTIÓN DE LA BASE DE DATOS (descargar / cargar)
-# =============================================================================
-
-def _excel_en_memoria(df: pd.DataFrame) -> bytes:
-    """Genera el Excel completo (sin columnas auxiliares, fechas sin hora)."""
-    import io
-    buffer = io.BytesIO()
-    df_export = _preparar_para_excel(df)
-    with pd.ExcelWriter(buffer, engine="openpyxl", datetime_format="DD/MM/YYYY",
-                        date_format="DD/MM/YYYY") as writer:
-        df_export.to_excel(writer, sheet_name=NOMBRE_HOJA, index=False)
-    return buffer.getvalue()
-
-
-def vista_base_datos(df: pd.DataFrame) -> None:
-    st.subheader("🗄️ Base de datos")
-    if "flash_bd" in st.session_state:
-        tipo, texto = st.session_state.pop("flash_bd")
-        (st.success if tipo == "success" else st.warning)(texto)
-
-    # ----- DESCARGAR -----
-    st.markdown("##### ⬇️ Descargar base de datos completa")
-    st.caption("Descarga el Excel con todos los registros y columnas tal como están "
-               "hoy. Puedes abrirlo, agregar reclamaciones nuevas o completar datos, y "
-               "volver a cargarlo aquí.")
-    hoy = ahora_mx().strftime("%Y%m%d_%H%M")
-    st.download_button(
-        "⬇️ Descargar datos.xlsx actualizado",
-        data=_excel_en_memoria(df),
-        file_name=f"datos_{hoy}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-    st.divider()
-
-    # ----- CARGAR -----
-    st.markdown("##### ⬆️ Cargar base de datos actualizada")
-    st.caption("Sube un Excel (misma estructura de columnas) para reemplazar la base "
-               "de datos. Se guardará y se subirá al repositorio para que la app tome "
-               "la nueva información. **Recomendado:** parte del archivo que descargaste "
-               "arriba para no perder columnas.")
-
-    archivo = st.file_uploader("Selecciona el archivo datos.xlsx", type=["xlsx"])
+    st.markdown("#### ⬆️ Cargar nueva base")
+    st.caption("Sube un Excel con las tres hojas: "
+                f"**{HOJA_GARANTIAS}**, **{HOJA_DEVOLUCIONES}** y **{HOJA_NC}**. "
+                "Reemplazará por completo la base actual.")
+    archivo = st.file_uploader("Selecciona el archivo", type=["xlsx"])
     if archivo is None:
         return
 
-    # Vista previa y validación
     try:
-        df_nuevo = pd.read_excel(archivo, sheet_name=NOMBRE_HOJA)
+        xl = pd.ExcelFile(archivo)
     except Exception as e:
-        st.error(f"No se pudo leer el archivo. ¿Tiene una hoja llamada '{NOMBRE_HOJA}'? "
-                 f"Detalle: {e}")
+        st.error(f"No se pudo leer el archivo: {e}")
         return
 
-    df_nuevo.columns = [_normalizar_encabezado(c) for c in df_nuevo.columns]
-    if COL_FOLIO not in df_nuevo.columns:
-        st.error(f"El archivo no tiene la columna obligatoria '{COL_FOLIO}'. "
-                 "Descarga la base actual y parte de ella.")
+    hojas_encontradas = xl.sheet_names
+    faltantes = [h for h in [HOJA_GARANTIAS, HOJA_DEVOLUCIONES, HOJA_NC]
+                 if h not in hojas_encontradas]
+    if faltantes:
+        st.error(f"Faltan hojas: {', '.join(faltantes)}")
         return
-
-    n_nuevos = len(df_nuevo)
-    folios = df_nuevo[COL_FOLIO].astype(str).str.strip()
-    duplicados = folios[folios.duplicated()].unique()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Registros en el archivo", n_nuevos)
-    c2.metric("Registros actuales", len(df))
-    c3.metric("Diferencia", f"{n_nuevos - len(df):+d}")
+    n_g = len(pd.read_excel(xl, sheet_name=HOJA_GARANTIAS))
+    n_d = len(pd.read_excel(xl, sheet_name=HOJA_DEVOLUCIONES))
+    n_nc = len(pd.read_excel(xl, sheet_name=HOJA_NC))
+    c1.metric("Folios garantía", n_g)
+    c2.metric("Folios devolución", n_d)
+    c3.metric("NC pendientes", n_nc)
 
-    if len(duplicados) > 0:
-        st.error(f"⚠️ Hay folios repetidos en el archivo (deben ser únicos): "
-                 f"{', '.join(map(str, duplicados[:10]))}"
-                 f"{'…' if len(duplicados) > 10 else ''}. Corrige antes de cargar.")
-        return
-
-    st.markdown("**Vista previa (primeras filas):**")
-    st.dataframe(df_nuevo.head(10), use_container_width=True, hide_index=True)
-
-    st.warning("Al confirmar, la base actual se reemplazará por completo con este "
-               "archivo y se subirá al repositorio.")
-    usuario = st.text_input("Tu nombre / usuario (para el registro)", key="user_carga_bd")
-    confirmar = st.checkbox("Entiendo que se reemplazará toda la base de datos",
-                            key="confirmar_carga_bd")
-
-    if st.button("⬆️ Cargar y subir al repositorio", type="primary",
-                 use_container_width=True, disabled=not confirmar):
-        if not usuario.strip():
-            st.error("✍️ Escribe tu nombre antes de cargar.")
-            return
+    confirmar = st.checkbox(
+        "Entiendo que se reemplazará por completo la base actual",
+        key="confirmar_carga")
+    if st.button("⬆️ Cargar y sincronizar", type="primary",
+                  use_container_width=True, disabled=not confirmar):
         try:
-            # Escribir el archivo nuevo tal cual en datos.xlsx
-            df_nuevo.to_excel(RUTA_EXCEL, sheet_name=NOMBRE_HOJA, index=False)
+            with open(RUTA_EXCEL, "wb") as fh:
+                archivo.seek(0)
+                fh.write(archivo.read())
         except Exception as e:
-            st.error(f"No se pudo escribir el Excel: {e}")
+            st.error(f"No se pudo escribir el archivo: {e}")
             return
-
-        mensaje_commit = (f"Carga masiva de base de datos por {usuario.strip()} "
-                          f"({n_nuevos} registros, {ahora_mx():%d/%m/%Y %H:%M})")
-        with st.spinner("Subiendo la nueva base a GitHub…"):
-            exito, mensaje = subir_a_github(mensaje_commit)
-
         cargar_datos.clear()
         st.session_state["version_datos"] += 1
-        st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
-
+        st.session_state["datos"] = cargar_datos(RUTA_EXCEL,
+                                                  st.session_state["version_datos"])
+        with st.spinner("Subiendo al repositorio…"):
+            exito, msg = subir_a_github(
+                f"Carga masiva ({n_g}+{n_d}+{n_nc} registros) "
+                f"{ahora_mx():%d/%m/%Y %H:%M}")
         if exito:
-            st.session_state["flash_bd"] = ("success", f"✅ Base cargada. {mensaje}")
+            st.success(f"✅ Base cargada. {msg}")
         else:
-            st.session_state["flash_bd"] = ("warning", f"💾 Guardado local, pero: {mensaje}")
+            st.warning(f"💾 Guardado local, pero: {msg}")
         st.rerun()
 
 
 # =============================================================================
-# 13. FUNCIÓN PRINCIPAL
+# 12. GUÍA
+# =============================================================================
+
+def vista_guia() -> None:
+    st.markdown("### 📖 Guía del sistema")
+    st.markdown(f"""
+Esta aplicación da seguimiento a devoluciones con proveedores. Toda la gestión
+la lleva **una sola persona** con acceso mediante contraseña única.
+
+### 🔑 Concepto general
+- Cada folio de garantía se mide de **extremo a extremo**: desde su fecha de
+  recepción hasta que se captura la **nota de crédito**.
+- El plazo total es de **{DIAS_PLAZO_TOTAL} días**.
+- Un folio queda **RESUELTO** en el momento en que se captura la nota de crédito.
+
+### 🧊 Cuarentena
+- Los folios con importe menor o igual a **${UMBRAL_CUARENTENA:,.0f}** entran
+  automáticamente a **cuarentena** por **{DIAS_CUARENTENA} días** para acumular
+  monto con otros folios del mismo proveedor.
+- Al vencer el plazo, se liberan solos y **ahí empiezan a contar los
+  {DIAS_PLAZO_TOTAL} días**.
+- También puedes liberarlos manualmente en cualquier momento (sin clave).
+
+### 💳 Notas de Crédito Pendientes
+- Pestaña aparte para NC de conceptos varios (faltantes, rebates, descuentos,
+  fletes, etc.).
+- Plazo: **{DIAS_PLAZO_NC} días** desde la fecha de recepción del reporte hasta
+  que se envía la NC a administración.
+- Cuando se captura la fecha de la NC, la NC pasa a estado **Resuelto** y sale
+  del listado de pendientes.
+
+### 🚦 Semáforo
+- 🟢 En tiempo · 🟡 Por vencerse · 🔴 Vencido · ✅ Resuelto · 🧊 Cuarentena · ⚫ Cancelado
+
+### 📊 Tablero Directivo
+Es la pestaña que se presenta en juntas. Muestra:
+- Número de folios y monto total
+- % de folios resueltos
+- Notas de crédito conseguidas
+- Alertas de folios vencidos
+- Top 10 proveedores por importe
+- Evolución mensual
+
+Todo con **filtro por mes o rango de fechas**.
+
+### ✏️ Modificaciones
+- Ya no se requieren claves para editar, cancelar o reactivar folios.
+- Todos los cambios se guardan automáticamente y se sincronizan con el
+  repositorio.
+
+### 🗄️ Base de datos
+- Se puede **descargar** el Excel actual en cualquier momento.
+- Se puede **cargar** una versión actualizada (reemplaza toda la base).
+- El archivo debe tener las tres hojas:
+  `{HOJA_GARANTIAS}`, `{HOJA_DEVOLUCIONES}` y `{HOJA_NC}`.
+""")
+
+
+# =============================================================================
+# 13. MAIN
 # =============================================================================
 
 def main() -> None:
@@ -2686,63 +1581,59 @@ def main() -> None:
 
     if "version_datos" not in st.session_state:
         st.session_state["version_datos"] = 0
-    if "df" not in st.session_state:
-        st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
-    df = st.session_state["df"]
+    if "datos" not in st.session_state:
+        st.session_state["datos"] = cargar_datos(
+            RUTA_EXCEL, st.session_state["version_datos"])
+    datos = st.session_state["datos"]
 
-    # --- Encabezado compacto (una sola línea) ---
+    # Barra lateral
+    st.sidebar.markdown("### ⚙️ Panel")
+    if st.sidebar.button("🔄 Recargar datos", use_container_width=True):
+        cargar_datos.clear()
+        st.session_state["version_datos"] += 1
+        st.session_state["datos"] = cargar_datos(
+            RUTA_EXCEL, st.session_state["version_datos"])
+        st.rerun()
+    if st.sidebar.button("🚪 Salir", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+
+    # Encabezado
     st.markdown(
-        "<div style='margin-bottom:0.2rem'>"
-        "<span style='font-size:1.15rem;font-weight:700'>📋 Seguimiento a devoluciones</span>"
-        "<span style='color:#888;font-size:0.85rem'> · Devoluciones y reclamaciones</span>"
+        "<div style='margin-bottom:0.4rem'>"
+        "<span style='font-size:1.3rem;font-weight:700;color:#1f4e79'>"
+        "📋 Seguimiento a Devoluciones</span>"
+        "<span style='color:#666;font-size:0.9rem'> · MASYFERR / SANVER FORTE</span>"
         "</div>",
         unsafe_allow_html=True,
     )
 
-    # --- Barra lateral: control + filtros (colapsable, no ocupa el área principal) ---
-    st.sidebar.markdown("### ⚙️ Panel")
-    cb1, cb2 = st.sidebar.columns(2)
-    if cb1.button("🔄 Recargar", use_container_width=True):
-        cargar_datos.clear()
-        st.session_state["version_datos"] += 1
-        st.session_state["df"] = cargar_datos(RUTA_EXCEL, st.session_state["version_datos"])
-        st.rerun()
-    if cb2.button("🚪 Salir", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
+    if datos.get("error"):
+        st.error(datos["error"])
+        st.info("Sube un archivo válido en la pestaña **Base de datos** para "
+                "comenzar.")
+        vista_base_datos(datos)
+        return
 
-    df_filtrado = construir_filtros(df)
-
-    # --- KPIs compactos en una línea ---
-    mostrar_kpis(df_filtrado)
-
-    # --- Aviso destacado de reclamos vencidos a 90 días ---
-    criticos = [f for _, f in df_filtrado.iterrows() if vencido_90_sin_definicion(f)]
-    if criticos:
-        st.error(
-            f"🚨 **{MSG_VENCIDO_90}** — {len(criticos)} reclamo(s) rebasaron los "
-            f"{DIAS_VENCIMIENTO_TOTAL} días desde la fecha de corte. "
-            "Revísalos en la pestaña *Resumen y alarmas*."
-        )
-
-    tab_graf, tab_editar, tab_tabla, tab_cuar, tab_resumen, tab_bd, tab_guia = st.tabs(
-        ["📈 Avance", "✏️ Editar reclamación", "📊 Tabla", "🧊 Cuarentena",
-         "🔔 Resumen y alarmas", "🗄️ Base de datos", "📖 Guía"]
-    )
-    with tab_graf:
-        vista_graficas(df_filtrado)
-    with tab_editar:
-        vista_editar(df_filtrado)
-    with tab_tabla:
-        mostrar_tabla(df_filtrado)
-    with tab_cuar:
-        vista_cuarentena(df_filtrado)
-    with tab_resumen:
-        mostrar_notificaciones(df_filtrado)
-    with tab_bd:
-        # La descarga/carga siempre opera sobre la base COMPLETA, no la filtrada.
-        vista_base_datos(df)
-    with tab_guia:
+    tabs = st.tabs([
+        "📊 Tablero directivo",
+        "📋 Folios de garantía",
+        "💳 NC pendientes",
+        "📦 Devoluciones históricas",
+        "🗄️ Base de datos",
+        "📖 Guía",
+    ])
+    with tabs[0]:
+        vista_tablero(datos)
+    with tabs[1]:
+        vista_garantias(datos)
+    with tabs[2]:
+        vista_nc_pendientes(datos)
+    with tabs[3]:
+        vista_devoluciones_sueltas(datos)
+    with tabs[4]:
+        vista_base_datos(datos)
+    with tabs[5]:
         vista_guia()
 
 
