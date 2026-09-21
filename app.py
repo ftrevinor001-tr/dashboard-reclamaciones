@@ -52,8 +52,36 @@ st.set_page_config(
     page_title="Seguimiento a devoluciones",
     page_icon="📋",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
+
+# CSS de compactación para aprovechar el ancho y reducir espacios en blanco
+st.markdown("""
+<style>
+    /* Reducir padding superior y márgenes generales */
+    .block-container {
+        padding-top: 1.2rem !important;
+        padding-bottom: 1rem !important;
+        max-width: 100% !important;
+    }
+    /* Encabezados más compactos */
+    h1, h2, h3 { margin-top: 0.4rem !important; margin-bottom: 0.4rem !important; }
+    h4 { margin-top: 0.6rem !important; margin-bottom: 0.3rem !important;
+         font-size: 1.05rem !important; }
+    /* Separadores más finos */
+    hr { margin: 0.6rem 0 !important; }
+    /* Tabs con menos padding */
+    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab"] {
+        padding-top: 0.4rem !important;
+        padding-bottom: 0.4rem !important;
+    }
+    /* Reducir margen de widgets */
+    [data-testid="stVerticalBlock"] { gap: 0.4rem !important; }
+    /* Captions más discretos */
+    .stCaption { font-size: 0.78rem !important; color: #64748b !important; }
+</style>
+""", unsafe_allow_html=True)
 
 RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
 RUTA_EXCEL = os.path.join(RUTA_BASE, "datos.xlsx")
@@ -200,6 +228,7 @@ ETAPAS_NC = [
 ETAPA_NC_INICIAL = ETAPAS_NC[0]
 
 # --- Columnas de la hoja 2: FOLIOS DE DEVOLUCIÓN ---
+COL_D_FECHA_REPORTE = "FECHA REPORTE"  # NUEVA — arranca el reloj de 20 días
 COL_D_FOLIO = "Folio"
 COL_D_FECHA = "Fecha"
 COL_D_PROVEEDOR = "Proveedor"
@@ -215,9 +244,9 @@ COL_D_ESTADO = "ESTADO"  # activo / bloqueado / cancelado
 COL_D_NOTAS = "NOTAS"
 
 # --- Columnas de la hoja 3: NC PENDIENTES ---
+COL_NC_FECHA_REPORTE = "FECHA REPORTE"  # NUEVA — arranca el reloj de 20 días
 COL_NC_ENTRADA = "FOLIO DE ENTRADA"
 COL_NC_FECHA_FACTURA = "FECHA FACTURA"
-COL_NC_FECHA_REPORTE = "FECHA RECEPCION REPORTE"  # NUEVA — arranca el reloj
 COL_NC_FISCAL = "FOLIO FISCAL"
 COL_NC_PROVEEDOR = "PROVEEDOR"
 COL_NC_NUM_FACTURA = "NUM. FACTURA"
@@ -386,11 +415,14 @@ def cargar_datos(ruta: str, _version: int) -> dict:
     if HOJA_DEVOLUCIONES in xl.sheet_names:
         d = pd.read_excel(xl, sheet_name=HOJA_DEVOLUCIONES)
         d = _normalizar_encabezados(d)
-        for col, default in [(COL_D_ESTADO, "Activo"), (COL_D_NOTAS, "")]:
+        for col, default in [(COL_D_ESTADO, "Activo"), (COL_D_NOTAS, ""),
+                              (COL_D_FECHA_REPORTE, pd.NaT)]:
             if col not in d.columns:
                 d[col] = default
         # Tipos
         d[COL_D_FECHA] = pd.to_datetime(d[COL_D_FECHA], errors="coerce").dt.normalize()
+        d[COL_D_FECHA_REPORTE] = pd.to_datetime(d[COL_D_FECHA_REPORTE],
+                                                  errors="coerce").dt.normalize()
         for col in [COL_D_TOTAL, COL_D_PENDIENTE, COL_D_APLICADO_MXN]:
             if col in d.columns:
                 d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
@@ -417,6 +449,20 @@ def cargar_datos(ruta: str, _version: int) -> dict:
         obs_larga = "OBSERVACIONES , QUE SE ESTA REALIZANDO PARA QUE NOS EMITAN LA NC"
         if obs_larga in nc.columns:
             nc = nc.rename(columns={obs_larga: COL_NC_OBSERVACIONES})
+        # Migración: si viene la columna antigua "FECHA RECEPCION REPORTE"
+        # y no la nueva "FECHA REPORTE", usarla como origen.
+        if ("FECHA RECEPCION REPORTE" in nc.columns
+                and COL_NC_FECHA_REPORTE not in nc.columns):
+            nc = nc.rename(columns={"FECHA RECEPCION REPORTE": COL_NC_FECHA_REPORTE})
+        # Si vienen las dos, priorizar la nueva y llenar huecos con la vieja
+        if ("FECHA RECEPCION REPORTE" in nc.columns
+                and COL_NC_FECHA_REPORTE in nc.columns):
+            vieja = pd.to_datetime(nc["FECHA RECEPCION REPORTE"],
+                                    errors="coerce").dt.normalize()
+            nueva = pd.to_datetime(nc[COL_NC_FECHA_REPORTE],
+                                     errors="coerce").dt.normalize()
+            nc[COL_NC_FECHA_REPORTE] = nueva.fillna(vieja)
+            nc = nc.drop(columns=["FECHA RECEPCION REPORTE"])
         for col, default in [
             (COL_NC_FECHA_REPORTE, pd.NaT),
             (COL_NC_ESTADO, ""),
@@ -438,8 +484,7 @@ def cargar_datos(ruta: str, _version: int) -> dict:
                     COL_NC_COMPRADOR, COL_NC_ESTADO]:
             if col in nc.columns:
                 nc[col] = nc[col].fillna("").astype(str).str.strip()
-        # Si no hay fecha de recepción del reporte, usar la fecha de la factura
-        # como aproximación inicial.
+        # Si no hay fecha de reporte, usar la fecha de la factura como respaldo
         m_sin_rep = nc[COL_NC_FECHA_REPORTE].isna()
         nc.loc[m_sin_rep, COL_NC_FECHA_REPORTE] = nc.loc[m_sin_rep, COL_NC_FECHA_FACTURA]
         # Estado por defecto: si tiene FECHA DE LA NC → Resuelto, si no → Pendiente
@@ -487,10 +532,10 @@ def guardar_excel(datos: dict, ruta: str) -> None:
             d = d.copy().drop(columns=["MES ETIQUETA", "TIPO"], errors="ignore")
         else:
             d = pd.DataFrame(columns=[
-                COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR, COL_D_TOTAL,
-                COL_D_PENDIENTE, COL_D_APLICADO_MXN, COL_D_APLICADO_EST,
-                COL_D_RESOLUCION, COL_D_TIPO_CLIENTE, COL_D_EJECUTIVO,
-                COL_D_COMPRADOR, COL_D_ESTADO, COL_D_NOTAS])
+                COL_D_FECHA_REPORTE, COL_D_FOLIO, COL_D_FECHA, COL_D_PROVEEDOR,
+                COL_D_TOTAL, COL_D_PENDIENTE, COL_D_APLICADO_MXN,
+                COL_D_APLICADO_EST, COL_D_RESOLUCION, COL_D_TIPO_CLIENTE,
+                COL_D_EJECUTIVO, COL_D_COMPRADOR, COL_D_ESTADO, COL_D_NOTAS])
         d.to_excel(writer, sheet_name=HOJA_DEVOLUCIONES, index=False)
 
         # NC
@@ -735,6 +780,24 @@ def _orden_mes(etiqueta: str) -> str:
         return "0000-00"
 
 
+def _rango_meses_placeholder(df: pd.DataFrame) -> str:
+    """Devuelve el rango de meses disponibles como 'Mes Año — Mes Año'.
+
+    Sirve como texto guía en los multiselects de mes: en vez del genérico
+    "Todos los meses", muestra los extremos reales del periodo cargado.
+    """
+    if df.empty or "MES ETIQUETA" not in df.columns:
+        return "Todos los meses"
+    meses = [m for m in df["MES ETIQUETA"].dropna().unique()
+             if m != "Sin fecha"]
+    if not meses:
+        return "Todos los meses"
+    meses = sorted(meses, key=_orden_mes)
+    if len(meses) == 1:
+        return meses[0]
+    return f"{meses[0]} — {meses[-1]}"
+
+
 def _filtros_barra(df: pd.DataFrame, prefijo: str,
                     col_fecha: str, col_folio: str,
                     col_proveedor: str, col_comprador: str,
@@ -754,16 +817,17 @@ def _filtros_barra(df: pd.DataFrame, prefijo: str,
         meses_disp = sorted(
             [m for m in df["MES ETIQUETA"].dropna().unique()
              if m != "Sin fecha"], key=_orden_mes)
+        placeholder_meses = _rango_meses_placeholder(df)
         sel_meses = cB.multiselect(
             "Mes(es)", options=meses_disp,
-            placeholder="Todos los meses",
+            placeholder=placeholder_meses,
             key=f"{prefijo}_meses")
         if sel_meses:
             df_p = df[df["MES ETIQUETA"].isin(sel_meses)]
             etiqueta_periodo = ", ".join(sel_meses)
         else:
             df_p = df
-            etiqueta_periodo = "Todos los meses"
+            etiqueta_periodo = placeholder_meses
     else:
         # Rango de fechas
         fmin_val = df[col_fecha].min()
@@ -865,12 +929,13 @@ def _filtro_periodo_tablero(df: pd.DataFrame, col_fecha: str,
         meses_disp = sorted(
             [m for m in df["MES ETIQUETA"].dropna().unique()
              if m != "Sin fecha"], key=_orden_mes)
+        placeholder_meses = _rango_meses_placeholder(df)
         sel = cB.multiselect("Mes(es)", options=meses_disp,
-                               placeholder="Todos los meses",
+                               placeholder=placeholder_meses,
                                key=f"{prefijo}_t_meses")
         if sel:
             return df[df["MES ETIQUETA"].isin(sel)], ", ".join(sel)
-        return df, "Todos los meses"
+        return df, placeholder_meses
     else:
         fmin_val = df[col_fecha].min()
         fmin = _a_fecha(fmin_val) if pd.notna(fmin_val) else hoy - timedelta(days=180)
@@ -885,7 +950,7 @@ def _filtro_periodo_tablero(df: pd.DataFrame, col_fecha: str,
 
 
 def vista_tablero(datos: dict) -> None:
-    st.markdown("### 📊 Tablero Directivo")
+    st.markdown("#### 📊 Tablero Directivo")
     st.caption("Panorama general para presentación en juntas.")
 
     seccion = st.radio(
@@ -947,19 +1012,90 @@ def _tablero_seccion_garantias(datos: dict) -> None:
                  MSG_VENCIDO if vencidos > 0 else "Sin vencimientos",
                  color="#dc2626" if vencidos > 0 else "#94a3b8")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ---- Gráficas ----
+    
+    # ---- Gráficas (2 columnas x 2 filas para aprovechar el ancho) ----
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### 🏭 Top 10 proveedores por monto")
         _grafica_top_prov_garantias(df_f)
+        st.markdown("#### 👥 Distribución por comprador")
+        _grafica_por_comprador(df_f)
     with c2:
         st.markdown("#### 📅 Folios por mes y estado")
         _grafica_evolucion_mensual(df_f)
+        st.markdown("#### 🚨 Vencidos por mes de recepción")
+        _grafica_vencidos_por_mes(df_f)
 
-    st.markdown("#### 👥 Distribución por comprador")
-    _grafica_por_comprador(df_f)
+    # ---- Tabla mensual detallada (SIN filtros — usa df completo) ----
+    st.markdown("---")
+    st.markdown("#### 📋 Detalle mensual (base completa, sin filtros)")
+    st.caption("Folios y monto por mes, agrupados por estado. La fila **TOTAL** "
+                "acumula todas las columnas.")
+    _tabla_detalle_mensual(datos["garantias"])
+
+
+def _tabla_detalle_mensual(df_completo: pd.DataFrame) -> None:
+    """Tabla mensual con folios y monto por estado. Ignora filtros."""
+    if df_completo is None or df_completo.empty:
+        st.info("Sin datos.")
+        return
+    d = df_completo.copy()
+    d = d[d["MES ETIQUETA"] != "Sin fecha"]
+    if d.empty:
+        st.info("Sin datos con fecha de recepción.")
+        return
+
+    # Construir por mes
+    filas = []
+    for mes, grupo in d.groupby("MES ETIQUETA"):
+        act = grupo[grupo[COL_G_ESTADO] == ESTADO_ACTIVO]
+        cua = grupo[grupo[COL_G_ESTADO] == ESTADO_CUARENTENA]
+        res = grupo[grupo[COL_G_ESTADO] == ESTADO_RESUELTO]
+        f_act, f_cua, f_res = len(act), len(cua), len(res)
+        m_act = act[COL_G_IMPORTE].sum()
+        m_cua = cua[COL_G_IMPORTE].sum()
+        m_res = res[COL_G_IMPORTE].sum()
+        filas.append({
+            "Mes": mes,
+            "_orden": _orden_mes(mes),
+            "Folios activos": f_act,
+            "Folios cuarentena": f_cua,
+            "Folios resueltos": f_res,
+            "Folios TOTAL": f_act + f_cua + f_res,
+            "Monto activo": m_act,
+            "Monto cuarentena": m_cua,
+            "Monto resuelto": m_res,
+            "Monto TOTAL": m_act + m_cua + m_res,
+        })
+    tabla = pd.DataFrame(filas).sort_values("_orden").drop(columns="_orden")
+    tabla = tabla.set_index("Mes")
+
+    # Fila TOTAL al final
+    total = tabla.sum(numeric_only=True)
+    total.name = "TOTAL"
+    tabla = pd.concat([tabla, total.to_frame().T])
+
+    st.dataframe(
+        tabla, use_container_width=True,
+        column_config={
+            "Folios activos": st.column_config.NumberColumn(
+                "Folios activos", format="%d"),
+            "Folios cuarentena": st.column_config.NumberColumn(
+                "Folios en cuarentena", format="%d"),
+            "Folios resueltos": st.column_config.NumberColumn(
+                "Folios resueltos", format="%d"),
+            "Folios TOTAL": st.column_config.NumberColumn(
+                "Folios TOTAL", format="%d"),
+            "Monto activo": st.column_config.NumberColumn(
+                "Monto activo (por cobrar)", format="$%.2f"),
+            "Monto cuarentena": st.column_config.NumberColumn(
+                "Monto en cuarentena", format="$%.2f"),
+            "Monto resuelto": st.column_config.NumberColumn(
+                "Monto resuelto (cobrado)", format="$%.2f"),
+            "Monto TOTAL": st.column_config.NumberColumn(
+                "Monto TOTAL", format="$%.2f"),
+        },
+    )
 
 
 def _tablero_seccion_nc(datos: dict) -> None:
@@ -998,8 +1134,7 @@ def _tablero_seccion_nc(datos: dict) -> None:
                  f"con {n_pend} nota(s) por conseguir",
                  color="#1f4e79")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
+    
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### 🏭 Top 10 proveedores por monto pendiente")
@@ -1126,6 +1261,51 @@ def _grafica_por_comprador(df: pd.DataFrame) -> None:
                      use_container_width=True)
 
 
+def _grafica_vencidos_por_mes(df: pd.DataFrame) -> None:
+    """Distribución mensual de folios vencidos (>90 días desde recepción)."""
+    if df.empty:
+        st.info("Sin datos.")
+        return
+    d = df.copy()
+    d["_venc"] = d.apply(esta_vencido_garantia, axis=1)
+    venc = d[d["_venc"]]
+    if venc.empty:
+        st.success("✅ No hay folios vencidos en este periodo.")
+        return
+    venc = venc[venc["MES ETIQUETA"] != "Sin fecha"]
+    if venc.empty:
+        return
+    agr = (venc.groupby("MES ETIQUETA")
+           .agg(Folios=(COL_G_FOLIO, "count"),
+                Monto=(COL_G_IMPORTE, "sum")))
+    agr = agr.reindex(sorted(agr.index, key=_orden_mes))
+    if not ALTAIR_OK:
+        st.bar_chart(agr[["Folios"]], height=280)
+        return
+    d2 = agr.reset_index()
+    d2["_txt"] = d2.apply(
+        lambda r: f"{int(r['Folios'])} · ${r['Monto']:,.0f}", axis=1)
+    base = alt.Chart(d2)
+    barras = base.mark_bar(color="#dc2626").encode(
+        x=alt.X("MES ETIQUETA:N", title="Mes de recepción",
+                sort=list(agr.index),
+                axis=alt.Axis(labelAngle=-30)),
+        y=alt.Y("Folios:Q", title="Folios vencidos"),
+        tooltip=[
+            alt.Tooltip("MES ETIQUETA:N", title="Mes"),
+            alt.Tooltip("Folios:Q", format=",d"),
+            alt.Tooltip("Monto:Q", title="Monto", format="$,.2f"),
+        ],
+    )
+    etq = base.mark_text(align="center", dy=-8, fontSize=11,
+                          fontWeight="bold", color="#dc2626").encode(
+        x=alt.X("MES ETIQUETA:N", sort=list(agr.index)),
+        y=alt.Y("Folios:Q"),
+        text=alt.Text("_txt:N"))
+    st.altair_chart((barras + etq).properties(height=280),
+                     use_container_width=True)
+
+
 def _grafica_nc_por_mes(df: pd.DataFrame) -> None:
     d = df[df["MES ETIQUETA"] != "Sin fecha"]
     if d.empty:
@@ -1160,7 +1340,7 @@ def _grafica_nc_por_mes(df: pd.DataFrame) -> None:
 
 
 def vista_garantias(datos: dict) -> None:
-    st.markdown("### 📋 Folios de Garantía")
+    st.markdown("#### 📋 Folios de Garantía")
     st.caption("Lista completa de folios. Plazo total: **90 días** desde la "
                 "fecha de recepción del reporte. Un folio queda RESUELTO al "
                 "capturar su nota de crédito.")
@@ -1381,7 +1561,7 @@ def _actualizar_garantia(folio: str, datos: dict, cambios: dict,
 
 
 def vista_cuarentena(datos: dict) -> None:
-    st.markdown("### 🧊 Cuarentena")
+    st.markdown("#### 🧊 Cuarentena")
     st.caption(f"Folios con importe ≤ **${UMBRAL_CUARENTENA:,.0f}** en espera "
                 f"de acumular monto por proveedor. Plazo: {DIAS_CUARENTENA} "
                 "días. Al vencer se liberan solos y ahí comienzan los 90 días.")
@@ -1429,8 +1609,7 @@ def vista_cuarentena(datos: dict) -> None:
                  f"acumulado > ${UMBRAL_CUARENTENA:,.0f}",
                  color="#059669")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
+    
     # ---- Acumulado por proveedor ----
     st.markdown("#### 🏭 Acumulado por proveedor")
     resumen = (df_f.groupby(COL_G_PROVEEDOR)
@@ -1508,7 +1687,7 @@ def vista_cuarentena(datos: dict) -> None:
 
 
 def vista_nc_pendientes(datos: dict) -> None:
-    st.markdown("### 💳 Notas de Crédito Pendientes")
+    st.markdown("#### 💳 Notas de Crédito Pendientes")
     st.caption(f"Notas por conceptos varios que aún no llegan a administración. "
                 f"Plazo de **{DIAS_PLAZO_NC} días** desde la fecha de recepción "
                 "del reporte.")
@@ -1547,8 +1726,7 @@ def vista_nc_pendientes(datos: dict) -> None:
     _tarjeta_kpi(c4, "🏭", "Proveedores", f"{df_pend[COL_NC_PROVEEDOR].nunique():,}",
                  "con NC pendientes", color="#1f4e79")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
+    
     # ---- Filtros adicionales ----
     c_a1, c_a2 = st.columns([1, 2])
     ver_resueltas = c_a1.checkbox("Mostrar también resueltas", value=False,
@@ -1713,7 +1891,7 @@ def _actualizar_nc(folio_entrada, datos: dict, cambios: dict,
 
 
 def vista_devoluciones_sueltas(datos: dict) -> None:
-    st.markdown("### 📦 Folios de devolución históricos")
+    st.markdown("#### 📦 Folios de devolución históricos")
     st.caption("Folios de devolución que no se ligan a un folio reporte actual "
                 "(en su mayoría de 2023-2024). Puedes activarlos, bloquearlos o "
                 "cancelarlos cuando ya no procedan.")
@@ -1823,7 +2001,7 @@ def _excel_en_memoria(datos: dict) -> bytes:
 
 
 def vista_base_datos(datos: dict) -> None:
-    st.markdown("### 🗄️ Base de datos")
+    st.markdown("#### 🗄️ Base de datos")
     if "flash" in st.session_state:
         tipo, msg = st.session_state.pop("flash")
         (st.success if tipo == "success" else st.warning)(msg)
@@ -1923,7 +2101,7 @@ def vista_base_datos(datos: dict) -> None:
 
 
 def vista_guia() -> None:
-    st.markdown("### 📖 Guía del sistema")
+    st.markdown("#### 📖 Guía del sistema")
     st.markdown(f"""
 Esta aplicación da seguimiento a devoluciones con proveedores. Toda la gestión
 la lleva **una sola persona** con acceso mediante contraseña única.
@@ -1985,7 +2163,7 @@ def vista_kanban(datos: dict) -> None:
     En cada tarjeta hay un selector "Mover a" para cambiarla de etapa. No
     requiere paquetes externos y no genera commits al rozar la pantalla.
     """
-    st.markdown("### 🔄 Tablero de flujo")
+    st.markdown("#### 🔄 Tablero de flujo")
     st.caption("Cada columna es una etapa del proceso. En cada tarjeta puedes "
                 "usar el selector para moverla a otra etapa. Solo se muestran "
                 "folios/NC en proceso (no resueltos ni cancelados).")
@@ -2034,8 +2212,7 @@ def _kanban_garantias(datos: dict) -> None:
     st.caption(f"**{len(df_act)}** folio(s) activo(s) en el flujo · "
                 f"Monto total: **{_fmt_mxn(df_act[COL_G_IMPORTE].sum())}**")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
+    
     # Layout: una columna por etapa
     cols = st.columns(len(ETAPAS_GARANTIA))
     for i, etapa in enumerate(ETAPAS_GARANTIA):
@@ -2141,8 +2318,7 @@ def _kanban_nc(datos: dict) -> None:
     st.caption(f"**{len(df_pend)}** NC pendiente(s) · "
                 f"Monto: **{_fmt_mxn(df_pend[COL_NC_IMP_PENDIENTE].sum())}**")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
+    
     cols = st.columns(len(ETAPAS_NC))
     for i, etapa in enumerate(ETAPAS_NC):
         with cols[i]:
@@ -2240,12 +2416,12 @@ def main() -> None:
         st.session_state.clear()
         st.rerun()
 
-    # Encabezado
+    # Encabezado compacto (una sola línea)
     st.markdown(
-        "<div style='margin-bottom:0.4rem'>"
-        "<span style='font-size:1.3rem;font-weight:700;color:#1f4e79'>"
+        "<div style='margin:0 0 0.3rem 0;padding:0'>"
+        "<span style='font-size:1.15rem;font-weight:700;color:#1f4e79'>"
         "📋 Seguimiento a Devoluciones</span>"
-        "<span style='color:#666;font-size:0.9rem'> · MASYFERR / SANVER FORTE</span>"
+        "<span style='color:#666;font-size:0.82rem'> · MASYFERR / SANVER FORTE</span>"
         "</div>",
         unsafe_allow_html=True,
     )
