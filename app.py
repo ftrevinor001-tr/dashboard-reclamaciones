@@ -984,38 +984,39 @@ def _tablero_seccion_garantias(datos: dict) -> None:
 
     st.markdown("## 📋 Folios de Garantía")
     df_f, etiq = _filtro_periodo_tablero(df, COL_G_FECHA_RECEPCION, "gar")
-    st.caption(f"📅 Periodo: **{etiq}** · Los tableros y gráficas excluyen "
-                "folios sin gestión (sin fecha de recepción o cancelados). "
-                "La tabla al final los conserva.")
+    st.caption(f"📅 Periodo: **{etiq}** · Los tableros, gráficas e indicadores "
+                "excluyen folios en **cuarentena** (aún no se gestionan). "
+                "La tabla de detalle mensual al final los conserva para el total.")
 
-    # Excluir "no gestionados" para tableros y gráficas
-    df_g = df_f[
-        (df_f[COL_G_ESTADO] != ESTADO_CANCELADO) &
-        (df_f[COL_G_FECHA_RECEPCION].notna())
-    ].copy()
+    # Excluir CUARENTENA para tableros, gráficas e indicadores de cumplimiento
+    df_g = df_f[df_f[COL_G_ESTADO] != ESTADO_CUARENTENA].copy()
 
     # ---- KPIs ----
     total = len(df_g)
     activos = (df_g[COL_G_ESTADO] == ESTADO_ACTIVO).sum()
-    cuarentena = (df_g[COL_G_ESTADO] == ESTADO_CUARENTENA).sum()
+    n_cuarentena_excluidos = (df_f[COL_G_ESTADO] == ESTADO_CUARENTENA).sum()
     resueltos = (df_g[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
+    cancelados = (df_g[COL_G_ESTADO] == ESTADO_CANCELADO).sum()
     monto_total = df_g[COL_G_IMPORTE].sum()
-    monto_activo = df_g.loc[df_g[COL_G_ESTADO].isin(
-        [ESTADO_ACTIVO, ESTADO_CUARENTENA]), COL_G_IMPORTE].sum()
-    pct_res = (resueltos / total * 100) if total > 0 else 0.0
+    monto_activo = df_g.loc[df_g[COL_G_ESTADO] == ESTADO_ACTIVO,
+                              COL_G_IMPORTE].sum()
+    valido = total - cancelados
+    pct_res = (resueltos / valido * 100) if valido > 0 else 0.0
     vencidos = int(df_g.apply(esta_vencido_garantia, axis=1).sum()) if not df_g.empty else 0
 
     c1, c2, c3, c4 = st.columns(4)
     _tarjeta_kpi(c1, "📁", "Folios en gestión", f"{total:,}",
-                 f"{activos} activos · {cuarentena} en cuarentena",
+                 f"{activos} activos · {resueltos} resueltos"
+                 + (f" · ({n_cuarentena_excluidos} en cuarentena excluidos)"
+                    if n_cuarentena_excluidos else ""),
                  color="#1f4e79")
-    _tarjeta_kpi(c2, "💰", "Monto total",
+    _tarjeta_kpi(c2, "💰", "Monto en gestión",
                  _fmt_mxn(monto_total),
                  f"{_fmt_mxn(monto_activo)} por cobrar",
                  color="#0f766e")
     _tarjeta_kpi(c3, "✅", "% Resueltos",
                  f"{pct_res:.1f}%",
-                 f"{resueltos:,} de {total:,} folios",
+                 f"{resueltos:,} de {valido:,} folios",
                  color="#059669")
     _tarjeta_kpi(c4, "🚨", "Vencidos (90 días)",
                  f"{vencidos:,}",
@@ -1220,15 +1221,9 @@ def _tablero_seccion_nc(datos: dict) -> None:
 
     st.markdown("## 💳 Notas de Crédito Pendientes")
     df_f, etiq = _filtro_periodo_tablero(df, COL_NC_FECHA_REPORTE, "nc")
-    st.caption(f"📅 Periodo: **{etiq}** · Los tableros y gráficas excluyen NC "
-                "sin gestión (sin fecha de reporte o canceladas). La tabla al "
-                "final las conserva.")
+    st.caption(f"📅 Periodo: **{etiq}**")
 
-    # Excluir "no gestionadas" para tableros y gráficas
-    df_nc = df_f[
-        (df_f[COL_NC_ESTADO] != "Cancelado") &
-        (df_f[COL_NC_FECHA_REPORTE].notna())
-    ].copy()
+    df_nc = df_f.copy()
 
     pend = df_nc[df_nc[COL_NC_ESTADO] == "Pendiente"]
     res = df_nc[df_nc[COL_NC_ESTADO] == "Resuelto"]
