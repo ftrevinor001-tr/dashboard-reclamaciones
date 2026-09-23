@@ -668,28 +668,72 @@ def esta_vencida_nc(fila: pd.Series) -> bool:
 # 5. AUTENTICACIÓN
 # =============================================================================
 
-def verificar_acceso() -> bool:
-    if st.session_state.get("autenticado", False):
-        return True
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    _, centro, _ = st.columns([1, 1.2, 1])
-    with centro:
-        st.markdown("## 🔐 Seguimiento a devoluciones")
-        st.caption("Acceso restringido. Ingresa la contraseña para continuar.")
-        with st.form("form_login"):
-            password = st.text_input("Contraseña", type="password",
-                                     placeholder="••••••••")
-            enviar = st.form_submit_button("Ingresar", use_container_width=True)
-        if enviar:
-            correcta = st.secrets.get("DASHBOARD_PASSWORD")
-            if correcta is None:
-                st.error("⚠️ Falta 'DASHBOARD_PASSWORD' en los secretos de la app.")
-            elif password == correcta:
-                st.session_state["autenticado"] = True
+def es_admin() -> bool:
+    """Devuelve True si la sesión actual tiene modo administrador activo.
+
+    Los visitantes normales entran en modo VISUALIZACIÓN por defecto (False).
+    El administrador desbloquea con la contraseña desde el candado del sidebar.
+    """
+    return st.session_state.get("admin_activo", False)
+
+
+def panel_admin_sidebar() -> None:
+    """Renderiza en la barra lateral el candado de administrador.
+
+    - Si no hay sesión admin: muestra un campo de contraseña.
+    - Si hay sesión admin: muestra 'MODO ADMIN' y un botón para bloquear.
+    """
+    with st.sidebar:
+        st.markdown("### 🔐 Modo administrador")
+        if es_admin():
+            st.success("🔓 Edición desbloqueada")
+            st.caption("Puedes capturar, modificar y sincronizar cambios.")
+            if st.button("🔒 Bloquear edición",
+                          use_container_width=True,
+                          key="btn_bloquear"):
+                st.session_state["admin_activo"] = False
+                # Limpiar el campo de contraseña
+                st.session_state.pop("admin_pwd_input", None)
                 st.rerun()
-            else:
-                st.error("❌ Contraseña incorrecta.")
-    return False
+        else:
+            st.caption("Solo lectura. Ingresa la contraseña para editar.")
+            with st.form("form_admin", clear_on_submit=False):
+                pwd = st.text_input("Contraseña", type="password",
+                                      placeholder="••••••••",
+                                      key="admin_pwd_input")
+                ok = st.form_submit_button("🔓 Desbloquear",
+                                             use_container_width=True)
+            if ok:
+                correcta = st.secrets.get("DASHBOARD_PASSWORD")
+                if correcta is None:
+                    st.error("⚠️ Falta 'DASHBOARD_PASSWORD' en los secretos.")
+                elif pwd == correcta:
+                    st.session_state["admin_activo"] = True
+                    st.rerun()
+                else:
+                    st.error("❌ Contraseña incorrecta.")
+
+
+def aviso_solo_lectura() -> None:
+    """Muestra un aviso al inicio de una sección con botones de edición."""
+    if not es_admin():
+        st.info("👁️ **Modo visualización.** Para modificar, desbloquea con "
+                 "la contraseña en la barra lateral (**🔐 Modo administrador**).")
+
+
+def _lock() -> dict:
+    """Props para deshabilitar controles cuando no hay modo admin.
+
+    Uso: st.button("Guardar", **_lock())
+    """
+    if es_admin():
+        return {}
+    return {"disabled": True, "help": "🔒 Solo el administrador puede modificar."}
+
+
+def _lock_label(texto: str) -> str:
+    """Etiqueta de botón con candado al inicio si no hay modo admin."""
+    return f"🔒 {texto}" if not es_admin() else texto
 
 
 # =============================================================================
@@ -1670,6 +1714,7 @@ def vista_garantias(datos: dict) -> None:
 
     st.divider()
     st.markdown("#### ✏️ Editar folio")
+    aviso_solo_lectura()
 
     df_sel = df_f.copy()
     df_sel["etiqueta"] = (df_sel[COL_G_FOLIO] + " · "
@@ -1711,7 +1756,8 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
 
     if estado == ESTADO_CANCELADO:
         st.warning("Este folio fue cancelado y no se contabiliza en indicadores.")
-        if st.button("↩️ Reactivar folio", key=f"react_{fila[COL_G_FOLIO]}"):
+        if st.button(_lock_label("↩️ Reactivar folio"),
+                      key=f"react_{fila[COL_G_FOLIO]}", **_lock()):
             _actualizar_garantia(fila[COL_G_FOLIO], datos,
                                   {COL_G_ESTADO: ESTADO_ACTIVO},
                                   "Folio reactivado")
@@ -1721,13 +1767,16 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
         c1, c2, c3 = st.columns(3)
         folio_dev = c1.text_input(
             "Folio de devolución",
-            value=str(fila.get(COL_G_FOLIO_DEV, "") or ""))
+            value=str(fila.get(COL_G_FOLIO_DEV, "") or ""),
+            disabled=not es_admin())
         folio_aj = c2.text_input(
             "Folio de ajuste",
-            value=str(fila.get(COL_G_FOLIO_AJUSTE, "") or ""))
+            value=str(fila.get(COL_G_FOLIO_AJUSTE, "") or ""),
+            disabled=not es_admin())
         nota_cred = c3.text_input(
             "Nota de crédito",
             value=str(fila.get(COL_G_NOTA_CREDITO, "") or ""),
+            disabled=not es_admin(),
             help="Al capturar la nota de crédito, el folio queda RESUELTO.")
 
         opciones_resp = ["", "Recolección", "Destrucción", "Sin respuesta"]
@@ -1737,7 +1786,7 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
         c_r1, c_r2 = st.columns(2)
         respuesta = c_r1.selectbox(
             "Respuesta del proveedor", options=opciones_resp,
-            index=idx_resp)
+            index=idx_resp, disabled=not es_admin())
 
         # Selector de ETAPA (estatus intermedio del flujo)
         actual_etapa = str(fila.get(COL_G_ETAPA, "") or "")
@@ -1746,22 +1795,27 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
         etapa = c_r2.selectbox(
             "Etapa del flujo", options=ETAPAS_GARANTIA,
             index=idx_etapa,
+            disabled=not es_admin(),
             help="Marca en qué punto del proceso va este folio.")
 
         notas = st.text_area("Notas / acciones",
                               value=str(fila.get(COL_G_NOTAS, "") or ""),
-                              height=100)
+                              height=100,
+                              disabled=not es_admin())
 
         c1, c2, c3 = st.columns([2, 1, 1])
-        guardar = c1.form_submit_button("💾 Guardar cambios",
+        guardar = c1.form_submit_button(_lock_label("💾 Guardar cambios"),
                                           use_container_width=True,
-                                          type="primary")
-        cancelar = c2.form_submit_button("⛔ Cancelar folio",
-                                           use_container_width=True)
+                                          type="primary",
+                                          **_lock())
+        cancelar = c2.form_submit_button(_lock_label("⛔ Cancelar folio"),
+                                           use_container_width=True,
+                                           **_lock())
         recibir = c3.form_submit_button(
-            "✅ Marcar como resuelto",
+            _lock_label("✅ Marcar como resuelto"),
             use_container_width=True,
-            help="Solo si ya se capturó la nota de crédito.")
+            help="Solo si ya se capturó la nota de crédito.",
+            **_lock())
 
     if guardar:
         cambios = {
@@ -1909,9 +1963,9 @@ def vista_cuarentena(datos: dict) -> None:
     )
 
     c1, c2 = st.columns(2)
-    if c1.button(f"🚀 Liberar TODOS los folios de {prov_sel}",
+    if c1.button(_lock_label(f"🚀 Liberar TODOS los folios de {prov_sel}"),
                   key=f"lib_all_{prov_sel}", type="primary",
-                  use_container_width=True):
+                  use_container_width=True, **_lock()):
         dfx = datos["garantias"]
         m = ((dfx[COL_G_ESTADO] == ESTADO_CUARENTENA) &
              (dfx[COL_G_PROVEEDOR] == prov_sel))
@@ -1923,8 +1977,9 @@ def vista_cuarentena(datos: dict) -> None:
                     f"Cuarentena: {n} folio(s) de {prov_sel} liberados",
                     f"{n} folio(s) liberados al flujo normal.")
 
-    if c2.button(f"⛔ Cancelar TODOS los folios de {prov_sel}",
-                  key=f"can_all_{prov_sel}", use_container_width=True):
+    if c2.button(_lock_label(f"⛔ Cancelar TODOS los folios de {prov_sel}"),
+                  key=f"can_all_{prov_sel}", use_container_width=True,
+                  **_lock()):
         dfx = datos["garantias"]
         m = ((dfx[COL_G_ESTADO] == ESTADO_CUARENTENA) &
              (dfx[COL_G_PROVEEDOR] == prov_sel))
@@ -2039,6 +2094,7 @@ def vista_nc_pendientes(datos: dict) -> None:
 
     st.divider()
     st.markdown("#### ✏️ Actualizar nota de crédito")
+    aviso_solo_lectura()
     df_sel = df_f.copy()
     df_sel["etiqueta"] = (df_sel[COL_NC_ENTRADA].astype(str) + " · "
                            + df_sel[COL_NC_PROVEEDOR].str.slice(0, 40)
@@ -2072,21 +2128,25 @@ def _editor_nc(fila: pd.Series, datos: dict) -> None:
         fecha_recep = c1.date_input(
             "Fecha de recepción del reporte",
             value=fecha_rep_val, format="DD/MM/YYYY",
+            disabled=not es_admin(),
             help="Desde esta fecha corren los 20 días.")
 
         fecha_nc_actual = _a_fecha(fila.get(COL_NC_FECHA_NC))
         fecha_nc = c2.date_input(
             "Fecha de la nota de crédito (si ya llegó)",
-            value=fecha_nc_actual or hoy_mx(), format="DD/MM/YYYY")
+            value=fecha_nc_actual or hoy_mx(), format="DD/MM/YYYY",
+            disabled=not es_admin())
         capturar_nc = st.checkbox(
             "Marcar que la NC ya se envió a administración",
             value=fecha_nc_actual is not None,
-            key=f"cap_nc_{fila[COL_NC_ENTRADA]}")
+            key=f"cap_nc_{fila[COL_NC_ENTRADA]}",
+            disabled=not es_admin())
 
         c_nc1, c_nc2 = st.columns(2)
         folio_nc = c_nc1.text_input(
             "Folio de la nota de crédito",
-            value=str(fila.get(COL_NC_FOLIO_NC, "") or ""))
+            value=str(fila.get(COL_NC_FOLIO_NC, "") or ""),
+            disabled=not es_admin())
 
         # Selector de ETAPA
         actual_etapa_nc = str(fila.get(COL_NC_ETAPA, "") or "")
@@ -2094,19 +2154,21 @@ def _editor_nc(fila: pd.Series, datos: dict) -> None:
                         if actual_etapa_nc in ETAPAS_NC else 0)
         etapa_nc = c_nc2.selectbox(
             "Etapa del flujo", options=ETAPAS_NC, index=idx_etapa_nc,
+            disabled=not es_admin(),
             help="Marca en qué punto va la gestión de esta NC.")
 
         observ = st.text_area(
             "Observaciones (qué se está haciendo para conseguirla)",
             value=str(fila.get(COL_NC_OBSERVACIONES, "") or ""),
-            height=100)
+            height=100, disabled=not es_admin())
 
         c1, c2 = st.columns([2, 1])
-        guardar = c1.form_submit_button("💾 Guardar cambios",
+        guardar = c1.form_submit_button(_lock_label("💾 Guardar cambios"),
                                           use_container_width=True,
-                                          type="primary")
-        cancelar = c2.form_submit_button("⛔ Cancelar seguimiento",
-                                           use_container_width=True)
+                                          type="primary", **_lock())
+        cancelar = c2.form_submit_button(_lock_label("⛔ Cancelar seguimiento"),
+                                           use_container_width=True,
+                                           **_lock())
 
     if guardar:
         cambios = {
@@ -2221,11 +2283,15 @@ def vista_devoluciones_sueltas(datos: dict) -> None:
 
     with st.form(f"form_d_{fila[COL_D_FOLIO]}"):
         notas = st.text_area("Notas",
-                              value=str(fila.get(COL_D_NOTAS, "") or ""))
+                              value=str(fila.get(COL_D_NOTAS, "") or ""),
+                              disabled=not es_admin())
         c1, c2, c3 = st.columns(3)
-        act = c1.form_submit_button("↩️ Activar", use_container_width=True)
-        blq = c2.form_submit_button("🔒 Bloquear", use_container_width=True)
-        can = c3.form_submit_button("⛔ Cancelar", use_container_width=True)
+        act = c1.form_submit_button(_lock_label("↩️ Activar"),
+                                      use_container_width=True, **_lock())
+        blq = c2.form_submit_button(_lock_label("🔒 Bloquear"),
+                                      use_container_width=True, **_lock())
+        can = c3.form_submit_button(_lock_label("⛔ Cancelar"),
+                                      use_container_width=True, **_lock())
 
     def _act_dev(nuevo, msg):
         df2 = datos["devoluciones"]
@@ -2303,6 +2369,10 @@ def vista_base_datos(datos: dict) -> None:
     st.caption(f"Sube un Excel con las tres hojas: **{HOJA_GARANTIAS}**, "
                 f"**{HOJA_DEVOLUCIONES}** y **{HOJA_NC}**. Reemplazará por "
                 "completo la base actual.")
+    if not es_admin():
+        st.warning("🔒 Solo el administrador puede cargar una nueva base. "
+                    "Desbloquea la edición en la barra lateral.")
+        return
     archivo = st.file_uploader("Selecciona el archivo", type=["xlsx"])
     if archivo is None:
         return
@@ -2534,8 +2604,9 @@ def _render_tarjetas_garantia(grupo: pd.DataFrame, etapa_actual: str,
                                         if e != etapa_actual]
         key_sel = f"mv_g_{r[COL_G_FOLIO]}"
         seleccion = st.selectbox("", options=opciones, key=key_sel,
-                                    label_visibility="collapsed")
-        if seleccion != "— Mover a…":
+                                    label_visibility="collapsed",
+                                    disabled=not es_admin())
+        if seleccion != "— Mover a…" and es_admin():
             df = datos["garantias"]
             m = df[COL_G_FOLIO] == r[COL_G_FOLIO]
             df.loc[m, COL_G_ETAPA] = seleccion
@@ -2635,8 +2706,9 @@ def _render_tarjetas_nc(grupo: pd.DataFrame, etapa_actual: str,
                                         if e != etapa_actual]
         key_sel = f"mv_nc_{r[COL_NC_ENTRADA]}"
         seleccion = st.selectbox("", options=opciones, key=key_sel,
-                                    label_visibility="collapsed")
-        if seleccion != "— Mover a…":
+                                    label_visibility="collapsed",
+                                    disabled=not es_admin())
+        if seleccion != "— Mover a…" and es_admin():
             df = datos["nc"]
             m = df[COL_NC_ENTRADA] == r[COL_NC_ENTRADA]
             df.loc[m, COL_NC_ETAPA] = seleccion
@@ -2649,8 +2721,8 @@ def _render_tarjetas_nc(grupo: pd.DataFrame, etapa_actual: str,
 
 
 def main() -> None:
-    if not verificar_acceso():
-        st.stop()
+    # No hay pantalla de login: la app arranca en modo VISUALIZACIÓN.
+    # El candado de administrador vive en la barra lateral.
 
     if "version_datos" not in st.session_state:
         st.session_state["version_datos"] = 0
@@ -2659,7 +2731,9 @@ def main() -> None:
             RUTA_EXCEL, st.session_state["version_datos"])
     datos = st.session_state["datos"]
 
-    # Barra lateral
+    # Barra lateral: primero el candado de admin, luego el panel general
+    panel_admin_sidebar()
+    st.sidebar.markdown("---")
     st.sidebar.markdown("### ⚙️ Panel")
     if st.sidebar.button("🔄 Recargar datos", use_container_width=True):
         cargar_datos.clear()
@@ -2667,17 +2741,21 @@ def main() -> None:
         st.session_state["datos"] = cargar_datos(
             RUTA_EXCEL, st.session_state["version_datos"])
         st.rerun()
-    if st.sidebar.button("🚪 Salir", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
 
-    # Encabezado compacto (una sola línea)
+    # Encabezado compacto (una sola línea) con badge de modo
+    modo_badge = ("🔓 ADMIN" if es_admin() else "👁️ Solo lectura")
+    color_badge = "#059669" if es_admin() else "#64748b"
     st.markdown(
-        "<div style='margin:0 0 0.3rem 0;padding:0'>"
+        f"<div style='margin:0 0 0.3rem 0;padding:0;display:flex;"
+        f"justify-content:space-between;align-items:center'>"
+        f"<div>"
         "<span style='font-size:1.15rem;font-weight:700;color:#1f4e79'>"
         "📋 Seguimiento a Devoluciones</span>"
         "<span style='color:#666;font-size:0.82rem'> · MASYFERR / SANVER FORTE</span>"
-        "</div>",
+        f"</div>"
+        f"<div style='background:{color_badge};color:white;padding:2px 10px;"
+        f"border-radius:12px;font-size:0.75rem;font-weight:600'>{modo_badge}</div>"
+        f"</div>",
         unsafe_allow_html=True,
     )
 
