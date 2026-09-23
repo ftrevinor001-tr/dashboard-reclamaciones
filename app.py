@@ -721,14 +721,21 @@ def aviso_solo_lectura() -> None:
                  "la contraseña en la barra lateral (**🔐 Modo administrador**).")
 
 
-def _lock() -> dict:
+def _lock(incluir_help: bool = True) -> dict:
     """Props para deshabilitar controles cuando no hay modo admin.
 
     Uso: st.button("Guardar", **_lock())
+
+    Si el botón ya tiene su propio `help=` explícito, pasar
+    `_lock(incluir_help=False)` para evitar el TypeError de argumento
+    duplicado. En modo admin no incluye nada — el `help` original queda.
     """
     if es_admin():
         return {}
-    return {"disabled": True, "help": "🔒 Solo el administrador puede modificar."}
+    props = {"disabled": True}
+    if incluir_help:
+        props["help"] = "🔒 Solo el administrador puede modificar."
+    return props
 
 
 def _lock_label(texto: str) -> str:
@@ -1815,7 +1822,7 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
             _lock_label("✅ Marcar como resuelto"),
             use_container_width=True,
             help="Solo si ya se capturó la nota de crédito.",
-            **_lock())
+            **_lock(incluir_help=False))
 
     if guardar:
         cambios = {
