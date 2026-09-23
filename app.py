@@ -368,13 +368,42 @@ def cargar_datos(ruta: str, _version: int) -> dict:
                 g[col] = g[col].str.replace(r"\.0$", "", regex=True)
 
         # ETAPA (estatus intermedio del flujo). Solo aplica a folios Activos.
+        g[COL_G_ETAPA] = g[COL_G_ETAPA].fillna("").astype(str).str.strip()
+
+        # -------- Migración de la columna vieja 'ETAPA ACTUAL' --------
+        # Si el Excel trae la columna vieja "ETAPA ACTUAL" (con nombres de la
+        # app anterior: 'Reporte de reclamo', 'Gestión', 'Cuentas por pagar',
+        # etc.), la traducimos a los nombres nuevos y sobreescribimos la
+        # columna ETAPA. Luego se elimina la columna vieja para que este
+        # arrastre no se repita en siguientes cargas.
+        MAPA_ETAPA_VIEJA = {
+            "reporte de reclamo": "📝 Reporte recibido",
+            "gestión": "⏳ Esperando respuesta",
+            "gestion": "⏳ Esperando respuesta",
+            "disposición final": "🗑️ En destrucción",
+            "disposicion final": "🗑️ En destrucción",
+            "destino final": "🗑️ En destrucción",
+            "cuentas por pagar": "📨 Enviado a Cuentas por Pagar",
+            "cuarentena": "",  # se maneja aparte por el ESTADO
+            "finalizado": "",  # los finalizados quedan como resueltos por ESTADO
+        }
+        if "ETAPA ACTUAL" in g.columns:
+            vieja = g["ETAPA ACTUAL"].fillna("").astype(str).str.strip().str.lower()
+            for valor_viejo, valor_nuevo in MAPA_ETAPA_VIEJA.items():
+                m = (vieja == valor_viejo) & (valor_nuevo != "")
+                # Solo para folios activos (los resueltos/cuarentena tienen su ESTADO)
+                m = m & (g[COL_G_ESTADO] == ESTADO_ACTIVO)
+                g.loc[m, COL_G_ETAPA] = valor_nuevo
+            # Borrar la columna vieja para que no se arrastre
+            g = g.drop(columns=["ETAPA ACTUAL"])
+
+        # -------- Inferencia (para los que quedaron sin etapa) --------
         # Si vacía, se infiere del avance ya capturado:
         #   tiene folio devolución/ajuste  → "Folio devolución/ajuste generado"
         #   respuesta = Destrucción         → "En destrucción"
         #   respuesta = Recolección         → "En recolección"
         #   respuesta = otra                → "Respuesta recibida"
         #   sin respuesta                    → "Reporte recibido" (inicio)
-        g[COL_G_ETAPA] = g[COL_G_ETAPA].fillna("").astype(str).str.strip()
         vacia_etapa = g[COL_G_ETAPA] == ""
         activos = g[COL_G_ESTADO] == ESTADO_ACTIVO
         tiene_folio_dev = g[COL_G_FOLIO_DEV].astype(str).str.strip() != ""
@@ -1810,6 +1839,20 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
                               height=100,
                               disabled=not es_admin())
 
+        # Fecha real de cierre (para cuando la actualización es retroactiva).
+        # Solo se usa si se marca la nota de crédito o el botón "Resuelto".
+        st.markdown("**Fecha real de cierre del folio**")
+        st.caption("Si el folio se cerró en un día anterior, cambia la fecha "
+                    "para que el indicador de cumplimiento sea correcto. Se "
+                    "aplica al capturar la nota de crédito o al marcar como resuelto.")
+        fecha_cierre_actual = _a_fecha(fila.get(COL_G_FECHA_RESUELTO)) or hoy_mx()
+        fecha_cierre = st.date_input(
+            "Fecha de cierre", value=fecha_cierre_actual,
+            format="DD/MM/YYYY",
+            label_visibility="collapsed",
+            disabled=not es_admin(),
+            key=f"fc_g_{fila[COL_G_FOLIO]}")
+
         c1, c2, c3 = st.columns([2, 1, 1])
         guardar = c1.form_submit_button(_lock_label("💾 Guardar cambios"),
                                           use_container_width=True,
@@ -1835,8 +1878,8 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
         }
         if nota_cred.strip():
             cambios[COL_G_ESTADO] = ESTADO_RESUELTO
-            cambios[COL_G_FECHA_RESUELTO] = pd.Timestamp(hoy_mx())
-            msg = "Folio marcado como RESUELTO (con NC capturada)"
+            cambios[COL_G_FECHA_RESUELTO] = pd.Timestamp(fecha_cierre)
+            msg = f"Folio marcado como RESUELTO (con NC, fecha cierre {fecha_cierre:%d/%m/%Y})"
         else:
             msg = "Cambios guardados"
         _actualizar_garantia(fila[COL_G_FOLIO], datos, cambios, msg)
@@ -1853,8 +1896,8 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
             _actualizar_garantia(fila[COL_G_FOLIO], datos, {
                 COL_G_NOTA_CREDITO: nota_cred.strip(),
                 COL_G_ESTADO: ESTADO_RESUELTO,
-                COL_G_FECHA_RESUELTO: pd.Timestamp(hoy_mx()),
-            }, "Folio marcado como RESUELTO")
+                COL_G_FECHA_RESUELTO: pd.Timestamp(fecha_cierre),
+            }, f"Folio marcado como RESUELTO (fecha cierre {fecha_cierre:%d/%m/%Y})")
 
 
 def _actualizar_garantia(folio: str, datos: dict, cambios: dict,
@@ -2140,9 +2183,11 @@ def _editor_nc(fila: pd.Series, datos: dict) -> None:
 
         fecha_nc_actual = _a_fecha(fila.get(COL_NC_FECHA_NC))
         fecha_nc = c2.date_input(
-            "Fecha de la nota de crédito (si ya llegó)",
+            "Fecha real de la nota de crédito",
             value=fecha_nc_actual or hoy_mx(), format="DD/MM/YYYY",
-            disabled=not es_admin())
+            disabled=not es_admin(),
+            help="Fecha en que realmente llegó la NC. Puedes poner una "
+                  "fecha anterior si actualizas la app días después.")
         capturar_nc = st.checkbox(
             "Marcar que la NC ya se envió a administración",
             value=fecha_nc_actual is not None,
