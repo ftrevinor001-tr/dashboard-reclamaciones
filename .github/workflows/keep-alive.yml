@@ -1,8 +1,8 @@
 name: Mantener app despierta
 
-# Corre cada 5 minutos para hacer un ping a la app usando el endpoint
-# especial ?ping=1 que responde de inmediato sin cargar toda la lógica.
-# Esto evita que Streamlit Cloud duerma la app.
+# Corre cada 5 minutos para hacer un ping a la app de Streamlit.
+# El objetivo es simplemente TOCAR el servidor cada pocos minutos para
+# evitar que Streamlit Cloud duerma la app por inactividad.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -14,13 +14,35 @@ jobs:
     steps:
       - name: Ping a la app de Streamlit
         run: |
-          echo "Haciendo ping a la app usando endpoint ?ping=1..."
-          RESPONSE=$(curl -s -L -o /dev/null -w "%{http_code}" \
-            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 KeepAlive" \
-            --max-time 60 \
-            "https://dashboard-reclamaciones.streamlit.app/?ping=1")
-          echo "Código HTTP: $RESPONSE"
-          if [ "$RESPONSE" != "200" ] && [ "$RESPONSE" != "303" ]; then
-            echo "Advertencia: la app respondió con código $RESPONSE"
+          echo "===================================="
+          echo "Ping a la app - $(date -u)"
+          echo "===================================="
+          
+          URL="https://dashboard-reclamaciones.streamlit.app/?ping=1"
+          
+          # Hacemos el ping tolerando redirecciones y timeouts.
+          # No usamos --fail para que curl NO devuelva error si el código
+          # HTTP es 3xx o 4xx: lo importante es que el servidor RESPONDA,
+          # no el contenido de la respuesta.
+          RESPONSE=$(curl -s \
+            -o /dev/null \
+            -w "%{http_code}" \
+            --connect-timeout 30 \
+            --max-time 90 \
+            --max-redirs 10 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            -H "Accept-Language: es-MX,es;q=0.9,en;q=0.8" \
+            "$URL" || echo "TIMEOUT")
+          
+          echo "Código HTTP recibido: $RESPONSE"
+          
+          # Solo consideramos que hay problema si NO hubo respuesta en absoluto
+          # (código 000 significa que curl no pudo conectar).
+          if [ "$RESPONSE" = "000" ] || [ "$RESPONSE" = "TIMEOUT" ]; then
+            echo "❌ La app no respondió. Puede estar caída."
+            exit 1
           fi
-          echo "Ping completado a las $(date -u)"
+          
+          echo "✅ Ping exitoso. Servidor activo (respondió con $RESPONSE)."
+          echo "===================================="
