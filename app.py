@@ -278,11 +278,16 @@ def _renombrar(df: pd.DataFrame, mapa: dict) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner="Cargando datos…")
+@st.cache_data(show_spinner="Cargando datos…", persist="disk", ttl=None)
 def cargar_datos(ruta: str, _version: int) -> dict:
     """Carga las tres hojas del Excel y devuelve un diccionario.
 
     _version se usa solo para invalidar el caché cuando queremos releer.
+    persist="disk" guarda el caché en el disco de Streamlit Cloud, así que
+    aunque la app se duerma y despierte, no tiene que reprocesar el Excel
+    de nuevo — usa la versión ya procesada del disco.
+    ttl=None significa que el caché no expira por tiempo, solo cuando
+    cambia _version (al recargar datos manualmente o cargar Excel nuevo).
     """
     resultado = {"garantias": None, "devoluciones": None, "nc": None,
                  "error": None}
@@ -2773,6 +2778,19 @@ def _render_tarjetas_nc(grupo: pd.DataFrame, etapa_actual: str,
 
 
 def main() -> None:
+    # ---- Modo health check para el ping externo ----
+    # Si la URL trae ?ping=1, respondemos inmediatamente sin cargar la app.
+    # Esto permite que UptimeRobot o el cron mantenga la app viva sin
+    # tener que iniciar toda la lógica pesada. Cuando un usuario real entra
+    # sin el parámetro, sí carga todo.
+    try:
+        query_params = st.query_params
+        if query_params.get("ping") == "1":
+            st.write("✅ App activa")
+            st.stop()
+    except Exception:
+        pass
+
     # No hay pantalla de login: la app arranca en modo VISUALIZACIÓN.
     # El candado de administrador vive en la barra lateral.
 
