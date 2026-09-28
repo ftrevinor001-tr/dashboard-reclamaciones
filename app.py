@@ -1999,10 +1999,10 @@ def vista_cuarentena(datos: dict) -> None:
 
     st.divider()
 
-    # ---- Administrar por proveedor ----
+    # ---- Administrar por proveedor con selección individual ----
     st.markdown("#### ⚙️ Administrar cuarentena por proveedor")
-    st.caption("Selecciona un proveedor para ver el detalle y liberar sus "
-                "folios al flujo normal (sin clave).")
+    st.caption("Selecciona un proveedor, marca los folios que quieres liberar "
+                "o cancelar con las casillas ✅, y presiona la acción.")
 
     prov_sel = st.selectbox("Proveedor", options=resumen.index.tolist(),
                               key="q_prov_sel")
@@ -2010,11 +2010,20 @@ def vista_cuarentena(datos: dict) -> None:
     grupo["Días restantes cuar."] = grupo[COL_G_CUAR_FIN].apply(
         lambda f: (_a_fecha(f) - hoy_mx()).days if pd.notna(f) else None)
 
-    st.dataframe(
-        grupo[[COL_G_FOLIO, COL_G_IMPORTE, COL_G_CUAR_INICIO,
-               COL_G_CUAR_FIN, "Días restantes cuar."]],
-        use_container_width=True, hide_index=True,
+    # Añadir columna Seleccionar como primera columna
+    grupo_edit = grupo[[COL_G_FOLIO, COL_G_IMPORTE, COL_G_CUAR_INICIO,
+                          COL_G_CUAR_FIN, "Días restantes cuar."]].copy()
+    grupo_edit.insert(0, "Seleccionar", False)
+
+    editado = st.data_editor(
+        grupo_edit, use_container_width=True, hide_index=True,
+        disabled=([COL_G_FOLIO, COL_G_IMPORTE, COL_G_CUAR_INICIO,
+                   COL_G_CUAR_FIN, "Días restantes cuar."]
+                   if es_admin() else grupo_edit.columns.tolist()),
         column_config={
+            "Seleccionar": st.column_config.CheckboxColumn(
+                "✅", width="small",
+                help="Marca los folios que quieres liberar o cancelar."),
             COL_G_IMPORTE: st.column_config.NumberColumn("Importe",
                                                           format="$%.2f"),
             COL_G_CUAR_INICIO: st.column_config.DateColumn("Inicio",
@@ -2023,35 +2032,104 @@ def vista_cuarentena(datos: dict) -> None:
                                                         format="DD/MM/YYYY"),
             "Días restantes cuar.": st.column_config.NumberColumn(format="%d"),
         },
+        key=f"q_editor_{prov_sel}",
     )
 
-    c1, c2 = st.columns(2)
-    if c1.button(_lock_label(f"🚀 Liberar TODOS los folios de {prov_sel}"),
-                  key=f"lib_all_{prov_sel}", type="primary",
-                  use_container_width=True, **_lock()):
+    seleccionados = editado[editado["Seleccionar"]][COL_G_FOLIO].tolist()
+    n_sel = len(seleccionados)
+    monto_sel = editado[editado["Seleccionar"]][COL_G_IMPORTE].sum()
+
+    if n_sel > 0:
+        st.info(f"📌 **{n_sel}** folio(s) seleccionado(s) · "
+                 f"Monto: **{_fmt_mxn(monto_sel)}**")
+    else:
+        st.caption("Marca al menos un folio para habilitar las acciones.")
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button(_lock_label(f"🚀 Liberar seleccionados ({n_sel})"),
+                  key=f"lib_sel_{prov_sel}", type="primary",
+                  use_container_width=True,
+                  disabled=(not es_admin() or n_sel == 0),
+                  help="Pasa los folios marcados al flujo normal, "
+                        "reiniciando su fecha de recepción a hoy."):
         dfx = datos["garantias"]
         m = ((dfx[COL_G_ESTADO] == ESTADO_CUARENTENA) &
-             (dfx[COL_G_PROVEEDOR] == prov_sel))
+             (dfx[COL_G_FOLIO].isin(seleccionados)))
         n = int(m.sum())
         dfx.loc[m, COL_G_ESTADO] = ESTADO_ACTIVO
         dfx.loc[m, COL_G_FECHA_RECEPCION] = pd.Timestamp(hoy_mx())
         dfx.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
         persistir(datos,
-                    f"Cuarentena: {n} folio(s) de {prov_sel} liberados",
+                    f"Cuarentena: {n} folio(s) de {prov_sel} liberados "
+                    f"({', '.join(seleccionados)})",
                     f"{n} folio(s) liberados al flujo normal.")
 
-    if c2.button(_lock_label(f"⛔ Cancelar TODOS los folios de {prov_sel}"),
-                  key=f"can_all_{prov_sel}", use_container_width=True,
-                  **_lock()):
+    if c2.button(_lock_label(f"⛔ Cancelar seleccionados ({n_sel})"),
+                  key=f"can_sel_{prov_sel}", use_container_width=True,
+                  disabled=(not es_admin() or n_sel == 0),
+                  help="Cancela los folios marcados (no se contabilizan más)."):
         dfx = datos["garantias"]
         m = ((dfx[COL_G_ESTADO] == ESTADO_CUARENTENA) &
-             (dfx[COL_G_PROVEEDOR] == prov_sel))
+             (dfx[COL_G_FOLIO].isin(seleccionados)))
         n = int(m.sum())
         dfx.loc[m, COL_G_ESTADO] = ESTADO_CANCELADO
         dfx.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
         persistir(datos,
-                    f"Cuarentena: {n} folio(s) de {prov_sel} cancelados",
+                    f"Cuarentena: {n} folio(s) de {prov_sel} cancelados "
+                    f"({', '.join(seleccionados)})",
                     f"{n} folio(s) cancelados.")
+
+    # Botón para regresar folios ACTIVOS de este proveedor a cuarentena
+    # (útil cuando se liberó por error uno o varios). Muestra los activos
+    # del proveedor y permite seleccionarlos.
+    with st.expander(f"↩️ ¿Liberaste por error? Regresar a cuarentena"):
+        activos_prov = datos["garantias"][
+            (datos["garantias"][COL_G_ESTADO] == ESTADO_ACTIVO) &
+            (datos["garantias"][COL_G_PROVEEDOR] == prov_sel) &
+            (datos["garantias"][COL_G_IMPORTE] <= UMBRAL_CUARENTENA)
+        ].copy()
+        if activos_prov.empty:
+            st.caption(f"No hay folios activos de {prov_sel} con importe "
+                        f"≤ ${UMBRAL_CUARENTENA:,.0f} para regresar.")
+        else:
+            reg_edit = activos_prov[[COL_G_FOLIO, COL_G_IMPORTE,
+                                       COL_G_FECHA_RECEPCION]].copy()
+            reg_edit.insert(0, "Seleccionar", False)
+            reg_editado = st.data_editor(
+                reg_edit, use_container_width=True, hide_index=True,
+                disabled=([COL_G_FOLIO, COL_G_IMPORTE, COL_G_FECHA_RECEPCION]
+                           if es_admin() else reg_edit.columns.tolist()),
+                column_config={
+                    "Seleccionar": st.column_config.CheckboxColumn(
+                        "✅", width="small"),
+                    COL_G_IMPORTE: st.column_config.NumberColumn(
+                        "Importe", format="$%.2f"),
+                    COL_G_FECHA_RECEPCION: st.column_config.DateColumn(
+                        "Recepción actual", format="DD/MM/YYYY"),
+                },
+                key=f"q_regresar_{prov_sel}",
+            )
+            reg_seleccionados = reg_editado[
+                reg_editado["Seleccionar"]][COL_G_FOLIO].tolist()
+            n_reg = len(reg_seleccionados)
+            if st.button(_lock_label(f"🧊 Regresar a cuarentena ({n_reg})"),
+                          key=f"btn_reg_{prov_sel}",
+                          disabled=(not es_admin() or n_reg == 0),
+                          use_container_width=True):
+                dfx = datos["garantias"]
+                m = ((dfx[COL_G_ESTADO] == ESTADO_ACTIVO) &
+                     (dfx[COL_G_FOLIO].isin(reg_seleccionados)))
+                n = int(m.sum())
+                # Regresar a cuarentena con inicio hoy y fin en DIAS_CUARENTENA
+                dfx.loc[m, COL_G_ESTADO] = ESTADO_CUARENTENA
+                dfx.loc[m, COL_G_CUAR_INICIO] = pd.Timestamp(hoy_mx())
+                dfx.loc[m, COL_G_CUAR_FIN] = pd.Timestamp(
+                    hoy_mx() + timedelta(days=DIAS_CUARENTENA))
+                dfx.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+                persistir(datos,
+                            f"Cuarentena: {n} folio(s) de {prov_sel} regresados "
+                            f"({', '.join(reg_seleccionados)})",
+                            f"{n} folio(s) regresados a cuarentena.")
 
 
 # =============================================================================
