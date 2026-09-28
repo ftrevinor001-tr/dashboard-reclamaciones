@@ -1951,6 +1951,8 @@ def vista_cuarentena(datos: dict) -> None:
 
     if en_cuar.empty:
         st.success("✅ No hay folios en cuarentena en este momento.")
+        st.divider()
+        _seccion_regresar_a_cuarentena(datos)
         return
 
     # ---- Filtros ----
@@ -2130,6 +2132,107 @@ def vista_cuarentena(datos: dict) -> None:
                             f"Cuarentena: {n} folio(s) de {prov_sel} regresados "
                             f"({', '.join(reg_seleccionados)})",
                             f"{n} folio(s) regresados a cuarentena.")
+
+    # Al final de la vista, sección global para regresar folios a cuarentena
+    st.divider()
+    _seccion_regresar_a_cuarentena(datos)
+
+
+def _seccion_regresar_a_cuarentena(datos: dict) -> None:
+    """Sección independiente que permite regresar cualquier folio activo con
+    importe ≤ $300 a cuarentena, útil cuando se libera por error.
+
+    A diferencia del expander dentro de "Administrar por proveedor" (que se
+    limita al proveedor seleccionado), esta sección lista TODOS los folios
+    activos elegibles de todos los proveedores. Incluye buscador y filtro
+    para localizar rápido.
+    """
+    st.markdown("#### ↩️ Regresar folios a cuarentena")
+    st.caption(f"Muestra todos los folios activos con importe ≤ "
+                f"**${UMBRAL_CUARENTENA:,.0f}** — puedes regresar a cuarentena "
+                "los que hayas liberado por error. Al regresar, la cuarentena "
+                f"reinicia con {DIAS_CUARENTENA} días desde hoy.")
+
+    df = datos.get("garantias")
+    if df is None:
+        return
+
+    candidatos = df[
+        (df[COL_G_ESTADO] == ESTADO_ACTIVO) &
+        (df[COL_G_IMPORTE] <= UMBRAL_CUARENTENA)
+    ].copy()
+
+    if candidatos.empty:
+        st.caption("No hay folios activos con importe bajo elegibles.")
+        return
+
+    # Filtros: proveedor + buscador
+    c1, c2 = st.columns([2, 1])
+    proveedores = sorted(candidatos[COL_G_PROVEEDOR].dropna().unique().tolist())
+    prov_filtro = c1.multiselect(
+        "Filtrar por proveedor", options=proveedores,
+        placeholder="Todos los proveedores",
+        key="reg_prov_global")
+    txt_folio = c2.text_input("Buscar folio", placeholder="Ej. DC-MZ017",
+                                key="reg_folio_global")
+
+    df_f = candidatos
+    if prov_filtro:
+        df_f = df_f[df_f[COL_G_PROVEEDOR].isin(prov_filtro)]
+    if txt_folio.strip():
+        df_f = df_f[df_f[COL_G_FOLIO].astype(str).str.contains(
+            txt_folio.strip(), case=False, na=False)]
+
+    if df_f.empty:
+        st.info("No hay folios con los filtros actuales.")
+        return
+
+    st.caption(f"**{len(df_f)}** de **{len(candidatos)}** folios elegibles.")
+
+    reg_edit = df_f[[COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_IMPORTE,
+                      COL_G_FECHA_RECEPCION]].copy()
+    reg_edit.insert(0, "Seleccionar", False)
+    reg_editado = st.data_editor(
+        reg_edit, use_container_width=True, hide_index=True,
+        disabled=([COL_G_FOLIO, COL_G_PROVEEDOR, COL_G_IMPORTE,
+                   COL_G_FECHA_RECEPCION]
+                   if es_admin() else reg_edit.columns.tolist()),
+        column_config={
+            "Seleccionar": st.column_config.CheckboxColumn(
+                "✅", width="small",
+                help="Marca los folios a regresar a cuarentena."),
+            COL_G_IMPORTE: st.column_config.NumberColumn(
+                "Importe", format="$%.2f"),
+            COL_G_FECHA_RECEPCION: st.column_config.DateColumn(
+                "Recepción actual", format="DD/MM/YYYY"),
+        },
+        key="reg_editor_global",
+    )
+    reg_seleccionados = reg_editado[
+        reg_editado["Seleccionar"]][COL_G_FOLIO].tolist()
+    n_reg = len(reg_seleccionados)
+
+    if n_reg > 0:
+        st.info(f"📌 **{n_reg}** folio(s) marcado(s) para regresar a cuarentena.")
+
+    if st.button(_lock_label(f"🧊 Regresar a cuarentena ({n_reg})"),
+                  key="btn_reg_global",
+                  disabled=(not es_admin() or n_reg == 0),
+                  type="primary",
+                  use_container_width=True):
+        dfx = datos["garantias"]
+        m = ((dfx[COL_G_ESTADO] == ESTADO_ACTIVO) &
+             (dfx[COL_G_FOLIO].isin(reg_seleccionados)))
+        n = int(m.sum())
+        dfx.loc[m, COL_G_ESTADO] = ESTADO_CUARENTENA
+        dfx.loc[m, COL_G_CUAR_INICIO] = pd.Timestamp(hoy_mx())
+        dfx.loc[m, COL_G_CUAR_FIN] = pd.Timestamp(
+            hoy_mx() + timedelta(days=DIAS_CUARENTENA))
+        dfx.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+        persistir(datos,
+                    f"Cuarentena: {n} folio(s) regresados "
+                    f"({', '.join(reg_seleccionados)})",
+                    f"{n} folio(s) regresados a cuarentena.")
 
 
 # =============================================================================
