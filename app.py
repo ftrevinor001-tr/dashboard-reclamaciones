@@ -326,6 +326,14 @@ def cargar_datos(ruta: str, _version: int) -> dict:
             if col in g.columns:
                 g[col] = g[col].fillna("").astype(str).str.strip()
 
+        # ULTIMA MODIFICACION: forzarla como texto (object). Si viene desde
+        # Excel como datetime, pandas la tipa como datetime64 y falla al
+        # asignarle strings después. La convertimos a texto formateado.
+        if COL_G_MODIFICADO in g.columns:
+            if pd.api.types.is_datetime64_any_dtype(g[COL_G_MODIFICADO]):
+                g[COL_G_MODIFICADO] = g[COL_G_MODIFICADO].dt.strftime("%d/%m/%Y %H:%M")
+            g[COL_G_MODIFICADO] = g[COL_G_MODIFICADO].fillna("").astype(object)
+
         # Si no hay fecha de recepción del reporte, usar FECHA CORTE como valor
         # inicial (los folios viejos ya nacen con el reloj corriendo desde ahí).
         mask_sin_recep = g[COL_G_FECHA_RECEPCION].isna()
