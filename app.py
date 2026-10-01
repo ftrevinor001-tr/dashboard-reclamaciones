@@ -1116,6 +1116,34 @@ def _tablero_seccion_garantias(datos: dict) -> None:
                  MSG_VENCIDO if vencidos > 0 else "Sin vencimientos",
                  color="#dc2626" if vencidos > 0 else "#94a3b8")
 
+    # ---- Segunda fila: separación por etapa (con proveedor vs CxP) ----
+    # Solo cuenta folios ACTIVOS (ya se excluyó cuarentena y cancelados en df_g).
+    # Los resueltos tampoco entran porque ya cerraron.
+    df_proceso = df_g[df_g[COL_G_ESTADO] == ESTADO_ACTIVO].copy()
+    # Última etapa del flujo = Enviado a Cuentas por Pagar
+    etapa_cxp = "📨 Enviado a Cuentas por Pagar"
+    cxp_mask = df_proceso[COL_G_ETAPA] == etapa_cxp
+    df_cxp = df_proceso[cxp_mask]
+    df_prov = df_proceso[~cxp_mask]
+
+    n_prov = len(df_prov)
+    monto_prov = df_prov[COL_G_IMPORTE].sum()
+    n_cxp = len(df_cxp)
+    monto_cxp = df_cxp[COL_G_IMPORTE].sum()
+
+    st.markdown("<div style='margin-top:0.5rem'></div>",
+                 unsafe_allow_html=True)
+    c5, c6 = st.columns(2)
+    _tarjeta_kpi(c5, "🏭", "En gestión con proveedor",
+                 f"{n_prov:,}",
+                 f"{_fmt_mxn(monto_prov)} · "
+                 "Etapas: reporte, recolección, destrucción, folio devolución, etc.",
+                 color="#1f4e79")
+    _tarjeta_kpi(c6, "💳", "En Cuentas por Pagar",
+                 f"{n_cxp:,}",
+                 f"{_fmt_mxn(monto_cxp)} pendientes de aplicar NC",
+                 color="#ea580c")
+
     # ---- INDICADOR DE CUMPLIMIENTO por mes ----
     st.markdown("---")
     st.markdown("#### 🎯 Indicador de cumplimiento — Folios de Garantía")
