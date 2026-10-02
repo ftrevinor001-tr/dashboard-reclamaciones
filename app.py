@@ -90,6 +90,22 @@ RUTA_EXCEL = os.path.join(RUTA_BASE, "datos.xlsx")
 HOJA_GARANTIAS = "datos- FOLIO DE GARANTIA"
 HOJA_DEVOLUCIONES = "FOLIOS DE DEVOLUCION-GARANTIA"
 HOJA_NC = "NC PENDIENTES"
+HOJA_CASOS_ESPECIALES = "CASOS ESPECIALES"
+
+# --- Tipos de caso especial (proveedores que distorsionan el indicador) ---
+# A estos proveedores los folios NO cuentan para los KPIs principales ni para
+# el indicador de cumplimiento, porque sus tiempos de cierre dependen de
+# factores que no están bajo nuestro control.
+TIPO_CASO_DESCUENTO = "Descuento en siguiente compra"
+TIPO_CASO_BAJA_FREC = "Proveedor de baja frecuencia"
+TIPO_CASO_OTRO = "Otro motivo"
+TIPOS_CASO_ESPECIAL = [TIPO_CASO_DESCUENTO, TIPO_CASO_BAJA_FREC, TIPO_CASO_OTRO]
+
+# Columnas de la hoja CASOS ESPECIALES
+COL_CE_PROVEEDOR = "PROVEEDOR"
+COL_CE_TIPO = "TIPO"
+COL_CE_MOTIVO = "MOTIVO"
+COL_CE_FECHA = "FECHA MARCADO"
 
 # --- Umbrales del proceso ---
 DIAS_PLAZO_TOTAL = 90     # plazo total de un folio de garantía
@@ -548,6 +564,27 @@ def cargar_datos(ruta: str, _version: int) -> dict:
         nc["MES ETIQUETA"] = nc[COL_NC_FECHA_REPORTE].apply(etiqueta_mes)
         resultado["nc"] = nc
 
+    # ------ HOJA 4: CASOS ESPECIALES (opcional) ------
+    # Si no existe, se crea un DataFrame vacío. Al guardar se incluirá como
+    # hoja nueva en el Excel.
+    if HOJA_CASOS_ESPECIALES in xl.sheet_names:
+        ce = pd.read_excel(xl, sheet_name=HOJA_CASOS_ESPECIALES)
+        ce = _normalizar_encabezados(ce)
+        for col, default in [(COL_CE_PROVEEDOR, ""), (COL_CE_TIPO, ""),
+                              (COL_CE_MOTIVO, ""), (COL_CE_FECHA, pd.NaT)]:
+            if col not in ce.columns:
+                ce[col] = default
+        ce[COL_CE_FECHA] = pd.to_datetime(ce[COL_CE_FECHA],
+                                            errors="coerce").dt.normalize()
+        for col in [COL_CE_PROVEEDOR, COL_CE_TIPO, COL_CE_MOTIVO]:
+            ce[col] = ce[col].fillna("").astype(str).str.strip()
+        # Quitar filas vacías
+        ce = ce[ce[COL_CE_PROVEEDOR] != ""].reset_index(drop=True)
+    else:
+        ce = pd.DataFrame(columns=[COL_CE_PROVEEDOR, COL_CE_TIPO,
+                                     COL_CE_MOTIVO, COL_CE_FECHA])
+    resultado["casos_especiales"] = ce
+
     return resultado
 
 
@@ -604,10 +641,30 @@ def guardar_excel(datos: dict, ruta: str) -> None:
                 COL_NC_ETAPA])
         nc.to_excel(writer, sheet_name=HOJA_NC, index=False)
 
+        # Casos especiales (proveedores excluidos del indicador)
+        ce = datos.get("casos_especiales")
+        if ce is not None and not ce.empty:
+            ce.to_excel(writer, sheet_name=HOJA_CASOS_ESPECIALES, index=False)
+        else:
+            pd.DataFrame(columns=[COL_CE_PROVEEDOR, COL_CE_TIPO,
+                                    COL_CE_MOTIVO, COL_CE_FECHA]) \
+                .to_excel(writer, sheet_name=HOJA_CASOS_ESPECIALES, index=False)
+
 
 # =============================================================================
 # 4. LÓGICA DE ESTADO Y SEMÁFOROS
 # =============================================================================
+
+def proveedores_caso_especial(datos: dict) -> set:
+    """Devuelve el conjunto de nombres de proveedores marcados como caso
+    especial. Los folios de estos proveedores no cuentan para KPIs ni
+    indicadores de cumplimiento.
+    """
+    ce = datos.get("casos_especiales")
+    if ce is None or ce.empty:
+        return set()
+    return set(ce[COL_CE_PROVEEDOR].astype(str).str.strip().unique().tolist())
+
 
 def dias_transcurridos_garantia(fila: pd.Series) -> int | None:
     """Días transcurridos desde la fecha de recepción del reporte."""
@@ -1048,6 +1105,49 @@ def _filtro_periodo_tablero(df: pd.DataFrame, col_fecha: str,
         return df, "Todo el periodo"
 
 
+def _filtros_tablero_extendido(df: pd.DataFrame, col_fecha: str,
+                                 col_proveedor: str, col_comprador: str,
+                                 prefijo: str) -> tuple:
+    """Filtro de periodo + proveedor + comprador para el tablero directivo.
+
+    Mantiene compatibilidad con la vista existente: devuelve (df_filtrado,
+    etiqueta_periodo).
+    """
+    # Fila 1: periodo
+    df_p, etiq = _filtro_periodo_tablero(df, col_fecha, prefijo)
+
+    # Fila 2: proveedor y comprador
+    c1, c2 = st.columns(2)
+    proveedores = sorted([p for p in df_p[col_proveedor].dropna().unique()
+                           if str(p).strip()])
+    sel_prov = c1.multiselect("Proveedor", options=proveedores,
+                                 placeholder="Todos",
+                                 key=f"{prefijo}_t_prov")
+    compradores = []
+    if col_comprador in df_p.columns:
+        compradores = sorted([c for c in df_p[col_comprador].dropna().unique()
+                               if str(c).strip()])
+    sel_comp = c2.multiselect("Comprador", options=compradores,
+                                 placeholder="Todos",
+                                 key=f"{prefijo}_t_comp")
+
+    df_f = df_p
+    if sel_prov:
+        df_f = df_f[df_f[col_proveedor].isin(sel_prov)]
+    if sel_comp and col_comprador in df_f.columns:
+        df_f = df_f[df_f[col_comprador].isin(sel_comp)]
+
+    # Etiqueta extendida con filtros activos
+    extras = []
+    if sel_prov:
+        extras.append(f"Proveedor: {len(sel_prov)} seleccionado(s)")
+    if sel_comp:
+        extras.append(f"Comprador: {len(sel_comp)} seleccionado(s)")
+    if extras:
+        etiq = f"{etiq} · " + " · ".join(extras)
+    return df_f, etiq
+
+
 def vista_tablero(datos: dict) -> None:
     st.markdown("#### 📊 Tablero Directivo")
     st.caption("Panorama general para presentación en juntas.")
@@ -1076,18 +1176,32 @@ def _tablero_seccion_garantias(datos: dict) -> None:
         return
 
     st.markdown("## 📋 Folios de Garantía")
-    df_f, etiq = _filtro_periodo_tablero(df, COL_G_FECHA_RECEPCION, "gar")
+
+    # Filtros extendidos: periodo + proveedor + comprador
+    df_f, etiq = _filtros_tablero_extendido(
+        df, COL_G_FECHA_RECEPCION, COL_G_PROVEEDOR, COL_G_COMPRADOR, "gar")
+
+    # Lista de proveedores "caso especial" (excluir del indicador principal)
+    prov_especiales = proveedores_caso_especial(datos)
+
+    # Separar folios en 3 subconjuntos:
+    #   df_cuar: cuarentena (se cuenta aparte en tarjeta propia)
+    #   df_ce: casos especiales (se cuentan en resumen aparte)
+    #   df_g: folios "en gestión normal" (los que entran en KPIs e indicadores)
+    cuar_mask = df_f[COL_G_ESTADO] == ESTADO_CUARENTENA
+    ce_mask = df_f[COL_G_PROVEEDOR].isin(prov_especiales) & ~cuar_mask
+    df_cuar = df_f[cuar_mask].copy()
+    df_ce = df_f[ce_mask].copy()
+    df_g = df_f[~cuar_mask & ~ce_mask].copy()
+
     st.caption(f"📅 Periodo: **{etiq}** · Los tableros, gráficas e indicadores "
-                "excluyen folios en **cuarentena** (aún no se gestionan). "
-                "La tabla de detalle mensual al final los conserva para el total.")
+                "excluyen folios en **cuarentena** y proveedores de "
+                "**caso especial** (ver cuadros abajo). La tabla de detalle "
+                "mensual conserva todo para el total.")
 
-    # Excluir CUARENTENA para tableros, gráficas e indicadores de cumplimiento
-    df_g = df_f[df_f[COL_G_ESTADO] != ESTADO_CUARENTENA].copy()
-
-    # ---- KPIs ----
+    # ==== PRIMERA FILA: KPIs principales ====
     total = len(df_g)
     activos = (df_g[COL_G_ESTADO] == ESTADO_ACTIVO).sum()
-    n_cuarentena_excluidos = (df_f[COL_G_ESTADO] == ESTADO_CUARENTENA).sum()
     resueltos = (df_g[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
     cancelados = (df_g[COL_G_ESTADO] == ESTADO_CANCELADO).sum()
     monto_total = df_g[COL_G_IMPORTE].sum()
@@ -1099,9 +1213,7 @@ def _tablero_seccion_garantias(datos: dict) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     _tarjeta_kpi(c1, "📁", "Folios en gestión", f"{total:,}",
-                 f"{activos} activos · {resueltos} resueltos"
-                 + (f" · ({n_cuarentena_excluidos} en cuarentena excluidos)"
-                    if n_cuarentena_excluidos else ""),
+                 f"{activos} activos · {resueltos} resueltos",
                  color="#1f4e79")
     _tarjeta_kpi(c2, "💰", "Monto en gestión",
                  _fmt_mxn(monto_total),
@@ -1116,11 +1228,9 @@ def _tablero_seccion_garantias(datos: dict) -> None:
                  MSG_VENCIDO if vencidos > 0 else "Sin vencimientos",
                  color="#dc2626" if vencidos > 0 else "#94a3b8")
 
-    # ---- Segunda fila: separación por etapa (con proveedor vs CxP) ----
-    # Solo cuenta folios ACTIVOS (ya se excluyó cuarentena y cancelados en df_g).
-    # Los resueltos tampoco entran porque ya cerraron.
+    # ==== SEGUNDA FILA: desglose por ubicación (3 tarjetas) ====
+    # Solo cuenta folios ACTIVOS "normales".
     df_proceso = df_g[df_g[COL_G_ESTADO] == ESTADO_ACTIVO].copy()
-    # Última etapa del flujo = Enviado a Cuentas por Pagar
     etapa_cxp = "📨 Enviado a Cuentas por Pagar"
     cxp_mask = df_proceso[COL_G_ETAPA] == etapa_cxp
     df_cxp = df_proceso[cxp_mask]
@@ -1130,19 +1240,31 @@ def _tablero_seccion_garantias(datos: dict) -> None:
     monto_prov = df_prov[COL_G_IMPORTE].sum()
     n_cxp = len(df_cxp)
     monto_cxp = df_cxp[COL_G_IMPORTE].sum()
+    n_cuar = len(df_cuar)
+    monto_cuar = df_cuar[COL_G_IMPORTE].sum()
 
     st.markdown("<div style='margin-top:0.5rem'></div>",
                  unsafe_allow_html=True)
-    c5, c6 = st.columns(2)
+    c5, c6, c7 = st.columns(3)
     _tarjeta_kpi(c5, "🏭", "En gestión con proveedor",
                  f"{n_prov:,}",
                  f"{_fmt_mxn(monto_prov)} · "
-                 "Etapas: reporte, recolección, destrucción, folio devolución, etc.",
+                 "Reporte, recolección, destrucción, etc.",
                  color="#1f4e79")
     _tarjeta_kpi(c6, "💳", "En Cuentas por Pagar",
                  f"{n_cxp:,}",
                  f"{_fmt_mxn(monto_cxp)} pendientes de aplicar NC",
                  color="#ea580c")
+    _tarjeta_kpi(c7, "🧊", "En cuarentena",
+                 f"{n_cuar:,}",
+                 f"{_fmt_mxn(monto_cuar)} · importe ≤ "
+                 f"${UMBRAL_CUARENTENA:,.0f}",
+                 color="#3b82f6")
+
+    # ==== CUADRO RESUMEN DE CASOS ESPECIALES ====
+    if not df_ce.empty:
+        st.markdown("---")
+        _resumen_casos_especiales(df_ce, datos)
 
     # ---- INDICADOR DE CUMPLIMIENTO por mes ----
     st.markdown("---")
@@ -1165,6 +1287,69 @@ def _tablero_seccion_garantias(datos: dict) -> None:
         _grafica_evolucion_mensual(df_g)
         st.markdown("#### 🚨 Vencidos por mes de recepción")
         _grafica_vencidos_por_mes(df_g)
+
+
+def _resumen_casos_especiales(df_ce: pd.DataFrame, datos: dict) -> None:
+    """Cuadro resumen de folios de proveedores marcados como caso especial.
+
+    Se muestra aparte del indicador principal porque sus tiempos de cierre
+    dependen de factores que no están bajo nuestro control (descuento en
+    siguiente compra, proveedores de baja frecuencia).
+    """
+    st.markdown("#### 🛈 Casos Especiales (excluidos del indicador)")
+    st.caption("Folios de proveedores marcados como caso especial. Se "
+                "muestran aparte porque sus tiempos de cierre dependen de "
+                "factores externos (próximo pedido, visitas esporádicas).")
+
+    ce = datos.get("casos_especiales", pd.DataFrame())
+    # Mapear proveedor → tipo
+    mapa_tipo = {}
+    if not ce.empty:
+        for _, r in ce.iterrows():
+            mapa_tipo[str(r[COL_CE_PROVEEDOR]).strip()] = r[COL_CE_TIPO]
+
+    # KPIs rápidos
+    total_ce = len(df_ce)
+    activos_ce = (df_ce[COL_G_ESTADO] == ESTADO_ACTIVO).sum()
+    resueltos_ce = (df_ce[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
+    monto_ce = df_ce[COL_G_IMPORTE].sum()
+    monto_activo_ce = df_ce.loc[df_ce[COL_G_ESTADO] == ESTADO_ACTIVO,
+                                   COL_G_IMPORTE].sum()
+
+    c1, c2, c3 = st.columns(3)
+    _tarjeta_kpi(c1, "📋", "Folios en casos especiales",
+                 f"{total_ce:,}",
+                 f"{activos_ce} activos · {resueltos_ce} resueltos",
+                 color="#7c3aed")
+    _tarjeta_kpi(c2, "💰", "Monto total",
+                 _fmt_mxn(monto_ce),
+                 f"{_fmt_mxn(monto_activo_ce)} activo",
+                 color="#7c3aed")
+    _tarjeta_kpi(c3, "🏭", "Proveedores involucrados",
+                 f"{df_ce[COL_G_PROVEEDOR].nunique():,}",
+                 "marcados como caso especial",
+                 color="#7c3aed")
+
+    # Desglose por tipo
+    df_disp = df_ce.copy()
+    df_disp["Tipo"] = df_disp[COL_G_PROVEEDOR].map(mapa_tipo).fillna("Sin tipo")
+    agr = (df_disp.groupby(["Tipo", COL_G_PROVEEDOR])
+           .agg(Folios=(COL_G_FOLIO, "count"),
+                Monto=(COL_G_IMPORTE, "sum"),
+                Activos=(COL_G_ESTADO,
+                           lambda s: (s == ESTADO_ACTIVO).sum()))
+           .sort_values("Monto", ascending=False)
+           .reset_index())
+    st.dataframe(
+        agr, use_container_width=True, hide_index=True,
+        column_config={
+            "Tipo": st.column_config.TextColumn("Tipo", width="medium"),
+            COL_G_PROVEEDOR: st.column_config.TextColumn("Proveedor"),
+            "Folios": st.column_config.NumberColumn(format="%d"),
+            "Activos": st.column_config.NumberColumn("Activos", format="%d"),
+            "Monto": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
 
     # ---- Tabla mensual detallada (SIN filtros — usa df completo, incluye no gestionados) ----
     st.markdown("---")
@@ -1341,10 +1526,20 @@ def _tablero_seccion_nc(datos: dict) -> None:
         return
 
     st.markdown("## 💳 Notas de Crédito Pendientes")
-    df_f, etiq = _filtro_periodo_tablero(df, COL_NC_FECHA_REPORTE, "nc")
-    st.caption(f"📅 Periodo: **{etiq}**")
 
-    df_nc = df_f.copy()
+    # Filtros extendidos: periodo + proveedor + comprador
+    df_f, etiq = _filtros_tablero_extendido(
+        df, COL_NC_FECHA_REPORTE, COL_NC_PROVEEDOR, COL_NC_COMPRADOR, "nc")
+
+    # Separar casos especiales
+    prov_especiales = proveedores_caso_especial(datos)
+    ce_mask = df_f[COL_NC_PROVEEDOR].isin(prov_especiales)
+    df_ce = df_f[ce_mask].copy()
+    df_nc = df_f[~ce_mask].copy()
+
+    st.caption(f"📅 Periodo: **{etiq}**"
+                + (f" · Excluye {len(df_ce)} NC de proveedores de caso "
+                    "especial (ver cuadro abajo)." if not df_ce.empty else ""))
 
     pend = df_nc[df_nc[COL_NC_ESTADO] == "Pendiente"]
     res = df_nc[df_nc[COL_NC_ESTADO] == "Resuelto"]
@@ -1372,6 +1567,11 @@ def _tablero_seccion_nc(datos: dict) -> None:
                  f"con {n_pend} nota(s) por conseguir",
                  color="#1f4e79")
 
+    # ==== CUADRO RESUMEN DE CASOS ESPECIALES ====
+    if not df_ce.empty:
+        st.markdown("---")
+        _resumen_casos_especiales_nc(df_ce, datos)
+
     # ---- INDICADOR DE CUMPLIMIENTO NC por mes ----
     st.markdown("---")
     st.markdown("#### 🎯 Indicador de cumplimiento — Notas de Crédito")
@@ -1394,6 +1594,55 @@ def _tablero_seccion_nc(datos: dict) -> None:
     st.caption("NC por mes agrupadas por estado. Incluye TODAS las NC (aun las "
                 "no gestionadas). La fila **TOTAL** acumula todas las columnas.")
     _tabla_detalle_mensual_nc(datos["nc"])
+
+
+def _resumen_casos_especiales_nc(df_ce: pd.DataFrame, datos: dict) -> None:
+    """Cuadro resumen de NC de proveedores de caso especial."""
+    st.markdown("#### 🛈 Casos Especiales (excluidos del indicador NC)")
+    st.caption("Notas de crédito de proveedores marcados como caso especial.")
+
+    ce = datos.get("casos_especiales", pd.DataFrame())
+    mapa_tipo = {}
+    if not ce.empty:
+        for _, r in ce.iterrows():
+            mapa_tipo[str(r[COL_CE_PROVEEDOR]).strip()] = r[COL_CE_TIPO]
+
+    pend_ce = df_ce[df_ce[COL_NC_ESTADO] == "Pendiente"]
+    res_ce = df_ce[df_ce[COL_NC_ESTADO] == "Resuelto"]
+
+    c1, c2, c3 = st.columns(3)
+    _tarjeta_kpi(c1, "⏳", "NC pendientes (CE)",
+                 f"{len(pend_ce):,}",
+                 f"{_fmt_mxn(pend_ce[COL_NC_IMP_PENDIENTE].sum())}",
+                 color="#7c3aed")
+    _tarjeta_kpi(c2, "✅", "NC resueltas (CE)",
+                 f"{len(res_ce):,}",
+                 f"{_fmt_mxn(res_ce[COL_NC_IMP_PENDIENTE].sum())}",
+                 color="#7c3aed")
+    _tarjeta_kpi(c3, "🏭", "Proveedores (CE)",
+                 f"{df_ce[COL_NC_PROVEEDOR].nunique():,}",
+                 "marcados como caso especial",
+                 color="#7c3aed")
+
+    df_disp = df_ce.copy()
+    df_disp["Tipo"] = df_disp[COL_NC_PROVEEDOR].map(mapa_tipo).fillna("Sin tipo")
+    agr = (df_disp.groupby(["Tipo", COL_NC_PROVEEDOR])
+           .agg(NC=(COL_NC_ENTRADA, "count"),
+                Monto=(COL_NC_IMP_PENDIENTE, "sum"),
+                Pendientes=(COL_NC_ESTADO,
+                              lambda s: (s == "Pendiente").sum()))
+           .sort_values("Monto", ascending=False)
+           .reset_index())
+    st.dataframe(
+        agr, use_container_width=True, hide_index=True,
+        column_config={
+            "Tipo": st.column_config.TextColumn("Tipo", width="medium"),
+            COL_NC_PROVEEDOR: st.column_config.TextColumn("Proveedor"),
+            "NC": st.column_config.NumberColumn(format="%d"),
+            "Pendientes": st.column_config.NumberColumn(format="%d"),
+            "Monto": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
 
 
 def _tabla_cumplimiento_nc(df_nc: pd.DataFrame) -> None:
@@ -2747,7 +2996,158 @@ automáticamente y se sincronizan con el repositorio.
 
 
 # =============================================================================
-# 13. TABLERO DE FLUJO (KANBAN)
+# 13. CASOS ESPECIALES (PROVEEDORES QUE DISTORSIONAN EL INDICADOR)
+# =============================================================================
+#
+#   Pestaña para marcar proveedores cuyos folios/NC no deben contar para los
+#   KPIs e indicadores de cumplimiento. Hay tres tipos:
+#     - Descuento en siguiente compra (no emiten NC)
+#     - Proveedor de baja frecuencia (compras 2-3 veces al año)
+#     - Otro motivo
+
+
+def vista_casos_especiales(datos: dict) -> None:
+    st.markdown("#### 🛈 Casos Especiales")
+    st.caption("Marca aquí los proveedores cuyos folios NO deben contar para "
+                "el indicador de cumplimiento, porque sus tiempos de cierre "
+                "dependen de factores externos a nuestro control.")
+
+    if "flash" in st.session_state:
+        tipo, msg = st.session_state.pop("flash")
+        (st.success if tipo == "success" else st.warning)(msg)
+
+    aviso_solo_lectura()
+
+    ce = datos.get("casos_especiales")
+    if ce is None:
+        ce = pd.DataFrame(columns=[COL_CE_PROVEEDOR, COL_CE_TIPO,
+                                     COL_CE_MOTIVO, COL_CE_FECHA])
+        datos["casos_especiales"] = ce
+
+    # ---- Resumen ----
+    c1, c2, c3 = st.columns(3)
+    n_total = len(ce)
+    for tipo in TIPOS_CASO_ESPECIAL:
+        n_tipo = (ce[COL_CE_TIPO] == tipo).sum() if not ce.empty else 0
+    n_desc = (ce[COL_CE_TIPO] == TIPO_CASO_DESCUENTO).sum() if not ce.empty else 0
+    n_baja = (ce[COL_CE_TIPO] == TIPO_CASO_BAJA_FREC).sum() if not ce.empty else 0
+    n_otro = (ce[COL_CE_TIPO] == TIPO_CASO_OTRO).sum() if not ce.empty else 0
+    _tarjeta_kpi(c1, "💳", "Descuento próximo pedido",
+                 f"{n_desc:,}",
+                 "no emiten NC, se descuentan en siguiente compra",
+                 color="#7c3aed")
+    _tarjeta_kpi(c2, "📅", "Baja frecuencia",
+                 f"{n_baja:,}",
+                 "compras 2-3 veces al año",
+                 color="#7c3aed")
+    _tarjeta_kpi(c3, "📝", "Otro motivo",
+                 f"{n_otro:,}",
+                 "casos especiales diversos",
+                 color="#7c3aed")
+
+    st.markdown("---")
+
+    # ---- Añadir nuevo caso especial ----
+    st.markdown("##### ➕ Marcar un proveedor como caso especial")
+
+    # Lista de todos los proveedores conocidos (de garantías y NC)
+    proveedores = set()
+    g = datos.get("garantias")
+    if g is not None and not g.empty:
+        proveedores.update(g[COL_G_PROVEEDOR].dropna().astype(str).str.strip())
+    nc = datos.get("nc")
+    if nc is not None and not nc.empty:
+        proveedores.update(nc[COL_NC_PROVEEDOR].dropna().astype(str).str.strip())
+    # Quitar los ya marcados
+    ya_marcados = set(ce[COL_CE_PROVEEDOR].astype(str).str.strip()) if not ce.empty else set()
+    proveedores_libres = sorted([p for p in proveedores
+                                   if p and p not in ya_marcados])
+
+    with st.form("form_caso_nuevo", clear_on_submit=True):
+        c1, c2 = st.columns([2, 1])
+        nuevo_prov = c1.selectbox(
+            "Proveedor", options=proveedores_libres,
+            placeholder="Selecciona un proveedor…",
+            disabled=not es_admin(),
+            key="ce_nuevo_prov")
+        nuevo_tipo = c2.selectbox(
+            "Tipo de caso", options=TIPOS_CASO_ESPECIAL,
+            disabled=not es_admin(),
+            key="ce_nuevo_tipo")
+        nuevo_motivo = st.text_area(
+            "Motivo / notas (opcional)",
+            placeholder="Ej. Solo se compra en Marzo y Octubre; política de "
+                         "descuento en siguiente factura.",
+            height=70, disabled=not es_admin())
+        agregar = st.form_submit_button(
+            _lock_label("➕ Marcar como caso especial"),
+            use_container_width=True, type="primary", **_lock())
+
+    if agregar:
+        if not nuevo_prov:
+            st.warning("⚠️ Selecciona un proveedor.")
+        else:
+            nueva_fila = pd.DataFrame([{
+                COL_CE_PROVEEDOR: nuevo_prov,
+                COL_CE_TIPO: nuevo_tipo,
+                COL_CE_MOTIVO: nuevo_motivo.strip(),
+                COL_CE_FECHA: pd.Timestamp(hoy_mx()),
+            }])
+            datos["casos_especiales"] = pd.concat(
+                [ce, nueva_fila], ignore_index=True)
+            persistir(datos,
+                        f"Casos especiales: + {nuevo_prov} ({nuevo_tipo})",
+                        f"{nuevo_prov} marcado como caso especial.")
+
+    st.markdown("---")
+
+    # ---- Lista de casos especiales con opción de quitar ----
+    st.markdown("##### 📋 Proveedores marcados")
+    if ce.empty:
+        st.info("Aún no hay proveedores marcados como caso especial.")
+        return
+
+    # Mostrar como tabla editable (solo para visualizar)
+    tabla_disp = ce.copy()
+    tabla_disp[COL_CE_FECHA] = pd.to_datetime(tabla_disp[COL_CE_FECHA],
+                                                 errors="coerce")
+    st.dataframe(
+        tabla_disp, use_container_width=True, hide_index=True,
+        column_config={
+            COL_CE_PROVEEDOR: st.column_config.TextColumn("Proveedor",
+                                                            width="large"),
+            COL_CE_TIPO: st.column_config.TextColumn("Tipo",
+                                                       width="medium"),
+            COL_CE_MOTIVO: st.column_config.TextColumn("Motivo",
+                                                         width="large"),
+            COL_CE_FECHA: st.column_config.DateColumn("Fecha marcado",
+                                                        format="DD/MM/YYYY"),
+        },
+    )
+
+    # Quitar
+    st.markdown("##### 🗑️ Quitar un proveedor de la lista")
+    c1, c2 = st.columns([3, 1])
+    marcados = ce[COL_CE_PROVEEDOR].tolist()
+    prov_quitar = c1.selectbox(
+        "Proveedor a quitar", options=marcados,
+        placeholder="Selecciona…",
+        disabled=not es_admin(),
+        key="ce_quitar_prov")
+    if c2.button(_lock_label("🗑️ Quitar"),
+                  key="btn_ce_quitar",
+                  use_container_width=True,
+                  disabled=not es_admin()):
+        if prov_quitar:
+            datos["casos_especiales"] = ce[ce[COL_CE_PROVEEDOR] != prov_quitar] \
+                .reset_index(drop=True)
+            persistir(datos,
+                        f"Casos especiales: - {prov_quitar}",
+                        f"{prov_quitar} regresa al indicador normal.")
+
+
+# =============================================================================
+# 14. TABLERO DE FLUJO (KANBAN)
 # =============================================================================
 #
 #   Vista de flujo tipo Kanban. Cada columna es una etapa del proceso. Las
@@ -3059,6 +3459,7 @@ def main() -> None:
         "📋 Folios de garantía",
         "🧊 Cuarentena",
         "💳 NC pendientes",
+        "🛈 Casos especiales",
         "📦 Devoluciones históricas",
         "🗄️ Base de datos",
         "📖 Guía",
@@ -3074,10 +3475,12 @@ def main() -> None:
     with tabs[4]:
         vista_nc_pendientes(datos)
     with tabs[5]:
-        vista_devoluciones_sueltas(datos)
+        vista_casos_especiales(datos)
     with tabs[6]:
-        vista_base_datos(datos)
+        vista_devoluciones_sueltas(datos)
     with tabs[7]:
+        vista_base_datos(datos)
+    with tabs[8]:
         vista_guia()
 
 
