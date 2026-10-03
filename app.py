@@ -2089,6 +2089,39 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
                                   "Folio reactivado")
         return
 
+    if estado == ESTADO_RESUELTO:
+        st.success("✅ Este folio está marcado como RESUELTO.")
+        nc_actual = str(fila.get(COL_G_NOTA_CREDITO, "") or "").strip()
+        fecha_res = _fmt_fecha(fila.get(COL_G_FECHA_RESUELTO))
+        st.caption(f"**Nota de crédito capturada:** {nc_actual or '(ninguna)'} "
+                    f"· **Fecha de cierre:** {fecha_res}")
+
+        with st.expander("↩️ Reabrir folio para corregir",
+                           expanded=False):
+            st.caption("Útil cuando la nota de crédito capturada estaba mal "
+                        "o hay que ajustar el folio. **La NC se conserva** "
+                        "por si vuelves a cerrarlo rápido — podrás corregirla "
+                        "en el editor que aparece después.")
+            etapa_destino = st.selectbox(
+                "Regresar a la etapa",
+                options=ETAPAS_GARANTIA,
+                index=len(ETAPAS_GARANTIA) - 1,  # por defecto: CxP
+                disabled=not es_admin(),
+                help="Normalmente se regresa a '📨 Enviado a Cuentas por Pagar' "
+                      "para corregir la NC. Puedes elegir otra etapa si aplica.",
+                key=f"reabrir_etapa_{fila[COL_G_FOLIO]}")
+            if st.button(_lock_label("↩️ Reabrir folio"),
+                          key=f"btn_reabrir_{fila[COL_G_FOLIO]}",
+                          type="primary", use_container_width=True,
+                          **_lock()):
+                _actualizar_garantia(fila[COL_G_FOLIO], datos, {
+                    COL_G_ESTADO: ESTADO_ACTIVO,
+                    COL_G_ETAPA: etapa_destino,
+                    COL_G_FECHA_RESUELTO: pd.NaT,
+                    # NO borramos COL_G_NOTA_CREDITO — se conserva.
+                }, f"Folio reabierto desde Resuelto → {etapa_destino}")
+        return
+
     with st.form(f"form_g_{fila[COL_G_FOLIO]}"):
         c1, c2, c3 = st.columns(3)
         folio_dev = c1.text_input(
