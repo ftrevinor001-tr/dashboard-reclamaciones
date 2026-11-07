@@ -107,6 +107,20 @@ COL_CE_TIPO = "TIPO"
 COL_CE_MOTIVO = "MOTIVO"
 COL_CE_FECHA = "FECHA MARCADO"
 
+# --- Hoja de cobros parciales ---
+# Un folio puede cobrarse en varias partes (parcialidades). Cada registro de
+# esta hoja es un cobro: a quién, cuándo, con qué NC, por cuánto. La suma de
+# los cobros de un folio se compara contra su importe:
+#   suma_cobros >= importe  → el folio queda Resuelto automáticamente
+#   suma_cobros <  importe  → el folio sigue Activo con saldo pendiente
+HOJA_COBROS_PARCIALES = "COBROS PARCIALES"
+COL_CP_FOLIO = "FOLIO REPORTE"      # folio al que aplica
+COL_CP_FECHA = "FECHA COBRO"         # fecha en que se cobró
+COL_CP_PROVEEDOR = "PROVEEDOR"       # a quién se le cobró (puede diferir del folio)
+COL_CP_FOLIO_NC = "FOLIO NC"         # folio de la NC o documento
+COL_CP_MONTO = "MONTO"               # importe cobrado
+COL_CP_NOTA = "NOTA"                 # observaciones del cobro
+
 # --- Umbrales del proceso ---
 DIAS_PLAZO_TOTAL = 90     # plazo total de un folio de garantía
 DIAS_PLAZO_NC = 20        # plazo para gestionar una nota de crédito pendiente
@@ -585,6 +599,31 @@ def cargar_datos(ruta: str, _version: int) -> dict:
                                      COL_CE_MOTIVO, COL_CE_FECHA])
     resultado["casos_especiales"] = ce
 
+    # ------ HOJA 5: COBROS PARCIALES ------
+    # Historial de todos los cobros parciales aplicados a folios. Permite
+    # dividir un folio en varias NC, incluso de distintos proveedores.
+    if HOJA_COBROS_PARCIALES in xl.sheet_names:
+        cp = pd.read_excel(xl, sheet_name=HOJA_COBROS_PARCIALES)
+        cp = _normalizar_encabezados(cp)
+        for col, default in [(COL_CP_FOLIO, ""), (COL_CP_FECHA, pd.NaT),
+                              (COL_CP_PROVEEDOR, ""), (COL_CP_FOLIO_NC, ""),
+                              (COL_CP_MONTO, 0.0), (COL_CP_NOTA, "")]:
+            if col not in cp.columns:
+                cp[col] = default
+        cp[COL_CP_FECHA] = pd.to_datetime(cp[COL_CP_FECHA],
+                                            errors="coerce").dt.normalize()
+        cp[COL_CP_MONTO] = pd.to_numeric(cp[COL_CP_MONTO],
+                                           errors="coerce").fillna(0.0)
+        for col in [COL_CP_FOLIO, COL_CP_PROVEEDOR, COL_CP_FOLIO_NC,
+                     COL_CP_NOTA]:
+            cp[col] = cp[col].fillna("").astype(str).str.strip()
+        cp = cp[cp[COL_CP_FOLIO] != ""].reset_index(drop=True)
+    else:
+        cp = pd.DataFrame(columns=[COL_CP_FOLIO, COL_CP_FECHA,
+                                     COL_CP_PROVEEDOR, COL_CP_FOLIO_NC,
+                                     COL_CP_MONTO, COL_CP_NOTA])
+    resultado["cobros_parciales"] = cp
+
     return resultado
 
 
@@ -650,6 +689,17 @@ def guardar_excel(datos: dict, ruta: str) -> None:
                                     COL_CE_MOTIVO, COL_CE_FECHA]) \
                 .to_excel(writer, sheet_name=HOJA_CASOS_ESPECIALES, index=False)
 
+        # Cobros parciales (historial de cobros aplicados a cada folio)
+        cp = datos.get("cobros_parciales")
+        if cp is not None and not cp.empty:
+            cp.to_excel(writer, sheet_name=HOJA_COBROS_PARCIALES, index=False)
+        else:
+            pd.DataFrame(columns=[COL_CP_FOLIO, COL_CP_FECHA,
+                                    COL_CP_PROVEEDOR, COL_CP_FOLIO_NC,
+                                    COL_CP_MONTO, COL_CP_NOTA]) \
+                .to_excel(writer, sheet_name=HOJA_COBROS_PARCIALES,
+                            index=False)
+
 
 # =============================================================================
 # 4. LÓGICA DE ESTADO Y SEMÁFOROS
@@ -664,6 +714,51 @@ def proveedores_caso_especial(datos: dict) -> set:
     if ce is None or ce.empty:
         return set()
     return set(ce[COL_CE_PROVEEDOR].astype(str).str.strip().unique().tolist())
+
+
+def cobrado_por_folio(datos: dict) -> dict:
+    """Devuelve dict {folio: suma_cobrado} con el total cobrado en
+    parcialidades por cada folio. Un folio sin cobros no aparece.
+    """
+    cp = datos.get("cobros_parciales")
+    if cp is None or cp.empty:
+        return {}
+    agr = cp.groupby(COL_CP_FOLIO)[COL_CP_MONTO].sum()
+    return agr.to_dict()
+
+
+def cobros_de_folio(datos: dict, folio: str) -> pd.DataFrame:
+    """Devuelve los cobros parciales registrados para un folio."""
+    cp = datos.get("cobros_parciales")
+    if cp is None or cp.empty:
+        return pd.DataFrame(columns=[COL_CP_FOLIO, COL_CP_FECHA,
+                                       COL_CP_PROVEEDOR, COL_CP_FOLIO_NC,
+                                       COL_CP_MONTO, COL_CP_NOTA])
+    return cp[cp[COL_CP_FOLIO] == folio].reset_index(drop=True).sort_values(
+        COL_CP_FECHA)
+
+
+def monto_pendiente_folio(fila: pd.Series, mapa_cobros: dict) -> float:
+    """Importe que aún falta por cobrar de un folio."""
+    importe = float(fila.get(COL_G_IMPORTE, 0) or 0)
+    cobrado = float(mapa_cobros.get(fila.get(COL_G_FOLIO), 0) or 0)
+    return max(importe - cobrado, 0.0)
+
+
+def _montos_pendientes_serie(df_g: pd.DataFrame,
+                                 datos: dict) -> pd.Series:
+    """Devuelve una Serie alineada con df_g con el monto pendiente por fila.
+    Para folios Resueltos o Cancelados el pendiente es 0 (ya no cuentan).
+    """
+    mapa = cobrado_por_folio(datos)
+    def pend(fila):
+        est = str(fila.get(COL_G_ESTADO, "")).strip()
+        if est in (ESTADO_RESUELTO, ESTADO_CANCELADO):
+            return 0.0
+        return monto_pendiente_folio(fila, mapa)
+    if df_g.empty:
+        return pd.Series(dtype=float)
+    return df_g.apply(pend, axis=1)
 
 
 def dias_transcurridos_garantia(fila: pd.Series) -> int | None:
@@ -1205,8 +1300,21 @@ def _tablero_seccion_garantias(datos: dict) -> None:
     resueltos = (df_g[COL_G_ESTADO] == ESTADO_RESUELTO).sum()
     cancelados = (df_g[COL_G_ESTADO] == ESTADO_CANCELADO).sum()
     monto_total = df_g[COL_G_IMPORTE].sum()
-    monto_activo = df_g.loc[df_g[COL_G_ESTADO] == ESTADO_ACTIVO,
-                              COL_G_IMPORTE].sum()
+    # Monto activo = monto PENDIENTE (importe menos parcialidades cobradas).
+    # Para folios sin cobros parciales, equivale al importe íntegro.
+    mapa_cobros = cobrado_por_folio(datos)
+    activos_df = df_g[df_g[COL_G_ESTADO] == ESTADO_ACTIVO]
+    monto_activo = (
+        activos_df.apply(lambda f: monto_pendiente_folio(f, mapa_cobros),
+                            axis=1).sum()
+        if not activos_df.empty else 0.0)
+    # Monto cobrado en parcialidades a folios aún activos (informativo)
+    monto_cobrado_parcial = (
+        activos_df.apply(
+            lambda f: min(mapa_cobros.get(f[COL_G_FOLIO], 0),
+                           float(f.get(COL_G_IMPORTE, 0) or 0)),
+            axis=1).sum()
+        if not activos_df.empty else 0.0)
     valido = total - cancelados
     pct_res = (resueltos / valido * 100) if valido > 0 else 0.0
     vencidos = int(df_g.apply(esta_vencido_garantia, axis=1).sum()) if not df_g.empty else 0
@@ -1215,9 +1323,13 @@ def _tablero_seccion_garantias(datos: dict) -> None:
     _tarjeta_kpi(c1, "📁", "Folios en gestión", f"{total:,}",
                  f"{activos} activos · {resueltos} resueltos",
                  color="#1f4e79")
+    sub_monto = f"{_fmt_mxn(monto_activo)} por cobrar"
+    if monto_cobrado_parcial > 0:
+        sub_monto += (f" · {_fmt_mxn(monto_cobrado_parcial)} ya "
+                       "cobrado en parcialidades")
     _tarjeta_kpi(c2, "💰", "Monto en gestión",
                  _fmt_mxn(monto_total),
-                 f"{_fmt_mxn(monto_activo)} por cobrar",
+                 sub_monto,
                  color="#0f766e")
     _tarjeta_kpi(c3, "✅", "% Resueltos",
                  f"{pct_res:.1f}%",
@@ -1229,7 +1341,8 @@ def _tablero_seccion_garantias(datos: dict) -> None:
                  color="#dc2626" if vencidos > 0 else "#94a3b8")
 
     # ==== SEGUNDA FILA: desglose por ubicación (3 tarjetas) ====
-    # Solo cuenta folios ACTIVOS "normales".
+    # Solo cuenta folios ACTIVOS "normales". Los montos son PENDIENTES
+    # (ya descontadas las parcialidades cobradas).
     df_proceso = df_g[df_g[COL_G_ESTADO] == ESTADO_ACTIVO].copy()
     etapa_cxp = "📨 Enviado a Cuentas por Pagar"
     cxp_mask = df_proceso[COL_G_ETAPA] == etapa_cxp
@@ -1237,11 +1350,17 @@ def _tablero_seccion_garantias(datos: dict) -> None:
     df_prov = df_proceso[~cxp_mask]
 
     n_prov = len(df_prov)
-    monto_prov = df_prov[COL_G_IMPORTE].sum()
+    monto_prov = (df_prov.apply(
+        lambda f: monto_pendiente_folio(f, mapa_cobros), axis=1).sum()
+        if not df_prov.empty else 0.0)
     n_cxp = len(df_cxp)
-    monto_cxp = df_cxp[COL_G_IMPORTE].sum()
+    monto_cxp = (df_cxp.apply(
+        lambda f: monto_pendiente_folio(f, mapa_cobros), axis=1).sum()
+        if not df_cxp.empty else 0.0)
     n_cuar = len(df_cuar)
-    monto_cuar = df_cuar[COL_G_IMPORTE].sum()
+    monto_cuar = (df_cuar.apply(
+        lambda f: monto_pendiente_folio(f, mapa_cobros), axis=1).sum()
+        if not df_cuar.empty else 0.0)
 
     st.markdown("<div style='margin-top:0.5rem'></div>",
                  unsafe_allow_html=True)
@@ -2221,6 +2340,203 @@ def _editor_garantia(fila: pd.Series, datos: dict) -> None:
                 COL_G_ESTADO: ESTADO_RESUELTO,
                 COL_G_FECHA_RESUELTO: pd.Timestamp(fecha_cierre),
             }, f"Folio marcado como RESUELTO (fecha cierre {fecha_cierre:%d/%m/%Y})")
+
+    # ===== Sección: cobros parciales del folio =====
+    _seccion_cobros_parciales_folio(fila, datos)
+
+
+def _seccion_cobros_parciales_folio(fila: pd.Series, datos: dict) -> None:
+    """Sección en el editor para registrar cobros parciales de un folio.
+
+    Un folio puede cobrarse en varias partes (con diferentes NC, en diferentes
+    fechas y hasta a diferentes proveedores). La suma de los cobros se
+    descuenta del importe original. Si la suma alcanza o supera el importe,
+    el folio se marca automáticamente como Resuelto con la fecha del último
+    cobro como fecha de cierre.
+    """
+    folio = fila[COL_G_FOLIO]
+    importe = float(fila.get(COL_G_IMPORTE, 0) or 0)
+    cobros = cobros_de_folio(datos, folio)
+    total_cobrado = float(cobros[COL_CP_MONTO].sum()) if not cobros.empty else 0.0
+    pendiente = max(importe - total_cobrado, 0.0)
+    pct = (total_cobrado / importe * 100) if importe > 0 else 0
+
+    st.markdown("---")
+    st.markdown("##### 💵 Cobros parciales")
+    st.caption("Cuando un folio se cobra en varias partes (varias NC, o "
+                "incluso a distintos proveedores), registra cada cobro aquí. "
+                "La suma se descuenta del importe original.")
+
+    # Resumen visual
+    cA, cB, cC = st.columns(3)
+    cA.metric("Importe del folio", _fmt_mxn(importe))
+    cB.metric("Cobrado acumulado", _fmt_mxn(total_cobrado),
+                f"{pct:.1f}%")
+    cC.metric("Pendiente por cobrar", _fmt_mxn(pendiente))
+
+    # Lista de cobros registrados
+    if not cobros.empty:
+        st.markdown("**Cobros registrados:**")
+        cobros_disp = cobros.copy()
+        cobros_disp[COL_CP_FECHA] = pd.to_datetime(cobros_disp[COL_CP_FECHA],
+                                                      errors="coerce")
+        st.dataframe(
+            cobros_disp[[COL_CP_FECHA, COL_CP_PROVEEDOR,
+                          COL_CP_FOLIO_NC, COL_CP_MONTO, COL_CP_NOTA]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                COL_CP_FECHA: st.column_config.DateColumn(
+                    "Fecha", format="DD/MM/YYYY"),
+                COL_CP_PROVEEDOR: st.column_config.TextColumn("Proveedor"),
+                COL_CP_FOLIO_NC: st.column_config.TextColumn("NC / Doc"),
+                COL_CP_MONTO: st.column_config.NumberColumn(
+                    "Monto", format="$%.2f"),
+                COL_CP_NOTA: st.column_config.TextColumn("Nota"),
+            },
+        )
+        # Permitir quitar un cobro específico
+        with st.expander("🗑️ Quitar un cobro"):
+            opciones = [
+                f"{i+1}. {r[COL_CP_FECHA]:%d/%m/%Y} — "
+                f"{r[COL_CP_PROVEEDOR] or '(sin proveedor)'} — "
+                f"{_fmt_mxn(r[COL_CP_MONTO])} "
+                f"({r[COL_CP_FOLIO_NC] or 'sin folio'})"
+                for i, r in cobros_disp.iterrows()]
+            if opciones:
+                sel_rm = st.selectbox(
+                    "Cobro a quitar", options=list(range(len(opciones))),
+                    format_func=lambda i: opciones[i],
+                    key=f"cp_rm_sel_{folio}",
+                    disabled=not es_admin())
+                if st.button(_lock_label("🗑️ Quitar este cobro"),
+                              key=f"cp_rm_btn_{folio}",
+                              disabled=not es_admin(),
+                              use_container_width=True):
+                    cp_all = datos["cobros_parciales"]
+                    # Identificar fila a quitar (por fecha + proveedor + nc + monto)
+                    r_sel = cobros_disp.iloc[sel_rm]
+                    cond = ~(
+                        (cp_all[COL_CP_FOLIO] == folio) &
+                        (cp_all[COL_CP_FECHA] == r_sel[COL_CP_FECHA]) &
+                        (cp_all[COL_CP_PROVEEDOR] == r_sel[COL_CP_PROVEEDOR]) &
+                        (cp_all[COL_CP_FOLIO_NC] == r_sel[COL_CP_FOLIO_NC]) &
+                        (cp_all[COL_CP_MONTO] == r_sel[COL_CP_MONTO])
+                    )
+                    datos["cobros_parciales"] = cp_all[cond].reset_index(
+                        drop=True)
+                    # Si al quitar ya no se completa el total, reabrir
+                    nuevo_total = datos["cobros_parciales"][
+                        datos["cobros_parciales"][COL_CP_FOLIO] == folio
+                    ][COL_CP_MONTO].sum()
+                    df = datos["garantias"]
+                    m = df[COL_G_FOLIO] == folio
+                    estado_actual = str(df.loc[m, COL_G_ESTADO].iloc[0]).strip()
+                    if (estado_actual == ESTADO_RESUELTO
+                            and nuevo_total < importe):
+                        df.loc[m, COL_G_ESTADO] = ESTADO_ACTIVO
+                        df.loc[m, COL_G_FECHA_RESUELTO] = pd.NaT
+                        msg = (f"Cobro quitado. Folio reabierto "
+                                f"({_fmt_mxn(nuevo_total)} / "
+                                f"{_fmt_mxn(importe)}).")
+                    else:
+                        msg = (f"Cobro quitado. Cobrado: "
+                                f"{_fmt_mxn(nuevo_total)}.")
+                    df.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+                    persistir(datos, f"Cobro parcial {folio}: quitado", msg)
+    else:
+        st.info("Aún no hay cobros parciales registrados para este folio.")
+
+    # Formulario para agregar un nuevo cobro
+    if pendiente > 0:
+        st.markdown("**➕ Registrar un nuevo cobro**")
+        with st.form(f"form_cp_{folio}", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            cp_fecha = c1.date_input(
+                "Fecha del cobro", value=hoy_mx(),
+                format="DD/MM/YYYY",
+                disabled=not es_admin(),
+                key=f"cp_fecha_{folio}")
+            cp_monto = c2.number_input(
+                "Monto cobrado (MXN)",
+                min_value=0.0,
+                max_value=float(pendiente) if pendiente > 0 else 0.0,
+                value=float(pendiente),
+                step=100.0, format="%.2f",
+                disabled=not es_admin(),
+                help=f"Máximo permitido: {_fmt_mxn(pendiente)} "
+                      f"(saldo pendiente).",
+                key=f"cp_monto_{folio}")
+            c3, c4 = st.columns(2)
+            # Autocompletar con el proveedor del folio
+            cp_prov = c3.text_input(
+                "Proveedor que cobró",
+                value=str(fila.get(COL_G_PROVEEDOR, "") or ""),
+                disabled=not es_admin(),
+                help="Puedes cambiarlo si el cobro se descontó a otro "
+                      "proveedor diferente al del folio original.",
+                key=f"cp_prov_{folio}")
+            cp_nc = c4.text_input(
+                "Folio NC / documento",
+                disabled=not es_admin(),
+                placeholder="Ej. NC-1234 o Descto. Fact. 5678",
+                key=f"cp_nc_{folio}")
+            cp_nota = st.text_input(
+                "Nota (opcional)",
+                disabled=not es_admin(),
+                placeholder="Ej. Descuento aplicado en Fact. 5678",
+                key=f"cp_nota_{folio}")
+
+            agregar_cobro = st.form_submit_button(
+                _lock_label("💵 Registrar cobro"),
+                use_container_width=True, type="primary",
+                **_lock())
+
+        if agregar_cobro:
+            if cp_monto <= 0:
+                st.warning("⚠️ El monto debe ser mayor que cero.")
+            else:
+                cp_all = datos.get("cobros_parciales")
+                if cp_all is None:
+                    cp_all = pd.DataFrame(columns=[
+                        COL_CP_FOLIO, COL_CP_FECHA, COL_CP_PROVEEDOR,
+                        COL_CP_FOLIO_NC, COL_CP_MONTO, COL_CP_NOTA])
+                nuevo = pd.DataFrame([{
+                    COL_CP_FOLIO: folio,
+                    COL_CP_FECHA: pd.Timestamp(cp_fecha),
+                    COL_CP_PROVEEDOR: cp_prov.strip(),
+                    COL_CP_FOLIO_NC: cp_nc.strip(),
+                    COL_CP_MONTO: float(cp_monto),
+                    COL_CP_NOTA: cp_nota.strip(),
+                }])
+                datos["cobros_parciales"] = pd.concat(
+                    [cp_all, nuevo], ignore_index=True)
+
+                # ¿Ya se completó el importe?
+                nuevo_total = total_cobrado + float(cp_monto)
+                df = datos["garantias"]
+                m = df[COL_G_FOLIO] == folio
+                if nuevo_total >= importe - 0.01:
+                    # Cerrar el folio con fecha del último cobro
+                    df.loc[m, COL_G_ESTADO] = ESTADO_RESUELTO
+                    df.loc[m, COL_G_FECHA_RESUELTO] = pd.Timestamp(cp_fecha)
+                    # Dejar constancia en la NC combinada
+                    df.loc[m, COL_G_NOTA_CREDITO] = (
+                        f"Cobrado en parcialidades (último: "
+                        f"{cp_nc.strip() or 'sin folio'})")
+                    msg = (f"Cobro {_fmt_mxn(cp_monto)} agregado. "
+                            f"Folio CERRADO: {_fmt_mxn(nuevo_total)} / "
+                            f"{_fmt_mxn(importe)}.")
+                else:
+                    msg = (f"Cobro {_fmt_mxn(cp_monto)} agregado. "
+                            f"Acumulado: {_fmt_mxn(nuevo_total)} / "
+                            f"{_fmt_mxn(importe)}. "
+                            f"Pendiente: {_fmt_mxn(importe - nuevo_total)}.")
+                df.loc[m, COL_G_MODIFICADO] = f"{ahora_mx():%d/%m/%Y %H:%M}"
+                persistir(datos, f"Cobro parcial {folio}: {_fmt_mxn(cp_monto)}",
+                            msg)
+    else:
+        st.success(f"✅ Este folio ya está cobrado al 100%. "
+                    f"{_fmt_mxn(total_cobrado)} de {_fmt_mxn(importe)}.")
 
 
 def _actualizar_garantia(folio: str, datos: dict, cambios: dict,
